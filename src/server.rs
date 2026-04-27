@@ -20,6 +20,7 @@ use crate::challenge::registry::ChallengeNonceRegistry;
 use crate::relayer::handler::{health_handler, verify_handler};
 use crate::relayer::transaction::RelayerTransaction;
 use crate::status::handler::status_handler;
+use crate::status::metrics_handler::metrics_handler;
 use crate::status::status_metrics::StatusMetrics;
 use crate::validation::handler::validate_features_handler;
 
@@ -135,6 +136,10 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/status", get(status_handler))
+        // Prometheus exposition for scrapers (Grafana / Datadog / Railway built-in
+        // metrics). Public, unauthenticated — exposes aggregate counters only,
+        // no per-wallet or per-API-key data. See `status/metrics_handler.rs`.
+        .route("/metrics", get(metrics_handler))
         .merge(verify_routes)
         // 1MB covers the MAX_CAPTURE_MS=60s path from the SDK plus the
         // base64-encoded audio payload for phrase content binding (#89):
