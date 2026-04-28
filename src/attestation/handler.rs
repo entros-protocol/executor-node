@@ -138,14 +138,19 @@ fn verify_wallet_signature(
         return Err(AppError::Forbidden("Attestation message has expired".into()));
     }
 
-    // 2. Decode hex signature and verify ed25519
-    let sig_bytes: Vec<u8> = (0..signature_hex.len())
+    // 2. Decode hex signature and verify ed25519. Ed25519 signatures are
+    //    64 bytes = 128 hex chars; reject anything else upfront so the
+    //    decode loop never reads partial chunks. The previous
+    //    `.unwrap_or("xx")` fallback masked odd-length input by silently
+    //    producing a malformed signature that would only fail in the
+    //    subsequent `Signature::try_from` step.
+    if signature_hex.len() != 128 {
+        return Err(AppError::Forbidden("Invalid signature hex length".into()));
+    }
+    let sig_bytes: Vec<u8> = (0..128)
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(
-                signature_hex.get(i..i + 2).unwrap_or("xx"),
-                16,
-            )
+            u8::from_str_radix(&signature_hex[i..i + 2], 16)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| AppError::Forbidden("Invalid signature hex encoding".into()))?;

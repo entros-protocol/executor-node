@@ -22,8 +22,12 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(requests_per_minute: u32) -> Self {
-        let per_minute = NonZeroU32::new(requests_per_minute.max(1))
-            .unwrap_or(NonZeroU32::new(1).expect("literal 1"));
+        // `.max(1)` ensures the input is >= 1, so `NonZeroU32::new` cannot
+        // return None on the outer call. The previous `.expect("literal 1")`
+        // fallback was dead defensive code that would never execute.
+        let clamped = requests_per_minute.max(1);
+        let per_minute = NonZeroU32::new(clamped)
+            .unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
         let quota = Quota::per_minute(per_minute);
         Self {
             limiters: DashMap::new(),

@@ -18,6 +18,7 @@ use attestation::sas::SasAttestor;
 use challenge::registry::ChallengeNonceRegistry;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use zeroize::Zeroize;
 use config::Config;
 use integrator::tracker::IntegratorTracker;
 use integrator::wallet_attempts::WalletAttemptTracker;
@@ -36,9 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
+    let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "dev".into());
 
-    // Clone relayer keypair bytes before moving into SolanaClient (needed for SAS authority fallback)
-    let relayer_keypair_bytes = config.relayer_keypair.to_bytes();
+    // Capture relayer keypair bytes BEFORE moving the keypair into SolanaClient.
+    // The bytes are only needed for the dev-mode SAS authority fallback below
+    // and are zeroized immediately afterward to minimize the in-memory window
+    // for the security-critical relayer secret. `mut` lets us call `.zeroize()`.
+    let mut relayer_keypair_bytes = config.relayer_keypair.to_bytes();
     let solana_client = Arc::new(SolanaClient::new(&config.rpc_url, config.relayer_keypair));
 
     let balance = solana_client.get_balance().await?;
@@ -94,15 +99,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Validation service not configured (VALIDATION_SERVICE_URL not set)");
     }
 
-    // Initialize SAS attestor if configured
+    // Initialize SAS attestor if configured. SAS authority keypair selection:
+    //   1. Dedicated SAS_AUTHORITY_KEYPAIR is preferred (separation of concerns
+    //      between relayer + attestor signers).
+    //   2. Dev-mode fallback: clone the relayer keypair as the SAS authority.
+    //      Refused in production to enforce a clean key-separation invariant.
     let sas_attestor = match (&config.sas_credential_pda, &config.sas_schema_pda) {
         (Some(cred), Some(schema)) => {
-            // Use dedicated SAS authority keypair if configured, otherwise fall back to relayer
-            let authority = config.sas_authority_keypair.unwrap_or_else(|| {
-                tracing::info!("SAS authority keypair not set, falling back to relayer keypair");
-                Keypair::try_from(relayer_keypair_bytes.as_slice())
-                    .expect("relayer keypair bytes are valid")
-            });
+            let authority = match config.sas_authority_keypair {
+                Some(k) => k,
+                None => {
+                    if environment == "prod" {
+                        return Err(
+                            "SAS_AUTHORITY_KEYPAIR is required when ENVIRONMENT=prod \
+                             (refusing to use relayer keypair as SAS authority in production)"
+                                .into(),
+                        );
+                    }
+                    tracing::warn!(
+                        environment,
+                        "SAS authority keypair not set, falling back to relayer keypair (non-prod)"
+                    );
+                    Keypair::try_from(relayer_keypair_bytes.as_slice())
+                        .map_err(|_| "Relayer keypair bytes failed to parse for SAS fallback")?
+                }
+            };
             tracing::info!(
                 credential = %cred,
                 schema = %schema,
@@ -123,6 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+
+    // Relayer keypair bytes are no longer needed in this scope; zeroize the
+    // local copy. The Keypair owned by SolanaClient remains intact.
+    relayer_keypair_bytes.zeroize();
 
     // Spawn background eviction task for stale commitment entries
     let registry_ref = Arc::clone(&commitment_registry);
