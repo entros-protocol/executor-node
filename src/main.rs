@@ -67,13 +67,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Initialize integrator quota tracker. Refuse to start in production
-    // if neither `API_KEYS` nor `INTEGRATORS` is populated — running open in
-    // production would silently expose every endpoint to anyone with the URL.
+    // unless `INTEGRATORS` is explicitly populated. `API_KEYS` alone is not
+    // sufficient: keys without an integrator entry fall through to the
+    // tracker's auto-register path with the default free-tier quota
+    // (`integrator/tracker.rs::DEFAULT_FREE_QUOTA`), which is dev-mode
+    // behaviour and produces unconfigured/implicit keys in production. In
+    // prod, every key should have an explicit name + quota declared via
+    // `INTEGRATORS`.
     let integrator_count = config.integrators.len();
-    if environment == "prod" && config.api_keys.is_empty() && integrator_count == 0 {
+    if environment == "prod" && integrator_count == 0 {
         return Err(
-            "API_KEYS or INTEGRATORS must be populated when ENVIRONMENT=prod \
-             (refusing to start without any auth configuration)"
+            "INTEGRATORS must be populated when ENVIRONMENT=prod (prod_mode_requires_integrators). \
+             API_KEYS alone is not sufficient — keys would auto-register at the dev-mode free-tier \
+             quota. Configure each integrator with explicit name + quota in the INTEGRATORS env var."
                 .into(),
         );
     }
