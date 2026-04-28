@@ -238,12 +238,12 @@ mod tests {
         assert_eq!(ts, 150);
 
         // verifiedAt
-        let vat = i64::from_le_bytes(data[3..11].try_into().unwrap());
+        let vat = i64::from_le_bytes(data[3..11].try_into().expect("8-byte slice"));
         assert_eq!(vat, 1_700_000_000);
 
         // mode
-        let mode_len = u32::from_le_bytes(data[11..15].try_into().unwrap()) as usize;
-        let mode = std::str::from_utf8(&data[15..15 + mode_len]).unwrap();
+        let mode_len = u32::from_le_bytes(data[11..15].try_into().expect("4-byte slice")) as usize;
+        let mode = std::str::from_utf8(&data[15..15 + mode_len]).expect("valid utf-8 mode tag");
         assert_eq!(mode, "wallet-connected");
     }
 
@@ -259,7 +259,7 @@ mod tests {
         let score: u16 = 250;
         data[60..62].copy_from_slice(&score.to_le_bytes());
 
-        let result = deserialize_identity_state(&data).unwrap();
+        let result = deserialize_identity_state(&data).expect("valid synthetic IdentityState");
         assert_eq!(result.trust_score, 250);
         assert_eq!(result.last_verification_timestamp, 1_700_000_000);
     }

@@ -51,7 +51,7 @@ impl CommitmentRegistry {
         if entry.commitments.len() >= MAX_COMMITMENTS_PER_KEY {
             entry.commitments.clear();
             tracing::warn!(
-                api_key = api_key,
+                api_key = %crate::auth::redact::redact_api_key(api_key),
                 "Commitment registry evicted all entries for key (capacity reached)"
             );
         }

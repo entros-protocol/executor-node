@@ -10,6 +10,11 @@ use crate::server::AppState;
 
 /// Maximum age of a signed attestation message (seconds).
 const ATTEST_MESSAGE_MAX_AGE_SECS: u64 = 60;
+/// Asymmetric tolerance for forward clock skew. Client devices commonly have
+/// a few seconds of drift ahead of server time; rejecting strictly on
+/// `msg_timestamp > now` would lock out those clients. 30s leaves room for
+/// realistic NTP variance without permitting meaningful replay-window abuse.
+const ATTEST_FORWARD_SKEW_SECS: u64 = 30;
 
 #[derive(Deserialize)]
 pub struct AttestRequest {
@@ -66,13 +71,21 @@ pub async fn attest_handler(
         );
     }
 
-    // 4. Verify wallet ownership via signed message
+    // 4. Verify wallet ownership via signed message. Walletless / captcha-
+    //    equivalent integrations DO submit attestation requests without a
+    //    signature — this is INTENTIONAL per the project's two-tier
+    //    integration model (wallet-connected = primary, walletless = secondary
+    //    captcha-tier). The ownership-proof path is taken when both
+    //    `signature` and `message` are provided; otherwise the request
+    //    proceeds and is logged at WARN so operators can see which tier
+    //    each call uses without forcing every walletless integrator through
+    //    a signing flow.
     if let (Some(sig_str), Some(msg)) = (&req.signature, &req.message) {
         verify_wallet_signature(&user_wallet, sig_str, msg)?;
     } else {
         tracing::warn!(
             wallet = %user_wallet,
-            "Attestation requested without wallet ownership proof"
+            "Attestation requested without wallet ownership proof (walletless tier)"
         );
     }
 
@@ -134,18 +147,34 @@ fn verify_wallet_signature(
         .expect("system clock before UNIX epoch")
         .as_secs();
 
-    if now.abs_diff(msg_timestamp) > ATTEST_MESSAGE_MAX_AGE_SECS {
+    // Asymmetric skew check: tolerate `ATTEST_FORWARD_SKEW_SECS` of
+    // forward clock drift (client time slightly ahead of server) but
+    // reject anything older than `ATTEST_MESSAGE_MAX_AGE_SECS` to bound
+    // replay windows. The previous `abs_diff > MAX_AGE` allowed up to
+    // `MAX_AGE` seconds of forward skew too, which is symmetric and
+    // unnecessarily wide for a replay-window guard.
+    if msg_timestamp > now && msg_timestamp - now > ATTEST_FORWARD_SKEW_SECS {
+        return Err(AppError::Forbidden(
+            "Attestation message timestamp too far in future".into(),
+        ));
+    }
+    if now > msg_timestamp && now - msg_timestamp > ATTEST_MESSAGE_MAX_AGE_SECS {
         return Err(AppError::Forbidden("Attestation message has expired".into()));
     }
 
-    // 2. Decode hex signature and verify ed25519
-    let sig_bytes: Vec<u8> = (0..signature_hex.len())
+    // 2. Decode hex signature and verify ed25519. Ed25519 signatures are
+    //    64 bytes = 128 hex chars; reject anything else upfront so the
+    //    decode loop never reads partial chunks. The previous
+    //    `.unwrap_or("xx")` fallback masked odd-length input by silently
+    //    producing a malformed signature that would only fail in the
+    //    subsequent `Signature::try_from` step.
+    if signature_hex.len() != 128 {
+        return Err(AppError::Forbidden("Invalid signature hex length".into()));
+    }
+    let sig_bytes: Vec<u8> = (0..128)
         .step_by(2)
         .map(|i| {
-            u8::from_str_radix(
-                signature_hex.get(i..i + 2).unwrap_or("xx"),
-                16,
-            )
+            u8::from_str_radix(&signature_hex[i..i + 2], 16)
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| AppError::Forbidden("Invalid signature hex encoding".into()))?;

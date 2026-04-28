@@ -18,6 +18,7 @@ use attestation::sas::SasAttestor;
 use challenge::registry::ChallengeNonceRegistry;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use zeroize::Zeroize;
 use config::Config;
 use integrator::tracker::IntegratorTracker;
 use integrator::wallet_attempts::WalletAttemptTracker;
@@ -36,9 +37,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
+    let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "dev".into());
 
-    // Clone relayer keypair bytes before moving into SolanaClient (needed for SAS authority fallback)
-    let relayer_keypair_bytes = config.relayer_keypair.to_bytes();
+    // Capture relayer keypair bytes BEFORE moving the keypair into SolanaClient.
+    // The bytes are only needed for the dev-mode SAS authority fallback below
+    // and are zeroized immediately afterward to minimize the in-memory window
+    // for the security-critical relayer secret. `mut` lets us call `.zeroize()`.
+    let mut relayer_keypair_bytes = config.relayer_keypair.to_bytes();
     let solana_client = Arc::new(SolanaClient::new(&config.rpc_url, config.relayer_keypair));
 
     let balance = solana_client.get_balance().await?;
@@ -61,8 +66,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Rate limiters initialized"
     );
 
-    // Initialize integrator quota tracker
+    // Initialize integrator quota tracker. Refuse to start in production
+    // if neither `API_KEYS` nor `INTEGRATORS` is populated — running open in
+    // production would silently expose every endpoint to anyone with the URL.
     let integrator_count = config.integrators.len();
+    if environment == "prod" && config.api_keys.is_empty() && integrator_count == 0 {
+        return Err(
+            "API_KEYS or INTEGRATORS must be populated when ENVIRONMENT=prod \
+             (refusing to start without any auth configuration)"
+                .into(),
+        );
+    }
     let tracker = Arc::new(IntegratorTracker::new(config.integrators));
     let wallet_attempts = Arc::new(WalletAttemptTracker::new(
         config.wallet_max_attempts,
@@ -94,15 +108,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Validation service not configured (VALIDATION_SERVICE_URL not set)");
     }
 
-    // Initialize SAS attestor if configured
+    // Initialize SAS attestor if configured. SAS authority keypair selection:
+    //   1. Dedicated SAS_AUTHORITY_KEYPAIR is preferred (separation of concerns
+    //      between relayer + attestor signers).
+    //   2. Dev-mode fallback: clone the relayer keypair as the SAS authority.
+    //      Refused in production to enforce a clean key-separation invariant.
     let sas_attestor = match (&config.sas_credential_pda, &config.sas_schema_pda) {
         (Some(cred), Some(schema)) => {
-            // Use dedicated SAS authority keypair if configured, otherwise fall back to relayer
-            let authority = config.sas_authority_keypair.unwrap_or_else(|| {
-                tracing::info!("SAS authority keypair not set, falling back to relayer keypair");
-                Keypair::try_from(relayer_keypair_bytes.as_slice())
-                    .expect("relayer keypair bytes are valid")
-            });
+            let authority = match config.sas_authority_keypair {
+                Some(k) => k,
+                None => {
+                    if environment == "prod" {
+                        return Err(
+                            "SAS_AUTHORITY_KEYPAIR is required when ENVIRONMENT=prod \
+                             (refusing to use relayer keypair as SAS authority in production)"
+                                .into(),
+                        );
+                    }
+                    tracing::warn!(
+                        environment,
+                        "SAS authority keypair not set, falling back to relayer keypair (non-prod)"
+                    );
+                    Keypair::try_from(relayer_keypair_bytes.as_slice())
+                        .map_err(|_| "Relayer keypair bytes failed to parse for SAS fallback")?
+                }
+            };
             tracing::info!(
                 credential = %cred,
                 schema = %schema,
@@ -124,6 +154,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Relayer keypair bytes are no longer needed in this scope; zeroize the
+    // local copy. The Keypair owned by SolanaClient remains intact.
+    relayer_keypair_bytes.zeroize();
+
     // Spawn background eviction task for stale commitment entries
     let registry_ref = Arc::clone(&commitment_registry);
     tokio::spawn(async move {
@@ -133,6 +167,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             registry_ref.evict_stale();
         }
     });
+
+    // Spawn background eviction tasks for stale rate-limiter entries.
+    // Previously, eviction ran inside RateLimiter::check() on every request,
+    // creating contention under load. Moving to a 60-second background sweep
+    // matches the WalletAttemptTracker / commitment registry pattern.
+    for (name, limiter_ref) in [
+        ("rate_limiter", Arc::clone(&rate_limiter)),
+        ("attest_rate_limiter", Arc::clone(&attest_rate_limiter)),
+    ] {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                limiter_ref.evict_stale();
+                tracing::debug!(
+                    limiter = name,
+                    tracked = limiter_ref.tracked_count(),
+                    "rate-limit eviction cycle complete"
+                );
+            }
+        });
+    }
 
     // Spawn background eviction task for stale challenge nonces
     let challenge_ref = Arc::clone(&challenge_registry);

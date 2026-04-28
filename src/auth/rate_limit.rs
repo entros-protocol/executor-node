@@ -22,8 +22,12 @@ pub struct RateLimiter {
 
 impl RateLimiter {
     pub fn new(requests_per_minute: u32) -> Self {
-        let per_minute = NonZeroU32::new(requests_per_minute.max(1))
-            .unwrap_or(NonZeroU32::new(1).expect("literal 1"));
+        // `.max(1)` ensures the input is >= 1, so `NonZeroU32::new` cannot
+        // return None on the outer call. The previous `.expect("literal 1")`
+        // fallback was dead defensive code that would never execute.
+        let clamped = requests_per_minute.max(1);
+        let per_minute = NonZeroU32::new(clamped)
+            .unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
         let quota = Quota::per_minute(per_minute);
         Self {
             limiters: DashMap::new(),
@@ -32,11 +36,13 @@ impl RateLimiter {
     }
 
     /// Check if a request from the given API key is allowed.
-    /// Evicts stale entries older than ENTRY_TTL on each call.
+    ///
+    /// Eviction of stale entries is performed by `evict_stale()` from a
+    /// background task, NOT inside `check()`. The previous per-request
+    /// `retain()` was a contention hotspot under high concurrency: two
+    /// threads racing through the entry-creation path could both pass the
+    /// `MAX_TRACKED_KEYS` guard and grow the map past the cap.
     pub fn check(&self, api_key: &str) -> Result<(), ()> {
-        // Lazy eviction of stale entries
-        self.limiters.retain(|_, (_, last_seen)| last_seen.elapsed() < ENTRY_TTL);
-
         if !self.limiters.contains_key(api_key) && self.limiters.len() >= MAX_TRACKED_KEYS {
             return Err(());
         }
@@ -52,6 +58,19 @@ impl RateLimiter {
         drop(limiter);
 
         lim.check().map_err(|_| ())
+    }
+
+    /// Evict entries that haven't been seen for `ENTRY_TTL`. Called from
+    /// a background tokio task; cheap when most keys are active.
+    pub fn evict_stale(&self) {
+        self.limiters
+            .retain(|_, (_, last_seen)| last_seen.elapsed() < ENTRY_TTL);
+    }
+
+    /// Number of currently-tracked keys. Used for observability in the
+    /// eviction-task log.
+    pub fn tracked_count(&self) -> usize {
+        self.limiters.len()
     }
 }
 

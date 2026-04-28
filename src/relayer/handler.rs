@@ -59,7 +59,7 @@ pub async fn verify_handler(
     let is_first = if commitment_known {
         if req.is_first_verification {
             tracing::warn!(
-                api_key = %api_key,
+                api_key = %crate::auth::redact::redact_api_key(&api_key),
                 "Client claimed is_first_verification but commitment already known — forcing re-verification"
             );
         }
@@ -72,7 +72,7 @@ pub async fn verify_handler(
 
     if is_first {
         tracing::info!(
-            api_key = %api_key,
+            api_key = %crate::auth::redact::redact_api_key(&api_key),
             "First verification: commitment registered (no proof required)"
         );
 
@@ -116,13 +116,13 @@ pub async fn verify_handler(
         inputs[i].copy_from_slice(pi);
     }
 
-    tracing::info!(api_key = %api_key, "Submitting re-verification proof");
+    tracing::info!(api_key = %crate::auth::redact::redact_api_key(&api_key), "Submitting re-verification proof");
 
     let outcome = match state.relayer_tx.submit_verification(&req.proof_bytes, &inputs).await {
         Ok(outcome) => outcome,
         Err(e) => {
             state.tracker.refund(&api_key);
-            tracing::error!(api_key = %api_key, error = %e, "Verification submission failed");
+            tracing::error!(api_key = %crate::auth::redact::redact_api_key(&api_key), error = %e, "Verification submission failed");
             return Err(e);
         }
     };
@@ -130,7 +130,7 @@ pub async fn verify_handler(
     let fresh_remaining = state.tracker.get_remaining(&api_key);
 
     tracing::info!(
-        api_key = %api_key,
+        api_key = %crate::auth::redact::redact_api_key(&api_key),
         signature = %outcome.signature,
         verified = outcome.is_valid,
         remaining_quota = fresh_remaining,
