@@ -159,6 +159,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Spawn background eviction tasks for stale rate-limiter entries.
+    // Previously, eviction ran inside RateLimiter::check() on every request,
+    // creating contention under load. Moving to a 60-second background sweep
+    // matches the WalletAttemptTracker / commitment registry pattern.
+    for (name, limiter_ref) in [
+        ("rate_limiter", Arc::clone(&rate_limiter)),
+        ("attest_rate_limiter", Arc::clone(&attest_rate_limiter)),
+    ] {
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                limiter_ref.evict_stale();
+                tracing::debug!(
+                    limiter = name,
+                    tracked = limiter_ref.tracked_count(),
+                    "rate-limit eviction cycle complete"
+                );
+            }
+        });
+    }
+
     // Spawn background eviction task for stale challenge nonces
     let challenge_ref = Arc::clone(&challenge_registry);
     let challenge_ttl = config.challenge_ttl_secs;

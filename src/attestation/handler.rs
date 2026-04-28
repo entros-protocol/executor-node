@@ -10,6 +10,11 @@ use crate::server::AppState;
 
 /// Maximum age of a signed attestation message (seconds).
 const ATTEST_MESSAGE_MAX_AGE_SECS: u64 = 60;
+/// Asymmetric tolerance for forward clock skew. Client devices commonly have
+/// a few seconds of drift ahead of server time; rejecting strictly on
+/// `msg_timestamp > now` would lock out those clients. 30s leaves room for
+/// realistic NTP variance without permitting meaningful replay-window abuse.
+const ATTEST_FORWARD_SKEW_SECS: u64 = 30;
 
 #[derive(Deserialize)]
 pub struct AttestRequest {
@@ -134,7 +139,18 @@ fn verify_wallet_signature(
         .expect("system clock before UNIX epoch")
         .as_secs();
 
-    if now.abs_diff(msg_timestamp) > ATTEST_MESSAGE_MAX_AGE_SECS {
+    // Asymmetric skew check: tolerate `ATTEST_FORWARD_SKEW_SECS` of
+    // forward clock drift (client time slightly ahead of server) but
+    // reject anything older than `ATTEST_MESSAGE_MAX_AGE_SECS` to bound
+    // replay windows. The previous `abs_diff > MAX_AGE` allowed up to
+    // `MAX_AGE` seconds of forward skew too, which is symmetric and
+    // unnecessarily wide for a replay-window guard.
+    if msg_timestamp > now && msg_timestamp - now > ATTEST_FORWARD_SKEW_SECS {
+        return Err(AppError::Forbidden(
+            "Attestation message timestamp too far in future".into(),
+        ));
+    }
+    if now > msg_timestamp && now - msg_timestamp > ATTEST_MESSAGE_MAX_AGE_SECS {
         return Err(AppError::Forbidden("Attestation message has expired".into()));
     }
 
