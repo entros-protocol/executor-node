@@ -71,13 +71,21 @@ pub async fn attest_handler(
         );
     }
 
-    // 4. Verify wallet ownership via signed message
+    // 4. Verify wallet ownership via signed message. Walletless / captcha-
+    //    equivalent integrations DO submit attestation requests without a
+    //    signature — this is INTENTIONAL per the project's two-tier
+    //    integration model (wallet-connected = primary, walletless = secondary
+    //    captcha-tier). The ownership-proof path is taken when both
+    //    `signature` and `message` are provided; otherwise the request
+    //    proceeds and is logged at WARN so operators can see which tier
+    //    each call uses without forcing every walletless integrator through
+    //    a signing flow.
     if let (Some(sig_str), Some(msg)) = (&req.signature, &req.message) {
         verify_wallet_signature(&user_wallet, sig_str, msg)?;
     } else {
         tracing::warn!(
             wallet = %user_wallet,
-            "Attestation requested without wallet ownership proof"
+            "Attestation requested without wallet ownership proof (walletless tier)"
         );
     }
 

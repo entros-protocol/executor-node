@@ -66,8 +66,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Rate limiters initialized"
     );
 
-    // Initialize integrator quota tracker
+    // Initialize integrator quota tracker. Refuse to start in production
+    // if neither `API_KEYS` nor `INTEGRATORS` is populated — running open in
+    // production would silently expose every endpoint to anyone with the URL.
     let integrator_count = config.integrators.len();
+    if environment == "prod" && config.api_keys.is_empty() && integrator_count == 0 {
+        return Err(
+            "API_KEYS or INTEGRATORS must be populated when ENVIRONMENT=prod \
+             (refusing to start without any auth configuration)"
+                .into(),
+        );
+    }
     let tracker = Arc::new(IntegratorTracker::new(config.integrators));
     let wallet_attempts = Arc::new(WalletAttemptTracker::new(
         config.wallet_max_attempts,

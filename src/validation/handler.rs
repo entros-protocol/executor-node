@@ -175,7 +175,7 @@ pub async fn validate_features_handler(
             .ok()
             .and_then(|body| body.reason);
         tracing::info!(
-            api_key = %api_key,
+            api_key = %crate::auth::redact::redact_api_key(&api_key),
             wallet_id = %req.wallet_id,
             reason = ?reason,
             "Feature validation rejected"
@@ -186,7 +186,7 @@ pub async fn validate_features_handler(
     // Validation passed — refund the per-wallet attempt slot so a wallet
     // with all-successful verifications never accumulates against the cap.
     state.wallet_attempts.refund_on_success(&wallet);
-    tracing::info!(api_key = %api_key, wallet_id = %req.wallet_id, "Feature validation passed");
+    tracing::info!(api_key = %crate::auth::redact::redact_api_key(&api_key), wallet_id = %req.wallet_id, "Feature validation passed");
 
     Ok(Json(ValidateFeaturesResponse {
         valid: true,

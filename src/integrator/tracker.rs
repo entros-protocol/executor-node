@@ -49,7 +49,10 @@ impl IntegratorTracker {
     pub fn check_and_deduct(&self, api_key: &str) -> Result<u64, AppError> {
         if !self.state.contains_key(api_key) {
             if !self.allow_unknown {
-                tracing::warn!(api_key, "Verification rejected: unknown integrator");
+                tracing::warn!(
+                    api_key = %crate::auth::redact::redact_api_key(api_key),
+                    "Verification rejected: unknown integrator"
+                );
                 return Err(AppError::InsufficientQuota);
             }
             // Dev mode: auto-register with free tier (bounded by auth — only valid API keys reach here)
@@ -73,7 +76,7 @@ impl IntegratorTracker {
         // quota == 0 means unlimited
         if state.quota > 0 && state.used >= state.quota {
             tracing::warn!(
-                api_key,
+                api_key = %crate::auth::redact::redact_api_key(api_key),
                 quota = state.quota,
                 used = state.used,
                 "Verification rejected: quota exhausted"
@@ -89,7 +92,7 @@ impl IntegratorTracker {
         };
 
         tracing::info!(
-            api_key,
+            api_key = %crate::auth::redact::redact_api_key(api_key),
             integrator = %state.name,
             used = state.used,
             remaining,

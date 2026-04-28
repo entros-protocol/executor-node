@@ -62,7 +62,7 @@ async fn rate_limit_middleware(
         .unwrap_or("authenticated");
 
     if state.rate_limiter.check(key).is_err() {
-        tracing::warn!(api_key = key, "Rate limit exceeded");
+        tracing::warn!(api_key = %crate::auth::redact::redact_api_key(key), "Rate limit exceeded");
         return Err(AppError::RateLimited);
     }
 
@@ -81,7 +81,10 @@ async fn attest_rate_limit_middleware(
         .unwrap_or("authenticated");
 
     if state.attest_rate_limiter.check(key).is_err() {
-        tracing::warn!(api_key = key, "Attestation rate limit exceeded");
+        tracing::warn!(
+            api_key = %crate::auth::redact::redact_api_key(key),
+            "Attestation rate limit exceeded"
+        );
         return Err(AppError::RateLimited);
     }
 
