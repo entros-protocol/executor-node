@@ -45,4 +45,30 @@ mod tests {
     fn handles_empty() {
         assert_eq!(redact_api_key(""), "<empty>");
     }
+
+    #[test]
+    fn handles_key_shorter_than_prefix_length() {
+        // 5-char key < REDACT_PREFIX_LEN (6). Should take all 5 chars + ellipsis.
+        assert_eq!(redact_api_key("abcde"), "abcde…");
+    }
+
+    #[test]
+    fn handles_key_exactly_at_prefix_length() {
+        // 6-char key == REDACT_PREFIX_LEN. Should take all 6 + ellipsis.
+        assert_eq!(redact_api_key("abcdef"), "abcdef…");
+    }
+
+    #[test]
+    fn redaction_is_deterministic() {
+        let full = "gRAC5wF+6TPcQr25iCTgxSxj00fmmalXLXOlEn6yhFw=";
+        assert_eq!(redact_api_key(full), redact_api_key(full));
+    }
+
+    #[test]
+    fn redaction_does_not_leak_key_length() {
+        // Two keys of very different lengths produce same-length redacted output.
+        let short = redact_api_key("abcdefxxxxx");
+        let long = redact_api_key("abcdefxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+        assert_eq!(short.chars().count(), long.chars().count());
+    }
 }
