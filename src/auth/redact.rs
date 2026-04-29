@@ -1,6 +1,6 @@
-//! Helper for redacting API keys in log lines so operators can correlate
-//! requests by key prefix without exposing the full secret to anyone with
-//! log access (or a leaked log file).
+//! Helper for redacting API keys and wallet IDs in log lines so operators
+//! can correlate requests by prefix without exposing the full identifier
+//! to anyone with log access (or a leaked log file).
 
 const REDACT_PREFIX_LEN: usize = 6;
 
@@ -20,6 +20,33 @@ pub fn redact_api_key(key: &str) -> String {
     let take = REDACT_PREFIX_LEN.min(key.len());
     let mut s = String::with_capacity(take + 2);
     s.push_str(&key[..take]);
+    s.push('…');
+    s
+}
+
+/// Returns a short, log-safe form of a wallet pubkey.
+///
+/// Solana wallet pubkeys in base58 are 32–44 characters. The first 6
+/// characters are sufficient to correlate log entries within an
+/// integrator's traffic without retaining the full pubkey string in
+/// operational logs. Wallet pubkeys are public on-chain data — every
+/// transaction discloses the signer pubkey — so prefix redaction is a
+/// privacy-by-architecture choice (keeping logs from becoming a secondary
+/// surface for wallet-activity reconstruction) rather than a secrecy
+/// primitive. Combined with structured logging plus the redacted API key,
+/// operators can still triage incidents per integrator without retaining
+/// per-wallet activity histories.
+///
+/// `"7xKxYBz2RdzBPyABxMfEHmgYPzqgxhCiW9TpRP4u9YCM"`
+///   becomes
+/// `"7xKxYB…"`
+pub fn redact_wallet_id(wallet: &str) -> String {
+    if wallet.is_empty() {
+        return "<empty>".into();
+    }
+    let take = REDACT_PREFIX_LEN.min(wallet.len());
+    let mut s = String::with_capacity(take + 2);
+    s.push_str(&wallet[..take]);
     s.push('…');
     s
 }
@@ -70,5 +97,23 @@ mod tests {
         let short = redact_api_key("abcdefxxxxx");
         let long = redact_api_key("abcdefxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
         assert_eq!(short.chars().count(), long.chars().count());
+    }
+
+    #[test]
+    fn redacts_wallet_pubkey_to_prefix() {
+        let full = "7xKxYBz2RdzBPyABxMfEHmgYPzqgxhCiW9TpRP4u9YCM";
+        let redacted = redact_wallet_id(full);
+        assert_eq!(redacted, "7xKxYB…");
+        assert!(!redacted.contains("9YCM"));
+    }
+
+    #[test]
+    fn redact_wallet_handles_empty() {
+        assert_eq!(redact_wallet_id(""), "<empty>");
+    }
+
+    #[test]
+    fn redact_wallet_handles_short_input() {
+        assert_eq!(redact_wallet_id("abc"), "abc…");
     }
 }

@@ -61,12 +61,16 @@ pub async fn attest_handler(
             .challenge_registry
             .validate_and_consume(&user_wallet, &nonce_arr, state.challenge_ttl_secs)
             .map_err(|e| {
-                tracing::warn!(wallet = %user_wallet, error = %e, "Challenge nonce validation failed");
+                tracing::warn!(
+                    wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
+                    error = %e,
+                    "Challenge nonce validation failed"
+                );
                 AppError::Forbidden(format!("Challenge validation failed: {e}"))
             })?;
     } else {
         tracing::warn!(
-            wallet = %user_wallet,
+            wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
             "Attestation requested without server-issued nonce"
         );
     }
@@ -84,7 +88,7 @@ pub async fn attest_handler(
         verify_wallet_signature(&user_wallet, sig_str, msg)?;
     } else {
         tracing::warn!(
-            wallet = %user_wallet,
+            wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
             "Attestation requested without wallet ownership proof (walletless tier)"
         );
     }
@@ -93,7 +97,7 @@ pub async fn attest_handler(
     match attestor.issue_attestation(&user_wallet).await {
         Ok(sig) => {
             tracing::info!(
-                wallet = %user_wallet,
+                wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
                 attestation_sig = %sig,
                 "SAS attestation issued"
             );
@@ -108,7 +112,7 @@ pub async fn attest_handler(
         }
         Err(e) => {
             tracing::error!(
-                wallet = %user_wallet,
+                wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
                 error = %e,
                 "SAS attestation failed"
             );

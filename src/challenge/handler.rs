@@ -34,7 +34,10 @@ pub async fn challenge_handler(
 
     let (nonce, phrase) = state.challenge_registry.issue(wallet);
 
-    tracing::debug!(wallet = %wallet, "Challenge nonce and phrase issued");
+    tracing::debug!(
+        wallet = %crate::auth::redact::redact_wallet_id(&wallet.to_string()),
+        "Challenge nonce and phrase issued"
+    );
 
     Ok(Json(ChallengeResponse {
         nonce: nonce.to_vec(),
