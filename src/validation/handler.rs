@@ -31,6 +31,14 @@ pub struct ValidateFeaturesRequest {
     /// with Bluetooth codec negotiation).
     #[serde(default)]
     pub audio_sample_rate_hz: Option<u32>,
+    /// Hex-encoded 32-byte commitment that will be submitted on-chain in
+    /// the upcoming `mint_anchor` transaction (master-list #146 Phase 2).
+    /// Forwarded unchanged to the validation service, which signs a
+    /// (wallet, commitment, validated_at) receipt when this is present and
+    /// validation passes. Absent for re-verification (`update_anchor`)
+    /// flows and pre-receipt SDK versions.
+    #[serde(default)]
+    pub commitment_new_hex: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -38,6 +46,26 @@ pub struct ValidateFeaturesResponse {
     pub valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_quota: Option<u64>,
+    /// Validator-signed receipt forwarded from the validation service when
+    /// the request included `commitment_new_hex` (master-list #146 Phase 2).
+    /// The SDK uses this to build an `Ed25519Program::verify` instruction
+    /// bundled before `mint_anchor` in the same atomic transaction. Absent
+    /// when the validator isn't configured for signing, when the SDK didn't
+    /// supply a commitment, or when the validator returned a body without
+    /// the field (older validator versions).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signed_receipt: Option<SignedReceiptDto>,
+}
+
+/// Wire-format mirror of `entros_validation::SignedReceiptDto`. Defined
+/// locally so the executor doesn't pull in the validator crate (different
+/// repo, different release cadence). Wire fields must stay byte-identical
+/// to the validator's serialization.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct SignedReceiptDto {
+    pub validator_pubkey_hex: String,
+    pub message_hex: String,
+    pub signature_hex: String,
 }
 
 pub async fn validate_features_handler(
@@ -67,7 +95,7 @@ pub async fn validate_features_handler(
     // burn the integrator's quota.
     if let Err(retry_after_secs) = state.wallet_attempts.check_and_record_attempt(&wallet) {
         tracing::info!(
-            wallet_id = %req.wallet_id,
+            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             retry_after_secs,
             "Wallet rate limited"
         );
@@ -101,6 +129,7 @@ pub async fn validate_features_handler(
             return Ok(Json(ValidateFeaturesResponse {
                 valid: true,
                 remaining_quota: Some(remaining),
+                signed_receipt: None,
             }));
         }
     };
@@ -132,6 +161,7 @@ pub async fn validate_features_handler(
             "audio_samples_b64": req.audio_samples_b64,
             "audio_sample_rate_hz": req.audio_sample_rate_hz,
             "expected_phrase": expected_phrase,
+            "commitment_new_hex": req.commitment_new_hex,
         }))
         .timeout(std::time::Duration::from_secs(8));
 
@@ -176,7 +206,7 @@ pub async fn validate_features_handler(
             .and_then(|body| body.reason);
         tracing::info!(
             api_key = %crate::auth::redact::redact_api_key(&api_key),
-            wallet_id = %req.wallet_id,
+            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             reason = ?reason,
             "Feature validation rejected"
         );
@@ -186,6 +216,23 @@ pub async fn validate_features_handler(
     // Validation passed — refund the per-wallet attempt slot so a wallet
     // with all-successful verifications never accumulates against the cap.
     state.wallet_attempts.refund_on_success(&wallet);
+
+    // Read the validator's success body to forward the signed receipt
+    // (master-list #146 Phase 2). Older validator versions return
+    // `{ "valid": true }` without the `signed_receipt` field — parse
+    // failure or missing field both map to `None` and the SDK falls back
+    // to the no-binding mint flow.
+    #[derive(serde::Deserialize)]
+    struct ValidatorSuccessBody {
+        #[serde(default)]
+        signed_receipt: Option<SignedReceiptDto>,
+    }
+    let signed_receipt = response
+        .json::<ValidatorSuccessBody>()
+        .await
+        .ok()
+        .and_then(|body| body.signed_receipt);
+
     tracing::info!(
         api_key = %crate::auth::redact::redact_api_key(&api_key),
         wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -195,5 +242,6 @@ pub async fn validate_features_handler(
     Ok(Json(ValidateFeaturesResponse {
         valid: true,
         remaining_quota: Some(remaining),
+        signed_receipt,
     }))
 }
