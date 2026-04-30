@@ -181,3 +181,66 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
+
+/// Build an `AppState` for handler-level tests. Tests call handlers
+/// directly (bypassing the auth/rate-limit middleware stack), so
+/// `api_keys` is intentionally empty — modeling middleware behavior is
+/// not the responsibility of these scaffolds.
+#[cfg(test)]
+pub fn build_test_state(
+    tracker: Arc<IntegratorTracker>,
+    validation_url: Option<String>,
+) -> AppState {
+    use solana_sdk::signature::Keypair;
+    use std::time::Duration;
+
+    let solana_client = Arc::new(crate::solana::client::SolanaClient::new(
+        "http://127.0.0.1:8899",
+        Keypair::new(),
+    ));
+    AppState {
+        relayer_tx: Arc::new(RelayerTransaction::new(solana_client)),
+        api_keys: Arc::new(vec![]),
+        rate_limiter: Arc::new(RateLimiter::new(60)),
+        attest_rate_limiter: Arc::new(RateLimiter::new(10)),
+        tracker,
+        wallet_attempts: Arc::new(WalletAttemptTracker::new(5, Duration::from_secs(3600))),
+        commitment_registry: Arc::new(CommitmentRegistry::new()),
+        sas_attestor: None,
+        metrics: Arc::new(StatusMetrics::new()),
+        http_client: Arc::new(reqwest::Client::new()),
+        validation_url,
+        validation_api_key: None,
+        challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
+        challenge_ttl_secs: 300,
+    }
+}
+
+/// Build an `IntegratorTracker` pre-loaded with a single key + quota.
+#[cfg(test)]
+pub fn tracker_with_quota(api_key: &str, quota: u64) -> Arc<IntegratorTracker> {
+    use crate::config::IntegratorConfig;
+    Arc::new(IntegratorTracker::new(vec![IntegratorConfig {
+        api_key: api_key.into(),
+        name: "TestApp".into(),
+        quota,
+    }]))
+}
+
+/// Build an `axum::http::HeaderMap` carrying just `X-API-Key`. Other
+/// headers are not material to the structural-failure invariants these
+/// tests cover.
+#[cfg(test)]
+pub fn headers_with_key(api_key: &str) -> axum::http::HeaderMap {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert("x-api-key", api_key.parse().unwrap());
+    headers
+}
+
+/// Generate a fresh, valid Solana wallet id (base58 pubkey) for tests
+/// that need a parseable wallet but don't care about its identity.
+#[cfg(test)]
+pub fn random_wallet_id() -> String {
+    use solana_sdk::signature::{Keypair, Signer};
+    Keypair::new().pubkey().to_string()
+}
