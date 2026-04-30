@@ -6,6 +6,7 @@ use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
 use crate::error::AppError;
+use crate::padding::PaddedJson;
 use crate::server::AppState;
 
 #[derive(Deserialize)]
@@ -72,7 +73,7 @@ pub async fn validate_features_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ValidateFeaturesRequest>,
-) -> Result<Json<ValidateFeaturesResponse>, AppError> {
+) -> Result<PaddedJson<ValidateFeaturesResponse>, AppError> {
     let api_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
@@ -126,7 +127,7 @@ pub async fn validate_features_handler(
             // dev environments without a validator don't accidentally
             // tick wallets toward their cap.
             state.wallet_attempts.refund_on_success(&wallet);
-            return Ok(Json(ValidateFeaturesResponse {
+            return Ok(PaddedJson(ValidateFeaturesResponse {
                 valid: true,
                 remaining_quota: Some(remaining),
                 signed_receipt: None,
@@ -239,7 +240,7 @@ pub async fn validate_features_handler(
         "Feature validation passed"
     );
 
-    Ok(Json(ValidateFeaturesResponse {
+    Ok(PaddedJson(ValidateFeaturesResponse {
         valid: true,
         remaining_quota: Some(remaining),
         signed_receipt,

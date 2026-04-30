@@ -6,6 +6,7 @@ use solana_sdk::signature::Signature;
 use std::str::FromStr;
 
 use crate::error::AppError;
+use crate::padding::PaddedJson;
 use crate::server::AppState;
 
 /// Maximum age of a signed attestation message (seconds).
@@ -39,7 +40,7 @@ pub struct AttestResponse {
 pub async fn attest_handler(
     State(state): State<AppState>,
     Json(req): Json<AttestRequest>,
-) -> Result<Json<AttestResponse>, AppError> {
+) -> Result<PaddedJson<AttestResponse>, AppError> {
     // 1. Check SAS is configured
     let attestor = state.sas_attestor.as_ref().ok_or_else(|| {
         AppError::InvalidRequest("SAS attestation is not configured".into())
@@ -93,7 +94,7 @@ pub async fn attest_handler(
 
             state.metrics.increment_attestations();
 
-            Ok(Json(AttestResponse {
+            Ok(PaddedJson(AttestResponse {
                 success: true,
                 attestation_tx: Some(sig),
                 error: None,
@@ -105,7 +106,7 @@ pub async fn attest_handler(
                 error = %e,
                 "SAS attestation failed"
             );
-            Ok(Json(AttestResponse {
+            Ok(PaddedJson(AttestResponse {
                 success: false,
                 attestation_tx: None,
                 error: Some(e.to_string()),

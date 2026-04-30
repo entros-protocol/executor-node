@@ -3,6 +3,7 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::padding::PaddedJson;
 use crate::server::AppState;
 
 #[derive(Deserialize)]
@@ -33,7 +34,7 @@ pub async fn verify_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<VerifyRequest>,
-) -> Result<Json<VerifyResponse>, AppError> {
+) -> Result<PaddedJson<VerifyResponse>, AppError> {
     let api_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
@@ -76,7 +77,7 @@ pub async fn verify_handler(
             "First verification: commitment registered (no proof required)"
         );
 
-        return Ok(Json(VerifyResponse {
+        return Ok(PaddedJson(VerifyResponse {
             success: true,
             tx_signature: None,
             verified: None,
@@ -139,7 +140,7 @@ pub async fn verify_handler(
 
     state.metrics.increment_verifications();
 
-    Ok(Json(VerifyResponse {
+    Ok(PaddedJson(VerifyResponse {
         success: true,
         tx_signature: Some(outcome.signature),
         verified: Some(outcome.is_valid),

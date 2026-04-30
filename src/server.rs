@@ -100,10 +100,34 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
             attest_rate_limit_middleware,
         ));
 
-    // Standard routes with shared rate limit (60/min)
-    let verify_routes = Router::new()
+    // Endpoints whose timing distinguishes outcome classes go through a
+    // min-duration clamp so rate-limit and quota rejections take the same
+    // wall-time as a successful validator round-trip. /challenge and /attest
+    // stay off this path: their UX hits the user-perceptible latency budget
+    // and their outcomes are already wallet-attributable.
+    let timed_routes = Router::new()
         .route("/verify", post(verify_handler))
         .route("/validate-features", post(validate_features_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .route_layer(middleware::from_fn(crate::timing::min_duration_middleware));
+
+    // Untimed authenticated routes: /challenge issues nonces (fast by design,
+    // user-blocking before the verify call) and /attest already exposes its
+    // outcome shape via a wallet-attributable error.
+    //
+    // The duplicated rate_limit + auth route_layer applications below are
+    // intentional: timed_routes need min_duration to wrap auth+rate_limit so
+    // pre-handler short-circuits also clamp to the timing budget. Each
+    // Router carries its own layer stack but the same `state.rate_limiter`
+    // (Arc) backs both, so counters merge across the route groups.
+    let untimed_routes = Router::new()
         .route("/challenge", get(challenge_handler))
         .merge(attest_route)
         .route_layer(middleware::from_fn_with_state(
@@ -114,6 +138,8 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
             state.clone(),
             auth_middleware,
         ));
+
+    let verify_routes = timed_routes.merge(untimed_routes);
 
     let cors = if cors_origins.is_empty() {
         // No origins configured — permissive for development

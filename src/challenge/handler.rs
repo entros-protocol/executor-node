@@ -1,10 +1,10 @@
 use axum::extract::{Query, State};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
 use crate::error::AppError;
+use crate::padding::PaddedJson;
 use crate::server::AppState;
 
 #[derive(Deserialize)]
@@ -27,7 +27,7 @@ pub struct ChallengeResponse {
 pub async fn challenge_handler(
     State(state): State<AppState>,
     Query(req): Query<ChallengeRequest>,
-) -> Result<Json<ChallengeResponse>, AppError> {
+) -> Result<PaddedJson<ChallengeResponse>, AppError> {
     let wallet = Pubkey::from_str(&req.wallet).map_err(|_| {
         AppError::InvalidRequest(format!("Invalid wallet address: {}", req.wallet))
     })?;
@@ -39,7 +39,7 @@ pub async fn challenge_handler(
         "Challenge nonce and phrase issued"
     );
 
-    Ok(Json(ChallengeResponse {
+    Ok(PaddedJson(ChallengeResponse {
         nonce: nonce.to_vec(),
         expires_in: state.challenge_ttl_secs,
         phrase,

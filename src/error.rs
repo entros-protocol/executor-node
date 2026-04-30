@@ -2,6 +2,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+use crate::padding::Padded;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("Invalid request: {0}")]
@@ -78,7 +80,9 @@ impl IntoResponse for AppError {
 
         // ValidationFailed surfaces an optional `reason` field for the
         // user-recoverable subset; WalletRateLimited surfaces `reason +
-        // retry_after`; everything else returns `{error}` only.
+        // retry_after`; everything else returns `{error}` only. Bodies are
+        // padded so an outside observer can't read outcome class from the
+        // response byte length on timed endpoints.
         let body = match &self {
             AppError::ValidationFailed { reason: Some(r) } => {
                 json!({ "error": message, "reason": r })
@@ -92,6 +96,6 @@ impl IntoResponse for AppError {
             }
             _ => json!({ "error": message }),
         };
-        (status, axum::Json(body)).into_response()
+        (status, axum::Json(Padded::new(body))).into_response()
     }
 }
