@@ -281,4 +281,147 @@ mod tests {
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
     }
+
+    mod handler_refund_invariant {
+        use super::*;
+        use crate::integrator::tracker::IntegratorTracker;
+        use crate::server::{build_test_state, headers_with_key, tracker_with_quota, AppState};
+        use std::sync::Arc;
+
+        const TEST_COMMITMENT: [u8; 32] = [7u8; 32];
+        const FRESH_COMMITMENT: [u8; 32] = [11u8; 32];
+
+        /// Build a state with the test commitment pre-registered against the
+        /// given api_key so the handler classifies subsequent requests as
+        /// re-verification (is_first=false) and reaches the proof-shape check.
+        fn state_with_known_commitment(tracker: Arc<IntegratorTracker>, api_key: &str) -> AppState {
+            let state = build_test_state(tracker, None);
+            state
+                .commitment_registry
+                .check_and_record(api_key, TEST_COMMITMENT);
+            state
+        }
+
+        fn build_request(
+            proof_len: usize,
+            public_inputs: Vec<Vec<u8>>,
+            commitment: [u8; 32],
+            is_first: bool,
+        ) -> VerifyRequest {
+            VerifyRequest {
+                proof_bytes: vec![0u8; proof_len],
+                public_inputs,
+                commitment: commitment.to_vec(),
+                is_first_verification: is_first,
+            }
+        }
+
+        #[tokio::test]
+        async fn proof_bytes_wrong_size_refunds_quota() {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = state_with_known_commitment(tracker.clone(), "test-key");
+            let req = build_request(255, valid_inputs(), TEST_COMMITMENT, false);
+
+            let result =
+                verify_handler(State(state), headers_with_key("test-key"), Json(req)).await;
+
+            assert!(
+                matches!(result, Err(AppError::InvalidRequest(_))),
+                "expected InvalidRequest"
+            );
+            assert_eq!(
+                tracker.get_remaining("test-key"),
+                10,
+                "proof_bytes shape failure must refund the integrator quota"
+            );
+        }
+
+        #[tokio::test]
+        async fn public_inputs_wrong_count_refunds_quota() {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = state_with_known_commitment(tracker.clone(), "test-key");
+            let req = build_request(256, vec![vec![0u8; 32]; 3], TEST_COMMITMENT, false);
+
+            let result =
+                verify_handler(State(state), headers_with_key("test-key"), Json(req)).await;
+
+            assert!(
+                matches!(result, Err(AppError::InvalidRequest(_))),
+                "expected InvalidRequest"
+            );
+            assert_eq!(
+                tracker.get_remaining("test-key"),
+                10,
+                "public_inputs count failure must refund the integrator quota"
+            );
+        }
+
+        #[tokio::test]
+        async fn public_input_element_wrong_size_refunds_quota() {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = state_with_known_commitment(tracker.clone(), "test-key");
+            let mut inputs = valid_inputs();
+            inputs[1] = vec![0u8; 31];
+            let req = build_request(256, inputs, TEST_COMMITMENT, false);
+
+            let result =
+                verify_handler(State(state), headers_with_key("test-key"), Json(req)).await;
+
+            assert!(
+                matches!(result, Err(AppError::InvalidRequest(_))),
+                "expected InvalidRequest"
+            );
+            assert_eq!(
+                tracker.get_remaining("test-key"),
+                10,
+                "per-element shape failure must refund the integrator quota"
+            );
+        }
+
+        #[tokio::test]
+        async fn commitment_wrong_size_does_not_deduct_quota() {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = build_test_state(tracker.clone(), None);
+            let req = VerifyRequest {
+                proof_bytes: vec![0u8; 256],
+                public_inputs: valid_inputs(),
+                commitment: vec![0u8; 31],
+                is_first_verification: false,
+            };
+
+            let result =
+                verify_handler(State(state), headers_with_key("test-key"), Json(req)).await;
+
+            assert!(
+                matches!(result, Err(AppError::InvalidRequest(_))),
+                "expected InvalidRequest"
+            );
+            assert_eq!(
+                tracker.get_remaining("test-key"),
+                10,
+                "commitment shape failure happens before deduct — quota must be untouched"
+            );
+        }
+
+        #[tokio::test]
+        async fn first_verification_deducts_quota() {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = build_test_state(tracker.clone(), None);
+            let req = build_request(0, vec![], FRESH_COMMITMENT, true);
+
+            let result =
+                verify_handler(State(state), headers_with_key("test-key"), Json(req)).await;
+
+            assert!(
+                result.is_ok(),
+                "first-verify should succeed, got {:?}",
+                result.err()
+            );
+            assert_eq!(
+                tracker.get_remaining("test-key"),
+                9,
+                "first-verify is a real verification event — quota must be deducted"
+            );
+        }
+    }
 }

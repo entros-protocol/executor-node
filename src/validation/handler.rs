@@ -117,19 +117,22 @@ pub async fn validate_features_handler(
         }
     };
 
-    // If validation service is not configured, pass through
+    // If validation service is not configured, pass through. No
+    // validation actually ran — refund the wallet slot AND the integrator
+    // quota so dev environments without a validator don't tick either
+    // budget, and skip the metrics increment so `validations_performed`
+    // reflects work that actually happened. Re-read remaining_quota after
+    // the refund so the response reflects the restored balance.
     let validation_url = match &state.validation_url {
         Some(url) => url,
         None => {
             tracing::debug!("Validation service not configured, skipping");
-            state.metrics.increment_validations();
-            // Validation didn't actually run; refund the wallet slot so
-            // dev environments without a validator don't accidentally
-            // tick wallets toward their cap.
             state.wallet_attempts.refund_on_success(&wallet);
+            state.tracker.refund(&api_key);
+            let remaining_after_refund = state.tracker.get_remaining(&api_key);
             return Ok(PaddedJson(ValidateFeaturesResponse {
                 valid: true,
-                remaining_quota: Some(remaining),
+                remaining_quota: Some(remaining_after_refund),
                 signed_receipt: None,
             }));
         }
@@ -234,4 +237,59 @@ pub async fn validate_features_handler(
         remaining_quota: Some(remaining),
         signed_receipt,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
+
+    fn baseline_request(wallet_id: String) -> ValidateFeaturesRequest {
+        ValidateFeaturesRequest {
+            features: vec![0.0; 134],
+            wallet_id,
+            f0_contour: None,
+            accel_magnitude: None,
+            audio_samples_b64: None,
+            audio_sample_rate_hz: None,
+            commitment_new_hex: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn dev_skip_refunds_integrator_quota() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let state = build_test_state(tracker.clone(), None);
+        let headers = headers_with_key("test-key");
+        let req = baseline_request(random_wallet_id());
+
+        let result = validate_features_handler(State(state), headers, Json(req)).await;
+
+        assert!(result.is_ok(), "expected success, got {:?}", result.err());
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            10,
+            "dev-skip path must refund the integrator quota"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_wallet_id_does_not_deduct_quota() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let state = build_test_state(tracker.clone(), None);
+        let headers = headers_with_key("test-key");
+        let req = baseline_request("not-a-pubkey".into());
+
+        let result = validate_features_handler(State(state), headers, Json(req)).await;
+
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(_))),
+            "expected InvalidRequest"
+        );
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            10,
+            "wallet-shape failure happens before deduct — quota must be untouched"
+        );
+    }
 }
