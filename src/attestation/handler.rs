@@ -45,55 +45,44 @@ pub async fn attest_handler(
         AppError::InvalidRequest("SAS attestation is not configured".into())
     })?;
 
-    // 2. Parse wallet address
+    // 2. Require all three ownership-proof fields. Walletless flows no longer
+    //    write to SAS — they were the captcha-equivalent tier, and aliasing
+    //    them through SAS created a griefing surface where a caller could
+    //    issue attestations against any target wallet pubkey without proof
+    //    of control. SAS is now wallet-only. Walletless integrators get
+    //    client-side ephemeral receipts only.
+    let (nonce, signature, message) = match (&req.nonce, &req.signature, &req.message) {
+        (Some(n), Some(s), Some(m)) => (n, s, m),
+        _ => return Err(AppError::InvalidRequest("wallet_ownership_required".into())),
+    };
+
+    // 3. Parse wallet address
     let user_wallet = Pubkey::from_str(&req.wallet_address).map_err(|_| {
         AppError::InvalidRequest(format!("Invalid wallet address: {}", req.wallet_address))
     })?;
 
-    // 3. Validate server-issued challenge nonce
-    if let Some(nonce) = &req.nonce {
-        let nonce_arr: [u8; 32] = nonce
-            .as_slice()
-            .try_into()
-            .map_err(|_| AppError::InvalidRequest("Nonce must be 32 bytes".into()))?;
+    // 4. Validate server-issued challenge nonce
+    let nonce_arr: [u8; 32] = nonce
+        .as_slice()
+        .try_into()
+        .map_err(|_| AppError::InvalidRequest("Nonce must be 32 bytes".into()))?;
 
-        state
-            .challenge_registry
-            .validate_and_consume(&user_wallet, &nonce_arr, state.challenge_ttl_secs)
-            .map_err(|e| {
-                tracing::warn!(
-                    wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
-                    error = %e,
-                    "Challenge nonce validation failed"
-                );
-                AppError::Forbidden(format!("Challenge validation failed: {e}"))
-            })?;
-    } else {
-        tracing::warn!(
-            wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
-            "Attestation requested without server-issued nonce"
-        );
-    }
+    state
+        .challenge_registry
+        .validate_and_consume(&user_wallet, &nonce_arr, state.challenge_ttl_secs)
+        .map_err(|e| {
+            tracing::warn!(
+                wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
+                error = %e,
+                "Challenge nonce validation failed"
+            );
+            AppError::Forbidden(format!("Challenge validation failed: {e}"))
+        })?;
 
-    // 4. Verify wallet ownership via signed message. Walletless / captcha-
-    //    equivalent integrations DO submit attestation requests without a
-    //    signature — this is INTENTIONAL per the project's two-tier
-    //    integration model (wallet-connected = primary, walletless = secondary
-    //    captcha-tier). The ownership-proof path is taken when both
-    //    `signature` and `message` are provided; otherwise the request
-    //    proceeds and is logged at WARN so operators can see which tier
-    //    each call uses without forcing every walletless integrator through
-    //    a signing flow.
-    if let (Some(sig_str), Some(msg)) = (&req.signature, &req.message) {
-        verify_wallet_signature(&user_wallet, sig_str, msg)?;
-    } else {
-        tracing::warn!(
-            wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
-            "Attestation requested without wallet ownership proof (walletless tier)"
-        );
-    }
+    // 5. Verify wallet ownership via signed message
+    verify_wallet_signature(&user_wallet, signature, message)?;
 
-    // 5. Issue attestation
+    // 6. Issue attestation
     match attestor.issue_attestation(&user_wallet).await {
         Ok(sig) => {
             tracing::info!(
