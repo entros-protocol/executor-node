@@ -3,13 +3,17 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "setup": "npx tsx sas-setup.ts"
+    "setup": "npx tsx sas-setup.ts",
+    "sign-url": "npx tsx sign-validator-url.ts"
   },
   "dependencies": {
     "sas-lib": "^1.0.10",
-    "@solana/kit": "^5.0.0"
+    "@solana/kit": "^5.0.0",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
   },
   "devDependencies": {
-    "tsx": "^4.0.0"
+    "tsx": "^4.0.0",
+    "@types/node": "^20.0.0"
   }
 }

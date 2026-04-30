@@ -108,8 +108,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let http_client = Arc::new(reqwest::Client::new());
+    // Pin VALIDATION_SERVICE_URL with a deploy-time Ed25519 signature so an
+    // attacker with environment-variable access cannot repoint validation
+    // traffic to a malicious validator. In prod, both URL and signature are
+    // required; the signature must verify against the hardcoded protocol
+    // authority pubkey. In dev, the signature is advisory — verified if
+    // present, skipped otherwise so local development isn't blocked on the
+    // signing tool. Use `scripts/sign-validator-url.ts` to produce signatures.
     if let Some(url) = &config.validation_service_url {
-        tracing::info!(url = %url, "Validation service configured");
+        match (environment.as_str(), &config.validation_service_url_signature) {
+            ("prod", None) => {
+                return Err(
+                    "VALIDATION_SERVICE_URL_SIGNATURE is required when ENVIRONMENT=prod \
+                     (refusing to launch with an unsigned validator URL — sign with \
+                     scripts/sign-validator-url.ts)"
+                        .into(),
+                );
+            }
+            (_, Some(sig)) => {
+                config::verify_validation_url_signature(url, sig)?;
+                tracing::info!(url = %url, "Validation service configured (URL signature verified)");
+            }
+            (_, None) => {
+                tracing::info!(url = %url, "Validation service configured (dev mode, no URL signature)");
+            }
+        }
     } else {
         tracing::info!("Validation service not configured (VALIDATION_SERVICE_URL not set)");
     }
