@@ -30,6 +30,45 @@ pub struct VerifyResponse {
     pub error: Option<String>,
 }
 
+/// Pure structural validation of a Groth16 proof payload. Returns the
+/// parsed `[[u8; 32]; 4]` public-input array on success, or an
+/// `InvalidRequest` describing the first failed shape check. Takes the
+/// two raw byte slices it reads rather than a whole `VerifyRequest` so
+/// the helper has no implicit dependency on unrelated request fields and
+/// is trivially testable in isolation.
+fn validate_proof_shape(
+    proof_bytes: &[u8],
+    public_inputs: &[Vec<u8>],
+) -> Result<[[u8; 32]; 4], AppError> {
+    if proof_bytes.len() != 256 {
+        return Err(AppError::InvalidRequest(format!(
+            "proof_bytes must be 256 bytes, got {}",
+            proof_bytes.len()
+        )));
+    }
+
+    if public_inputs.len() != 4 {
+        return Err(AppError::InvalidRequest(format!(
+            "public_inputs must have 4 elements, got {}",
+            public_inputs.len()
+        )));
+    }
+
+    let mut inputs: [[u8; 32]; 4] = [[0u8; 32]; 4];
+    for (i, pi) in public_inputs.iter().enumerate() {
+        if pi.len() != 32 {
+            return Err(AppError::InvalidRequest(format!(
+                "public_inputs[{}] must be 32 bytes, got {}",
+                i,
+                pi.len()
+            )));
+        }
+        inputs[i].copy_from_slice(pi);
+    }
+
+    Ok(inputs)
+}
+
 pub async fn verify_handler(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -87,35 +126,18 @@ pub async fn verify_handler(
         }));
     }
 
-    // Re-verification: validate and submit proof on-chain
-    if req.proof_bytes.len() != 256 {
-        state.tracker.refund(&api_key);
-        return Err(AppError::InvalidRequest(format!(
-            "proof_bytes must be 256 bytes, got {}",
-            req.proof_bytes.len()
-        )));
-    }
-
-    if req.public_inputs.len() != 4 {
-        state.tracker.refund(&api_key);
-        return Err(AppError::InvalidRequest(format!(
-            "public_inputs must have 4 elements, got {}",
-            req.public_inputs.len()
-        )));
-    }
-
-    let mut inputs: [[u8; 32]; 4] = [[0u8; 32]; 4];
-    for (i, pi) in req.public_inputs.iter().enumerate() {
-        if pi.len() != 32 {
+    // Re-verification: validate proof shape, then submit on-chain. The
+    // shape check is a pure structural validation against the request body
+    // — separated into a helper so a single refund site replaces the three
+    // earlier inline checks, and so the structural-failure invariant is
+    // testable in isolation from the handler's runtime dependencies.
+    let inputs = match validate_proof_shape(&req.proof_bytes, &req.public_inputs) {
+        Ok(inputs) => inputs,
+        Err(e) => {
             state.tracker.refund(&api_key);
-            return Err(AppError::InvalidRequest(format!(
-                "public_inputs[{}] must be 32 bytes, got {}",
-                i,
-                pi.len()
-            )));
+            return Err(e);
         }
-        inputs[i].copy_from_slice(pi);
-    }
+    };
 
     tracing::info!(api_key = %crate::auth::redact::redact_api_key(&api_key), "Submitting re-verification proof");
 
@@ -152,4 +174,111 @@ pub async fn verify_handler(
 
 pub async fn health_handler() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_inputs() -> Vec<Vec<u8>> {
+        vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]]
+    }
+
+    #[test]
+    fn happy_path_returns_parsed_inputs() {
+        let inputs = validate_proof_shape(&vec![0u8; 256], &valid_inputs()).unwrap();
+        assert_eq!(inputs[0], [1u8; 32]);
+        assert_eq!(inputs[1], [2u8; 32]);
+        assert_eq!(inputs[2], [3u8; 32]);
+        assert_eq!(inputs[3], [4u8; 32]);
+    }
+
+    #[test]
+    fn rejects_short_proof_bytes() {
+        match validate_proof_shape(&vec![0u8; 255], &valid_inputs()) {
+            Err(AppError::InvalidRequest(msg)) => {
+                assert!(msg.contains("proof_bytes"));
+                assert!(msg.contains("255"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_long_proof_bytes() {
+        match validate_proof_shape(&vec![0u8; 257], &valid_inputs()) {
+            Err(AppError::InvalidRequest(msg)) => assert!(msg.contains("proof_bytes")),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_empty_proof_bytes() {
+        match validate_proof_shape(&[], &valid_inputs()) {
+            Err(AppError::InvalidRequest(msg)) => assert!(msg.contains("proof_bytes")),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_too_few_public_inputs() {
+        let inputs = vec![vec![0u8; 32], vec![0u8; 32], vec![0u8; 32]];
+        match validate_proof_shape(&vec![0u8; 256], &inputs) {
+            Err(AppError::InvalidRequest(msg)) => {
+                assert!(msg.contains("public_inputs"));
+                assert!(msg.contains("3"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_too_many_public_inputs() {
+        let mut inputs = valid_inputs();
+        inputs.push(vec![5u8; 32]);
+        match validate_proof_shape(&vec![0u8; 256], &inputs) {
+            Err(AppError::InvalidRequest(msg)) => {
+                assert!(msg.contains("public_inputs"));
+                assert!(msg.contains("5"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_short_public_input_element() {
+        let mut inputs = valid_inputs();
+        inputs[2] = vec![0u8; 31];
+        match validate_proof_shape(&vec![0u8; 256], &inputs) {
+            Err(AppError::InvalidRequest(msg)) => {
+                assert!(msg.contains("public_inputs[2]"));
+                assert!(msg.contains("31"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_long_public_input_element() {
+        let mut inputs = valid_inputs();
+        inputs[0] = vec![0u8; 33];
+        match validate_proof_shape(&vec![0u8; 256], &inputs) {
+            Err(AppError::InvalidRequest(msg)) => assert!(msg.contains("public_inputs[0]")),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_first_invalid_element_only() {
+        let mut inputs = valid_inputs();
+        inputs[1] = vec![0u8; 30];
+        inputs[3] = vec![0u8; 30];
+        match validate_proof_shape(&vec![0u8; 256], &inputs) {
+            Err(AppError::InvalidRequest(msg)) => {
+                assert!(msg.contains("public_inputs[1]"));
+                assert!(!msg.contains("public_inputs[3]"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
 }
