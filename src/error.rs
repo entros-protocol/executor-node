@@ -36,14 +36,13 @@ pub enum AppError {
     #[error("Attestation failed: {0}")]
     AttestationFailed(String),
 
-    /// Validation rejected the submission. `reason` carries the safe-to-reveal
-    /// category from `entros-validation::ValidationResult::safe_reason` for
-    /// user-recoverable failures (variance_floor, entropy_bounds,
-    /// temporal_coupling_low, phrase_content_mismatch). Attack signals and
-    /// capture bugs send `None`, preserving the historical opaque-rejection
-    /// contract that prevents adversarial probing.
+    /// Validation rejected the submission. The validator no longer surfaces
+    /// a reason category over the wire (stripped 2026-04-29 to remove the
+    /// directed-signal calibration channel for adversarial probing); this
+    /// variant carries no payload. Server-side `safe_reason` still emits to
+    /// `tracing::info!` for ops debugging.
     #[error("Validation failed")]
-    ValidationFailed { reason: Option<String> },
+    ValidationFailed,
 
     #[error("Validation service error: {0}")]
     ValidationServiceError(String),
@@ -70,7 +69,7 @@ impl IntoResponse for AppError {
             AppError::AttestationFailed(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg.clone())
             }
-            AppError::ValidationFailed { .. } => {
+            AppError::ValidationFailed => {
                 (StatusCode::BAD_REQUEST, "Verification failed".into())
             }
             AppError::ValidationServiceError(msg) => {
@@ -78,15 +77,11 @@ impl IntoResponse for AppError {
             }
         };
 
-        // ValidationFailed surfaces an optional `reason` field for the
-        // user-recoverable subset; WalletRateLimited surfaces `reason +
-        // retry_after`; everything else returns `{error}` only. Bodies are
-        // padded so an outside observer can't read outcome class from the
-        // response byte length on timed endpoints.
+        // WalletRateLimited surfaces `reason + retry_after` so the client
+        // can render a cooldown countdown; everything else returns `{error}`
+        // only. Bodies are padded so an outside observer can't read outcome
+        // class from the response byte length on timed endpoints.
         let body = match &self {
-            AppError::ValidationFailed { reason: Some(r) } => {
-                json!({ "error": message, "reason": r })
-            }
             AppError::WalletRateLimited { retry_after_secs } => {
                 json!({
                     "error": message,

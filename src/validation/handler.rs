@@ -187,31 +187,20 @@ pub async fn validate_features_handler(
     state.metrics.increment_validations();
 
     if !response.status().is_success() {
-        // Parse the validator's safe reason (when present) so the SDK + UI
-        // can show a soft-fail retry hint instead of the generic "verification
-        // failed" page. Missing/unparseable reason → opaque rejection (the
-        // existing behavior for attack signals + capture bugs).
+        // Validator stripped its safe-reveal reason from the wire on
+        // 2026-04-29 to close the directed-signal calibration channel; the
+        // executor mirrors that opacity here. Server-side reason codes
+        // remain in the validator's `tracing::info!` output for ops.
         //
         // Note: the per-wallet attempt slot consumed at the top of this
         // handler stays consumed — it's a real failed attempt against the
         // wallet's window budget.
-        #[derive(serde::Deserialize)]
-        struct ValidatorErrorBody {
-            #[serde(default)]
-            reason: Option<String>,
-        }
-        let reason = response
-            .json::<ValidatorErrorBody>()
-            .await
-            .ok()
-            .and_then(|body| body.reason);
         tracing::info!(
             api_key = %crate::auth::redact::redact_api_key(&api_key),
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            reason = ?reason,
             "Feature validation rejected"
         );
-        return Err(AppError::ValidationFailed { reason });
+        return Err(AppError::ValidationFailed);
     }
 
     // Validation passed — refund the per-wallet attempt slot so a wallet
