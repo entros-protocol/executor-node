@@ -70,6 +70,7 @@ fn render_metrics(metrics: &crate::status::status_metrics::StatusMetrics) -> Str
     let verifications = metrics.verifications_relayed();
     let attestations = metrics.attestations_issued();
     let validations = metrics.validations_performed();
+    let per_ip_rejected = metrics.per_ip_rate_limit_rejected();
     let start_time_secs = metrics.start_time();
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -91,6 +92,10 @@ fn render_metrics(metrics: &crate::status::status_metrics::StatusMetrics) -> Str
             "# TYPE entros_validations_performed_total counter\n",
             "entros_validations_performed_total {validations}\n",
             "\n",
+            "# HELP entros_per_ip_rate_limit_rejected_total Cumulative count of requests rejected by the per-IP rate limiter.\n",
+            "# TYPE entros_per_ip_rate_limit_rejected_total counter\n",
+            "entros_per_ip_rate_limit_rejected_total {per_ip_rejected}\n",
+            "\n",
             "# HELP entros_uptime_seconds Seconds since the executor process started.\n",
             "# TYPE entros_uptime_seconds gauge\n",
             "entros_uptime_seconds {uptime_secs}\n",
@@ -98,6 +103,7 @@ fn render_metrics(metrics: &crate::status::status_metrics::StatusMetrics) -> Str
         verifications = verifications,
         attestations = attestations,
         validations = validations,
+        per_ip_rejected = per_ip_rejected,
         uptime_secs = uptime_secs,
     )
 }
@@ -114,6 +120,7 @@ mod tests {
         assert!(body.contains("entros_verifications_relayed_total 0"));
         assert!(body.contains("entros_attestations_issued_total 0"));
         assert!(body.contains("entros_validations_performed_total 0"));
+        assert!(body.contains("entros_per_ip_rate_limit_rejected_total 0"));
     }
 
     #[test]
@@ -152,6 +159,7 @@ mod tests {
             "entros_verifications_relayed_total",
             "entros_attestations_issued_total",
             "entros_validations_performed_total",
+            "entros_per_ip_rate_limit_rejected_total",
             "entros_uptime_seconds",
         ];
         for name in metric_names {
