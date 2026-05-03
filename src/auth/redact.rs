@@ -2,6 +2,8 @@
 //! can correlate requests by prefix without exposing the full identifier
 //! to anyone with log access (or a leaked log file).
 
+use std::net::IpAddr;
+
 const REDACT_PREFIX_LEN: usize = 6;
 
 /// Returns a short, log-safe form of an API key.
@@ -49,6 +51,29 @@ pub fn redact_wallet_id(wallet: &str) -> String {
     s.push_str(&wallet[..take]);
     s.push('…');
     s
+}
+
+/// Returns a coarsened, log-safe form of a client IP address.
+///
+/// Mask the host portion so logs retain ISP-block-level granularity for
+/// triage without storing exact client IPs. IPv4 → /24 (last octet
+/// zeroed); IPv6 → /48 (only the first three groups kept). The trailing
+/// `/24` or `/48` keeps the redaction shape unambiguous.
+///
+/// Used by the per-IP rate limiter middleware (master-list #155) so
+/// `RATE_LIMIT: per-IP cap hit` log lines don't become a secondary
+/// source of identifiable client data.
+pub fn redact_ip(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}::/48", s[0], s[1], s[2])
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,5 +140,23 @@ mod tests {
     #[test]
     fn redact_wallet_handles_short_input() {
         assert_eq!(redact_wallet_id("abc"), "abc…");
+    }
+
+    #[test]
+    fn redacts_ipv4_last_octet() {
+        let ip: IpAddr = "203.0.113.42".parse().unwrap();
+        assert_eq!(redact_ip(ip), "203.0.113.0/24");
+    }
+
+    #[test]
+    fn redacts_ipv6_to_first_three_groups() {
+        let ip: IpAddr = "2001:db8:cafe::abcd".parse().unwrap();
+        assert_eq!(redact_ip(ip), "2001:db8:cafe::/48");
+    }
+
+    #[test]
+    fn redact_ipv4_loopback() {
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(redact_ip(ip), "127.0.0.0/24");
     }
 }
