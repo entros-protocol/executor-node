@@ -142,6 +142,15 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub api_keys: Vec<String>,
     pub rate_limit_per_minute: u32,
+    /// Per-IP request cap (master-list #155). Bounds the throughput a
+    /// single client IP can sustain across rotated wallets / API keys
+    /// before the per-API-key and per-wallet limiters fire. Configurable
+    /// via `EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN`. Default 30 — covers
+    /// legitimate verification flows + dashboard reads while bounding
+    /// damage from a single hostile IP. On Railway, the leftmost
+    /// `X-Forwarded-For` entry is trusted as the client IP because the
+    /// edge layer rewrites the header on every inbound request.
+    pub per_ip_rate_limit_per_minute: u32,
     pub integrators: Vec<IntegratorConfig>,
     pub cors_origins: Vec<String>,
     pub sas_credential_pda: Option<Pubkey>,
@@ -206,6 +215,14 @@ impl Config {
                 .map_err(|e| format!("RATE_LIMIT_PER_MINUTE is not a valid u32: {e}"))?,
             Err(_) => 60,
         };
+
+        let per_ip_rate_limit_per_minute: u32 =
+            match std::env::var("EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN") {
+                Ok(s) => s.parse().map_err(|e| {
+                    format!("EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN is not a valid u32: {e}")
+                })?,
+                Err(_) => 30,
+            };
 
         let integrators: Vec<IntegratorConfig> = match std::env::var("INTEGRATORS") {
             Ok(s) => serde_json::from_str(&s)
@@ -284,6 +301,7 @@ impl Config {
             listen_addr,
             api_keys,
             rate_limit_per_minute,
+            per_ip_rate_limit_per_minute,
             integrators,
             cors_origins,
             sas_credential_pda,
