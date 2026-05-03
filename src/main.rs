@@ -62,9 +62,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rate_limit_per_minute,
     ));
     let attest_rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(10));
+    let per_ip_rate_limiter = Arc::new(auth::rate_limit::PerIpRateLimiter::new(
+        config.per_ip_rate_limit_per_minute,
+    ));
     tracing::info!(
         requests_per_minute = config.rate_limit_per_minute,
         attest_per_minute = 10,
+        per_ip_per_minute = config.per_ip_rate_limit_per_minute,
         "Rate limiters initialized"
     );
 
@@ -221,6 +225,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Per-IP rate-limiter eviction. Same 60s sweep cadence; the limiter
+    // type differs (DashMap keyed on IpAddr) so it doesn't share the loop
+    // above without a generic wrapper, which isn't worth the extra
+    // indirection for two limiters.
+    let per_ip_ref = Arc::clone(&per_ip_rate_limiter);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            per_ip_ref.evict_stale();
+            tracing::debug!(
+                limiter = "per_ip_rate_limiter",
+                tracked = per_ip_ref.tracked_count(),
+                "rate-limit eviction cycle complete"
+            );
+        }
+    });
+
     // Spawn background eviction task for stale challenge nonces
     let challenge_ref = Arc::clone(&challenge_registry);
     let challenge_ttl = config.challenge_ttl_secs;
@@ -254,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_keys: Arc::new(config.api_keys),
         rate_limiter,
         attest_rate_limiter,
+        per_ip_rate_limiter,
         tracker,
         wallet_attempts,
         commitment_registry,
@@ -279,7 +302,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "Executor node started");
 
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
+    // peer socket address to middleware via `ConnectInfo` extension —
+    // required by the per-IP rate-limiter fallback path when no
+    // `X-Forwarded-For` header is present (local dev, direct curl).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

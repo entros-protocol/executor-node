@@ -1,14 +1,16 @@
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Request, State};
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::api_key::api_key_auth;
-use crate::auth::rate_limit::RateLimiter;
+use crate::auth::client_ip::extract_client_ip;
+use crate::auth::rate_limit::{PerIpRateLimiter, RateLimiter};
 use crate::error::AppError;
 use crate::integrator::tracker::IntegratorTracker;
 use crate::integrator::wallet_attempts::WalletAttemptTracker;
@@ -30,6 +32,7 @@ pub struct AppState {
     pub api_keys: Arc<Vec<String>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub attest_rate_limiter: Arc<RateLimiter>,
+    pub per_ip_rate_limiter: Arc<PerIpRateLimiter>,
     pub tracker: Arc<IntegratorTracker>,
     pub wallet_attempts: Arc<WalletAttemptTracker>,
     pub commitment_registry: Arc<CommitmentRegistry>,
@@ -64,6 +67,54 @@ async fn rate_limit_middleware(
     if state.rate_limiter.check(key).is_err() {
         tracing::warn!(api_key = %crate::auth::redact::redact_api_key(key), "Rate limit exceeded");
         return Err(AppError::RateLimited);
+    }
+
+    Ok(next.run(request).await)
+}
+
+/// Per-IP rate-limit gate (master-list #155). Sits OUTSIDE the
+/// min-duration timing equalizer so over-cap IPs fail fast — there's no
+/// privacy benefit to padding here (the same IP already knows from its
+/// own request count whether it's rate-limited), and short-circuiting
+/// frees server resources for legitimate traffic.
+///
+/// Runs before auth and quota deduction, so a hostile IP cannot burn
+/// integrator quota or trigger Whisper inference by rotating wallets
+/// behind a single IP.
+async fn per_ip_rate_limit_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    // ConnectInfo is populated by `into_make_service_with_connect_info`
+    // in main.rs. Tests that exercise the middleware directly (without
+    // the full server stack) are expected to either set this extension
+    // or rely on the X-Forwarded-For path.
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0);
+    let ip = extract_client_ip(request.headers(), peer);
+
+    if let Some(addr) = ip {
+        if let Err(retry_after_secs) = state.per_ip_rate_limiter.check(addr) {
+            state.metrics.increment_per_ip_rate_limit_rejected();
+            tracing::warn!(
+                ip = %crate::auth::redact::redact_ip(addr),
+                retry_after_secs,
+                "per-IP rate limit exceeded"
+            );
+            return Err(AppError::IpRateLimited { retry_after_secs });
+        }
+    } else {
+        // No IP source available — log and allow. Reaching this branch
+        // in production would mean axum lost the peer address AND the
+        // request had no X-Forwarded-For, which is unreachable on
+        // Railway. In dev (e.g. unit tests bypassing the server), allow
+        // the request to flow through rather than failing closed —
+        // failing closed would break tests that don't care about IP
+        // gating.
+        tracing::debug!("per-IP rate limit middleware: no IP source available, allowing");
     }
 
     Ok(next.run(request).await)
@@ -139,7 +190,17 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
             auth_middleware,
         ));
 
-    let verify_routes = timed_routes.merge(untimed_routes);
+    // Apply per-IP rate limiting to ALL verify routes (timed + untimed).
+    // Sits OUTSIDE both min-duration and per-API-key/per-wallet limiters
+    // so hostile traffic is rejected before consuming server resources.
+    // Excluded: /health, /status, /metrics — Railway healthchecks and
+    // Prometheus scrapers are expected to hit at high cadence.
+    let verify_routes = timed_routes
+        .merge(untimed_routes)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            per_ip_rate_limit_middleware,
+        ));
 
     let cors = if cors_origins.is_empty() {
         // No origins configured — permissive for development
@@ -203,6 +264,7 @@ pub fn build_test_state(
         api_keys: Arc::new(vec![]),
         rate_limiter: Arc::new(RateLimiter::new(60)),
         attest_rate_limiter: Arc::new(RateLimiter::new(10)),
+        per_ip_rate_limiter: Arc::new(PerIpRateLimiter::new(30)),
         tracker,
         wallet_attempts: Arc::new(WalletAttemptTracker::new(5, Duration::from_secs(3600))),
         commitment_registry: Arc::new(CommitmentRegistry::new()),
@@ -243,4 +305,215 @@ pub fn headers_with_key(api_key: &str) -> axum::http::HeaderMap {
 pub fn random_wallet_id() -> String {
     use solana_sdk::signature::{Keypair, Signer};
     Keypair::new().pubkey().to_string()
+}
+
+#[cfg(test)]
+mod per_ip_middleware_tests {
+    //! Per-IP rate-limit middleware tests (master-list #155). Exercise
+    //! the middleware via `tower::ServiceExt::oneshot` against a minimal
+    //! Router so we get true middleware semantics (extension extraction,
+    //! header pass-through, AppError::IntoResponse) instead of mocking
+    //! the pieces.
+    use super::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use std::net::SocketAddr;
+    use tower::util::ServiceExt;
+
+    /// Tiny router that pipes every request through the per-IP rate
+    /// limiter and short-circuits to a 200 if the middleware allows.
+    /// The real router under test would have many handlers; we use one
+    /// trivial handler so failures come from the middleware, not the
+    /// handler.
+    fn app(per_ip_rate_limiter: Arc<PerIpRateLimiter>) -> Router {
+        let tracker = tracker_with_quota("dummy", 100);
+        let mut state = build_test_state(tracker, None);
+        state.per_ip_rate_limiter = per_ip_rate_limiter;
+        Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                per_ip_rate_limit_middleware,
+            ))
+            .with_state(state)
+    }
+
+    fn req_with_xff(xff: &str) -> Request<Body> {
+        Request::builder()
+            .uri("/probe")
+            .header("x-forwarded-for", xff)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn req_with_peer(peer: SocketAddr) -> Request<Body> {
+        let mut req = Request::builder()
+            .uri("/probe")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req
+    }
+
+    #[tokio::test]
+    async fn allows_first_request_under_limit() {
+        let limiter = Arc::new(PerIpRateLimiter::new(30));
+        let app = app(limiter);
+        let resp = app.oneshot(req_with_xff("203.0.113.1")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rejects_with_429_and_retry_after_when_over_limit() {
+        let limiter = Arc::new(PerIpRateLimiter::new(2));
+        let app = app(limiter);
+        // Burn the budget.
+        for _ in 0..2 {
+            let resp = app.clone().oneshot(req_with_xff("203.0.113.5")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let resp = app.oneshot(req_with_xff("203.0.113.5")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let retry_after = resp
+            .headers()
+            .get("retry-after")
+            .expect("Retry-After header must be present on per-IP 429")
+            .to_str()
+            .unwrap();
+        let secs: u64 = retry_after.parse().expect("Retry-After must be integer seconds");
+        assert!(secs >= 1, "Retry-After must be at least 1s, got {secs}");
+    }
+
+    #[tokio::test]
+    async fn separate_ips_have_independent_budgets() {
+        let limiter = Arc::new(PerIpRateLimiter::new(1));
+        let app = app(limiter);
+        // IP A: burn the budget, then verify it's rejected.
+        let r1 = app.clone().oneshot(req_with_xff("203.0.113.10")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app.clone().oneshot(req_with_xff("203.0.113.10")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+        // IP B: should still pass first request.
+        let r3 = app.oneshot(req_with_xff("203.0.113.11")).await.unwrap();
+        assert_eq!(r3.status(), StatusCode::OK, "different IP must have its own budget");
+    }
+
+    #[tokio::test]
+    async fn forwarded_for_takes_precedence_over_peer() {
+        // Limiter caps the X-Forwarded-For IP after one request. If the
+        // middleware were keying on peer instead, the second request would
+        // pass — proving precedence is the easiest way to verify which
+        // source the middleware actually uses.
+        let limiter = Arc::new(PerIpRateLimiter::new(1));
+        let app = app(limiter);
+        let peer: SocketAddr = "10.0.0.99:5000".parse().unwrap();
+
+        let mut req1 = req_with_xff("203.0.113.42");
+        req1.extensions_mut().insert(ConnectInfo(peer));
+        let r1 = app.clone().oneshot(req1).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let mut req2 = req_with_xff("203.0.113.42");
+        req2.extensions_mut().insert(ConnectInfo(peer));
+        let r2 = app.oneshot(req2).await.unwrap();
+        assert_eq!(
+            r2.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "limiter must key on X-Forwarded-For, not peer"
+        );
+    }
+
+    #[tokio::test]
+    async fn falls_back_to_peer_address_when_no_forwarded_for() {
+        let limiter = Arc::new(PerIpRateLimiter::new(1));
+        let app = app(limiter);
+        let peer: SocketAddr = "192.0.2.50:8080".parse().unwrap();
+        let r1 = app.clone().oneshot(req_with_peer(peer)).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app.oneshot(req_with_peer(peer)).await.unwrap();
+        assert_eq!(
+            r2.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "peer-only requests must still hit the per-IP cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_ip_source_allows_request() {
+        // Production-impossible (Railway always provides the peer
+        // address), but keep the fail-open behavior so unit tests that
+        // don't care about IP wiring continue to work.
+        let limiter = Arc::new(PerIpRateLimiter::new(1));
+        let app = app(limiter);
+        let req = Request::builder().uri("/probe").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn ip_rejection_does_not_deduct_integrator_quota() {
+        // The middleware rejects BEFORE auth + quota deduction. A
+        // rejected IP must not touch the IntegratorTracker — a hostile
+        // IP holding a leaked API key shouldn't burn that key's quota
+        // by hammering past its IP cap.
+        let limiter = Arc::new(PerIpRateLimiter::new(1));
+        let tracker = tracker_with_quota("test-key", 100);
+        let mut state = build_test_state(tracker.clone(), None);
+        state.per_ip_rate_limiter = limiter;
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                per_ip_rate_limit_middleware,
+            ))
+            .with_state(state);
+
+        // 1 r/m budget — first request OK, second rejected.
+        let r1 = app.clone().oneshot(req_with_xff("203.0.113.99")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let r2 = app.oneshot(req_with_xff("203.0.113.99")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Quota should be untouched — the middleware short-circuits
+        // before any handler that would call check_and_deduct.
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            100,
+            "per-IP rejection must not deduct integrator quota"
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_rejection_increments_prometheus_counter() {
+        // Per-IP rejections must surface as
+        // `entros_per_ip_rate_limit_rejected_total` so ops can monitor
+        // sustained-attack signals via the unauthenticated /metrics
+        // scrape, not via log scraping.
+        let limiter = Arc::new(PerIpRateLimiter::new(1));
+        let tracker = tracker_with_quota("dummy", 100);
+        let mut state = build_test_state(tracker, None);
+        state.per_ip_rate_limiter = limiter;
+        let metrics = Arc::clone(&state.metrics);
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                per_ip_rate_limit_middleware,
+            ))
+            .with_state(state);
+
+        // First request: under cap → no counter increment.
+        let r1 = app.clone().oneshot(req_with_xff("203.0.113.123")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(metrics.per_ip_rate_limit_rejected(), 0);
+
+        // Two more requests: both over cap → two increments.
+        for _ in 0..2 {
+            let r = app.clone().oneshot(req_with_xff("203.0.113.123")).await.unwrap();
+            assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert_eq!(metrics.per_ip_rate_limit_rejected(), 2);
+    }
 }
