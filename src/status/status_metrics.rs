@@ -5,6 +5,11 @@ pub struct StatusMetrics {
     total_verifications_relayed: AtomicU64,
     total_attestations_issued: AtomicU64,
     total_validations_performed: AtomicU64,
+    /// Per-IP rate-limiter rejections (master-list #155). Increments on
+    /// every 429 emitted by `per_ip_rate_limit_middleware`. Surfaced via
+    /// the unauthenticated `/metrics` endpoint as a Prometheus counter so
+    /// ops can monitor sustained-attack signals without log scraping.
+    total_per_ip_rate_limit_rejected: AtomicU64,
     start_time: u64,
     balance_cache: RwLock<(u64, u64)>, // (balance, fetched_at) — updated atomically
 }
@@ -15,6 +20,7 @@ impl StatusMetrics {
             total_verifications_relayed: AtomicU64::new(0),
             total_attestations_issued: AtomicU64::new(0),
             total_validations_performed: AtomicU64::new(0),
+            total_per_ip_rate_limit_rejected: AtomicU64::new(0),
             start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -40,6 +46,11 @@ impl StatusMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn increment_per_ip_rate_limit_rejected(&self) {
+        self.total_per_ip_rate_limit_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // getters for the metrics
     pub fn verifications_relayed(&self) -> u64 {
         self.total_verifications_relayed.load(Ordering::Relaxed)
@@ -51,6 +62,10 @@ impl StatusMetrics {
 
     pub fn validations_performed(&self) -> u64 {
         self.total_validations_performed.load(Ordering::Relaxed)
+    }
+
+    pub fn per_ip_rate_limit_rejected(&self) -> u64 {
+        self.total_per_ip_rate_limit_rejected.load(Ordering::Relaxed)
     }
 
     pub fn start_time(&self) -> u64 {
@@ -76,6 +91,20 @@ mod tests {
         let m = StatusMetrics::new();
         assert_eq!(m.verifications_relayed(), 0);
         assert_eq!(m.attestations_issued(), 0);
+        assert_eq!(m.per_ip_rate_limit_rejected(), 0);
+    }
+
+    #[test]
+    fn increment_per_ip_rate_limit_rejected_counts_correctly() {
+        let m = StatusMetrics::new();
+        m.increment_per_ip_rate_limit_rejected();
+        m.increment_per_ip_rate_limit_rejected();
+        m.increment_per_ip_rate_limit_rejected();
+        assert_eq!(m.per_ip_rate_limit_rejected(), 3);
+        // Other counters untouched.
+        assert_eq!(m.verifications_relayed(), 0);
+        assert_eq!(m.attestations_issued(), 0);
+        assert_eq!(m.validations_performed(), 0);
     }
 
     #[test]
