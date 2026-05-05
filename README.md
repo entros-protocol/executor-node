@@ -8,7 +8,7 @@ The executor serves two roles:
 
 1. **Validation server** — receives 134 statistical features from the Pulse SDK, runs proprietary validation models (loaded from the private `entros-validation` crate), performs cross-wallet Sybil detection via the fingerprint registry, and issues signed challenges.
 
-2. **Walletless relayer** — accepts ZK proofs and submits on-chain transactions for users without wallets (liveness-check tier). API key required.
+2. **Walletless relayer** — accepts ZK proofs and submits on-chain `create_challenge` + `verify_proof` for users without wallets (liveness-check tier). API key required. Walletless flows do not receive SAS attestations.
 
 ## API
 
@@ -35,7 +35,7 @@ Requires `X-API-Key` header (walletless tier only).
 
 ### POST /attest
 
-Issues a Solana Attestation Service (SAS) attestation for a verified wallet.
+Issues a Solana Attestation Service (SAS) attestation on a verified wallet. Requires the wallet to prove ownership via a signed message + server-issued nonce challenge — unauthenticated walletless flows do not reach this endpoint.
 
 ### GET /status
 
@@ -74,6 +74,7 @@ cargo test
 | `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
 | `API_KEYS` | `[]` | JSON array of valid API keys |
 | `RATE_LIMIT_PER_MINUTE` | `60` | Max requests per minute per API key |
+| `EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN` | `30` | Per-IP request cap, applied across all API keys and wallets |
 | `CORS_ORIGINS` | `[]` | JSON array of allowed origins (permissive if empty) |
 | `SAS_CREDENTIAL_PDA` | — | SAS credential PDA for attestation issuance |
 | `SAS_SCHEMA_PDA` | — | SAS schema PDA for attestation issuance |
