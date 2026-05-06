@@ -190,20 +190,48 @@ pub async fn validate_features_handler(
     state.metrics.increment_validations();
 
     if !response.status().is_success() {
-        // Validator stripped its safe-reveal reason from the wire on
-        // 2026-04-29 to close the directed-signal calibration channel; the
-        // executor mirrors that opacity here. Server-side reason codes
-        // remain in the validator's `tracing::info!` output for ops.
+        // Validator surfaces a whitelisted `reason` for `phrase_content_mismatch`
+        // only (the user already knows whether they said the assigned phrase,
+        // so this category carries no attacker-calibration value); all other
+        // rejection categories return an opaque body and `reason` stays
+        // `None`. The executor passes the reason through to the SDK +
+        // entros.io frontend so the soft-reject retry UX can route on the
+        // per-category hint. Other categories stay opaque end-to-end per
+        // the 2026-04-29 directed-signal strip.
+        //
+        // Defense in depth: even if the validator misbehaves and returns
+        // an unwhitelisted reason, this handler re-filters against the same
+        // allowlist before forwarding. Locks the contract on both ends so
+        // a single misconfiguration can't open a calibration channel.
+        // Threat-model note: the validator's wire body length differs by
+        // ~35 bytes between reason-present vs reason-absent rejections,
+        // but the validator is internal-only (only the executor talks to
+        // it on Railway) and the executor's `Padded::new` outbound layer
+        // pads every response to a uniform length, so external observers
+        // see no length oracle.
         //
         // Note: the per-wallet attempt slot consumed at the top of this
         // handler stays consumed — it's a real failed attempt against the
         // wallet's window budget.
+        #[derive(serde::Deserialize)]
+        struct ValidatorErrorBody {
+            #[serde(default)]
+            reason: Option<String>,
+        }
+        const REASON_ALLOWLIST: &[&str] = &["phrase_content_mismatch"];
+        let raw_reason = response
+            .json::<ValidatorErrorBody>()
+            .await
+            .ok()
+            .and_then(|body| body.reason);
+        let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
         tracing::info!(
             api_key = %crate::auth::redact::redact_api_key(&api_key),
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+            reason = ?reason,
             "Feature validation rejected"
         );
-        return Err(AppError::ValidationFailed);
+        return Err(AppError::ValidationFailed { reason });
     }
 
     // Validation passed — refund the per-wallet attempt slot so a wallet
