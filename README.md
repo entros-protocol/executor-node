@@ -6,7 +6,7 @@ Entros Protocol executor node. Validation server and relayer service for the Ent
 
 The executor serves two roles:
 
-1. **Validation server** — receives 134 statistical features from the Pulse SDK, runs proprietary validation models (loaded from the private `entros-validation` crate), performs cross-wallet Sybil detection via the fingerprint registry, and issues signed challenges.
+1. **Validation server**—receives a length-agnostic `Vec<f64>` of statistical features from the Pulse SDK (308 dimensions under the v3 layout: 170 audio + 81 motion + 57 touch). Runs proprietary validation models (loaded from the private `entros-validation` crate), performs cross-wallet Sybil detection via the fingerprint registry, and issues signed challenges.
 
 2. **Walletless relayer** — accepts ZK proofs and submits on-chain `create_challenge` + `verify_proof` for users without wallets (liveness-check tier). API key required. Walletless flows do not receive SAS attestations.
 
