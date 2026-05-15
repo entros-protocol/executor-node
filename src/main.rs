@@ -215,12 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
-                limiter_ref.evict_stale();
-                tracing::debug!(
-                    limiter = name,
-                    tracked = limiter_ref.tracked_count(),
-                    "rate-limit eviction cycle complete"
-                );
+                let evicted = limiter_ref.evict_stale();
+                if evicted > 0 {
+                    tracing::debug!(limiter = name, evicted, "Evicted stale rate-limit entries");
+                }
             }
         });
     }
@@ -234,12 +232,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
         loop {
             interval.tick().await;
-            per_ip_ref.evict_stale();
-            tracing::debug!(
-                limiter = "per_ip_rate_limiter",
-                tracked = per_ip_ref.tracked_count(),
-                "rate-limit eviction cycle complete"
-            );
+            let evicted = per_ip_ref.evict_stale();
+            if evicted > 0 {
+                tracing::debug!(
+                    limiter = "per_ip_rate_limiter",
+                    evicted,
+                    "Evicted stale rate-limit entries"
+                );
+            }
         }
     });
 

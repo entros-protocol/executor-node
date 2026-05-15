@@ -123,7 +123,11 @@ impl WalletAttemptTracker {
 
     /// Drop entries whose window has fully elapsed AND counter is zero.
     /// Called periodically from a background task in `main.rs` to bound
-    /// memory growth. Returns the count of evicted entries.
+    /// memory growth. Returns the approximate count of evicted entries
+    /// (`saturating_sub` because DashMap's `len()` is not atomic with
+    /// `retain()` under concurrent inserts — a precise count would
+    /// require an atomic counter inside the retain closure, which isn't
+    /// worth the cost for a debug signal).
     ///
     /// Eviction-while-zero is the safe condition: a wallet at 0 attempts
     /// with an expired window contributes no rate-limit info, so dropping
@@ -136,7 +140,7 @@ impl WalletAttemptTracker {
         self.state.retain(|_, state| {
             now.duration_since(state.window_start) < self.window_duration || state.attempts > 0
         });
-        before - self.state.len()
+        before.saturating_sub(self.state.len())
     }
 }
 

@@ -69,16 +69,15 @@ impl RateLimiter {
     }
 
     /// Evict entries that haven't been seen for `ENTRY_TTL`. Called from
-    /// a background tokio task; cheap when most keys are active.
-    pub fn evict_stale(&self) {
+    /// a background tokio task; cheap when most keys are active. Returns
+    /// the approximate number of entries removed (DashMap len() is not
+    /// atomic with retain() under concurrent inserts, so this is a debug
+    /// signal, not a precise count).
+    pub fn evict_stale(&self) -> usize {
+        let before = self.limiters.len();
         self.limiters
             .retain(|_, (_, last_seen)| last_seen.elapsed() < ENTRY_TTL);
-    }
-
-    /// Number of currently-tracked keys. Used for observability in the
-    /// eviction-task log.
-    pub fn tracked_count(&self) -> usize {
-        self.limiters.len()
+        before.saturating_sub(self.limiters.len())
     }
 }
 
@@ -137,19 +136,23 @@ impl PerIpRateLimiter {
 
     /// Drop entries inactive for `IP_ENTRY_TTL`. Called from a background
     /// task in `main.rs` (60-second sweep) — same pattern as `RateLimiter`.
-    pub fn evict_stale(&self) {
-        self.evict_with_ttl(IP_ENTRY_TTL);
+    /// Returns the approximate count of removed entries (see `RateLimiter::evict_stale`).
+    pub fn evict_stale(&self) -> usize {
+        self.evict_with_ttl(IP_ENTRY_TTL)
     }
 
     /// TTL-parameterized eviction. Production code calls `evict_stale()`
     /// which delegates here with `IP_ENTRY_TTL`. Tests use a tiny TTL to
     /// exercise the retain logic without spending 5 minutes of wall time.
-    fn evict_with_ttl(&self, ttl: Duration) {
+    fn evict_with_ttl(&self, ttl: Duration) -> usize {
+        let before = self.limiters.len();
         self.limiters
             .retain(|_, (_, last_seen)| last_seen.elapsed() < ttl);
+        before.saturating_sub(self.limiters.len())
     }
 
-    /// Number of currently-tracked IPs. Surfaced in the eviction-task log.
+    /// Number of currently-tracked IPs. Exposed for tests.
+    #[cfg(test)]
     pub fn tracked_count(&self) -> usize {
         self.limiters.len()
     }
@@ -270,6 +273,29 @@ mod tests {
         assert_eq!(limiter.tracked_count(), 2);
         limiter.evict_with_ttl(Duration::from_nanos(0));
         assert_eq!(limiter.tracked_count(), 0);
+    }
+
+    #[test]
+    fn per_ip_evict_with_ttl_returns_evicted_count() {
+        // The conditional eviction log in main.rs depends on this return
+        // value to suppress empty-sweep heartbeats. Lock the contract.
+        let limiter = PerIpRateLimiter::new(60);
+        limiter.check(ip("203.0.113.1")).unwrap();
+        limiter.check(ip("203.0.113.2")).unwrap();
+        assert_eq!(limiter.evict_with_ttl(Duration::from_nanos(0)), 2);
+        assert_eq!(limiter.evict_with_ttl(Duration::from_nanos(0)), 0);
+    }
+
+    #[test]
+    fn rate_limiter_evict_stale_returns_zero_when_nothing_is_stale() {
+        // Fresh entries are within ENTRY_TTL, so the sweep must not
+        // remove them — and the return must be zero so main.rs stays
+        // silent.
+        let limiter = RateLimiter::new(60);
+        assert_eq!(limiter.evict_stale(), 0);
+        limiter.check("key_a").ok();
+        limiter.check("key_b").ok();
+        assert_eq!(limiter.evict_stale(), 0);
     }
 
     #[test]
