@@ -45,13 +45,17 @@ pub enum AppError {
     #[error("Attestation failed: {0}")]
     AttestationFailed(String),
 
-    /// Validation rejected the submission. The validator no longer surfaces
-    /// a reason category over the wire (stripped 2026-04-29 to remove the
-    /// directed-signal calibration channel for adversarial probing); this
-    /// variant carries no payload. Server-side `safe_reason` still emits to
-    /// `tracing::info!` for ops debugging.
+    /// Validation rejected the submission. The validator surfaces a single
+    /// whitelisted reason category over the wire (`phrase_content_mismatch`)
+    /// because the user already knows whether they said the assigned phrase
+    /// — that category exposes zero attacker-calibration value while
+    /// enabling the soft-reject retry UX on entros.io. All other safe_reason
+    /// categories (variance_floor, entropy_bounds, temporal_coupling_low,
+    /// and attack-signal categories like TtsDetected, SybilMatch) carry
+    /// directed-signal calibration value and stay opaque per the 2026-04-29
+    /// strip — `reason` stays `None` for those.
     #[error("Validation failed")]
-    ValidationFailed,
+    ValidationFailed { reason: Option<String> },
 
     #[error("Validation service error: {0}")]
     ValidationServiceError(String),
@@ -107,7 +111,7 @@ impl IntoResponse for AppError {
             AppError::AttestationFailed(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, msg.clone())
             }
-            AppError::ValidationFailed => {
+            AppError::ValidationFailed { .. } => {
                 (StatusCode::BAD_REQUEST, "Verification failed".into())
             }
             AppError::ValidationServiceError(msg) => {
@@ -116,15 +120,25 @@ impl IntoResponse for AppError {
         };
 
         // WalletRateLimited surfaces `reason + retry_after` so the client
-        // can render a cooldown countdown; everything else returns `{error}`
-        // only. Bodies are padded so an outside observer can't read outcome
-        // class from the response byte length on timed endpoints.
+        // can render a cooldown countdown; ValidationFailed surfaces a
+        // whitelisted `reason` (currently only `phrase_content_mismatch`)
+        // when the validator returned one — fuels the soft-reject retry UX
+        // on entros.io without exposing attacker-calibration channels for
+        // other check categories. Everything else returns `{error}` only.
+        // Bodies are padded so an outside observer can't read outcome class
+        // from the response byte length on timed endpoints.
         let body = match &self {
             AppError::WalletRateLimited { retry_after_secs } => {
                 json!({
                     "error": message,
                     "reason": "rate_limited",
                     "retry_after": retry_after_secs,
+                })
+            }
+            AppError::ValidationFailed { reason: Some(r) } => {
+                json!({
+                    "error": message,
+                    "reason": r,
                 })
             }
             _ => json!({ "error": message }),
