@@ -58,13 +58,21 @@ impl SasAttestor {
             .get_account_data(&identity_pda)
             .await?
             .ok_or_else(|| {
-                AppError::AttestationFailed(format!(
-                    "No IdentityState found for wallet {user_wallet}"
-                ))
+                tracing::error!(
+                    wallet = %user_wallet,
+                    identity_pda = %identity_pda,
+                    "Attestation requested but no IdentityState found on-chain"
+                );
+                AppError::AttestationServiceUnavailable
             })?;
 
         let identity = deserialize_identity_state(&identity_data).map_err(|e| {
-            AppError::AttestationFailed(format!("Failed to deserialize IdentityState: {e}"))
+            tracing::error!(
+                error = %e,
+                wallet = %user_wallet,
+                "Failed to deserialize IdentityState during attestation"
+            );
+            AppError::AttestationServiceUnavailable
         })?;
 
         // 2. Derive attestation PDA
@@ -96,7 +104,10 @@ impl SasAttestor {
         // 4. Serialize attestation data
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| AppError::AttestationFailed(e.to_string()))?
+            .map_err(|e| {
+                tracing::error!(error = %e, "SystemTime before UNIX_EPOCH during attestation");
+                AppError::AttestationServiceUnavailable
+            })?
             .as_secs() as i64;
 
         let data = serialize_attestation_data(

@@ -37,7 +37,10 @@ impl SolanaClient {
         self.rpc
             .get_balance(&self.relayer_keypair.pubkey())
             .await
-            .map_err(|e| AppError::SolanaRpc(e.to_string()))
+            .map_err(|e| {
+                tracing::error!(error = %e, "get_balance RPC call failed");
+                AppError::SolanaRpcUnavailable
+            })
     }
 
     pub async fn get_account_data(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, AppError> {
@@ -49,7 +52,12 @@ impl SolanaClient {
                 {
                     Ok(None)
                 } else {
-                    Err(AppError::SolanaRpc(err_str))
+                    tracing::error!(
+                        error = %err_str,
+                        pubkey = %pubkey,
+                        "get_account_data RPC call failed"
+                    );
+                    Err(AppError::SolanaRpcUnavailable)
                 }
             }
         }
@@ -63,7 +71,6 @@ impl SolanaClient {
         instructions: Vec<Instruction>,
     ) -> Result<Signature, AppError> {
         let mut backoff = INITIAL_BACKOFF;
-        let mut last_error = String::new();
 
         for attempt in 0..MAX_RETRIES {
             let mut all_instructions =
@@ -73,7 +80,7 @@ impl SolanaClient {
             let recent_blockhash = match self.rpc.get_latest_blockhash().await {
                 Ok(bh) => bh,
                 Err(e) => {
-                    last_error = e.to_string();
+                    let last_error = e.to_string();
                     if attempt < MAX_RETRIES - 1 {
                         tracing::warn!(
                             attempt,
@@ -84,7 +91,12 @@ impl SolanaClient {
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
-                    return Err(AppError::SolanaRpc(last_error));
+                    tracing::error!(
+                        error = %last_error,
+                        attempts = attempt + 1,
+                        "Blockhash fetch failed after retries (send_verification_tx)"
+                    );
+                    return Err(AppError::SolanaRpcUnavailable);
                 }
             };
 
@@ -98,7 +110,7 @@ impl SolanaClient {
             match self.rpc.send_and_confirm_transaction(&tx).await {
                 Ok(sig) => return Ok(sig),
                 Err(e) => {
-                    last_error = e.to_string();
+                    let last_error = e.to_string();
                     if attempt < MAX_RETRIES - 1 {
                         tracing::warn!(
                             attempt,
@@ -109,12 +121,19 @@ impl SolanaClient {
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
-                    return Err(AppError::TransactionFailed(last_error));
+                    tracing::error!(
+                        error = %last_error,
+                        attempts = attempt + 1,
+                        "Transaction send failed after retries (send_verification_tx)"
+                    );
+                    return Err(AppError::TransactionSubmissionFailed);
                 }
             }
         }
 
-        Err(AppError::TransactionFailed(last_error))
+        // Unreachable in practice: the loop above returns Ok or Err on every iteration.
+        // Kept as a defensive fallback so the function signature stays total.
+        Err(AppError::TransactionSubmissionFailed)
     }
 
     /// Send a transaction signed by both the relayer (payer) and a separate authority.
@@ -125,7 +144,6 @@ impl SolanaClient {
         authority: &Keypair,
     ) -> Result<Signature, AppError> {
         let mut backoff = INITIAL_BACKOFF;
-        let mut last_error = String::new();
 
         let same_signer = authority.pubkey() == self.relayer_keypair.pubkey();
 
@@ -137,7 +155,7 @@ impl SolanaClient {
             let recent_blockhash = match self.rpc.get_latest_blockhash().await {
                 Ok(bh) => bh,
                 Err(e) => {
-                    last_error = e.to_string();
+                    let last_error = e.to_string();
                     if attempt < MAX_RETRIES - 1 {
                         tracing::warn!(
                             attempt,
@@ -148,7 +166,12 @@ impl SolanaClient {
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
-                    return Err(AppError::SolanaRpc(last_error));
+                    tracing::error!(
+                        error = %last_error,
+                        attempts = attempt + 1,
+                        "Blockhash fetch failed after retries (send_attestation_tx)"
+                    );
+                    return Err(AppError::SolanaRpcUnavailable);
                 }
             };
 
@@ -171,7 +194,7 @@ impl SolanaClient {
             match self.rpc.send_and_confirm_transaction(&tx).await {
                 Ok(sig) => return Ok(sig),
                 Err(e) => {
-                    last_error = e.to_string();
+                    let last_error = e.to_string();
                     if attempt < MAX_RETRIES - 1 {
                         tracing::warn!(
                             attempt,
@@ -182,11 +205,18 @@ impl SolanaClient {
                         backoff = (backoff * 2).min(MAX_BACKOFF);
                         continue;
                     }
-                    return Err(AppError::TransactionFailed(last_error));
+                    tracing::error!(
+                        error = %last_error,
+                        attempts = attempt + 1,
+                        "Attestation transaction send failed after retries"
+                    );
+                    return Err(AppError::TransactionSubmissionFailed);
                 }
             }
         }
 
-        Err(AppError::TransactionFailed(last_error))
+        // Unreachable in practice: the loop above returns Ok or Err on every iteration.
+        // Kept as a defensive fallback so the function signature stays total.
+        Err(AppError::TransactionSubmissionFailed)
     }
 }

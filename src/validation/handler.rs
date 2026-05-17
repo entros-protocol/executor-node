@@ -177,13 +177,23 @@ pub async fn validate_features_handler(
     let response = match request.send().await {
         Ok(r) => r,
         Err(e) => {
+            // Full error detail stays in ops logs; the wire response
+            // body resolves to a generic "service temporarily unavailable"
+            // string so reqwest internals (hostnames, ports, connect-error
+            // categories) never reach external observers.
+            tracing::error!(
+                error = %e,
+                url = %validation_url,
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                "Validation upstream request failed"
+            );
             // Infrastructure failure — refund integrator quota AND the
             // per-wallet attempt slot. The wallet did nothing wrong; if
             // the validator was unreachable the user shouldn't pay against
             // their per-wallet budget.
             state.tracker.refund(&api_key);
             state.wallet_attempts.refund_on_success(&wallet);
-            return Err(AppError::ValidationServiceError(e.to_string()));
+            return Err(AppError::ValidationServiceUnavailable);
         }
     };
 
