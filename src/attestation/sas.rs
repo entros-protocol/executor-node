@@ -16,9 +16,28 @@ use crate::solana::pda;
 /// Parsed fields from the on-chain IdentityState account.
 pub struct IdentityStateData {
     pub trust_score: u16,
-    #[allow(dead_code)] // Used for verification recency checks in Agent Anchor and Realms integrations
+    /// Solana cluster timestamp of the most recent state-changing tx
+    /// (`mint_anchor`, `update_anchor`, or `reset_identity_state`).
+    /// Consumed by `check_attestation_freshness` to gate `/attest` on
+    /// recent verification; also surfaced to Agent Anchor and Realms
+    /// integrations that perform their own recency checks.
     pub last_verification_timestamp: i64,
 }
+
+/// Forward-skew tolerance for the on-chain `last_verification_timestamp`.
+/// A few seconds of drift between the Solana cluster clock and the
+/// executor's wall clock is expected; rejecting strictly on `ts > now`
+/// would false-reject legitimate flows. Mirrors the asymmetric pattern
+/// in `attestation/handler.rs::verify_wallet_signature`.
+const ATTESTATION_FORWARD_SKEW_SECS: i64 = 30;
+
+/// Maximum age of the on-chain verification timestamp accepted by
+/// `/attest`. 5 minutes gives comfortable headroom over the normal SDK
+/// flow (which calls `/attest` within seconds of on-chain confirmation)
+/// while keeping the window tight enough that a direct API caller
+/// bypassing the SDK cannot refresh attestation freshness for state
+/// that didn't actually re-verify.
+const ATTESTATION_VERIFICATION_MAX_AGE_SECS: i64 = 300;
 
 /// Issues SAS attestations after successful Entros verification.
 /// Uses a dedicated authority keypair (separate from the relayer/payer)
@@ -75,14 +94,47 @@ impl SasAttestor {
             AppError::AttestationServiceUnavailable
         })?;
 
-        // 2. Derive attestation PDA
+        // 2. Capture wall-clock time once for both the freshness gate
+        // below and the attestation's `verifiedAt` field (step 5). Reading
+        // once is more semantically correct than re-reading after the
+        // close-existing-attestation RPC — the value here is closer to
+        // the actual verification time the attestation should reflect.
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| {
+                tracing::error!(error = %e, "SystemTime before UNIX_EPOCH during attestation");
+                AppError::AttestationServiceUnavailable
+            })?
+            .as_secs() as i64;
+
+        // 3. Gate on verification recency. The on-chain `mint_anchor`,
+        // `update_anchor`, and `reset_identity_state` instructions all
+        // set `last_verification_timestamp` to the cluster clock; a stale
+        // value here means the wallet hasn't completed a recent state-
+        // changing tx and the SDK's normal client-side confirmation gate
+        // was bypassed (or the on-chain tx silently reverted earlier in
+        // the flow). Reject before issuing.
+        check_attestation_freshness(identity.last_verification_timestamp, now).map_err(
+            |reason| {
+                tracing::warn!(
+                    wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
+                    ts = identity.last_verification_timestamp,
+                    now,
+                    reason,
+                    "Attestation rejected: verification not recent"
+                );
+                AppError::AttestationServiceUnavailable
+            },
+        )?;
+
+        // 4. Derive attestation PDA
         let attestation_pda = find_sas_attestation_pda(
             &self.credential_pda,
             &self.schema_pda,
             user_wallet,
         );
 
-        // 3. Check if attestation already exists
+        // 5. Check if attestation already exists
         let existing = self.client.get_account_data(&attestation_pda).await?;
 
         let mut instructions = Vec::new();
@@ -101,22 +153,14 @@ impl SasAttestor {
             instructions.push(close_ix);
         }
 
-        // 4. Serialize attestation data
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| {
-                tracing::error!(error = %e, "SystemTime before UNIX_EPOCH during attestation");
-                AppError::AttestationServiceUnavailable
-            })?
-            .as_secs() as i64;
-
+        // 6. Serialize attestation data using the `now` captured at step 2.
         let data = serialize_attestation_data(
             identity.trust_score,
             now,
             "wallet-connected",
         );
 
-        // 5. Build CreateAttestation instruction
+        // 7. Build CreateAttestation instruction
         let expiry = now + (self.ttl_days as i64 * 86_400);
 
         let create_ix = CreateAttestationBuilder::new()
@@ -131,7 +175,7 @@ impl SasAttestor {
             .instruction();
         instructions.push(create_ix);
 
-        // 6. Submit transaction (relayer pays, authority signs)
+        // 8. Submit transaction (relayer pays, authority signs)
         let sig = self
             .client
             .send_attestation_tx(instructions, &self.authority_keypair)
@@ -167,6 +211,35 @@ fn find_event_authority_pda() -> Pubkey {
         &SOLANA_ATTESTATION_SERVICE_ID,
     );
     pda
+}
+
+/// Check whether the on-chain `last_verification_timestamp` is recent
+/// enough to support issuing an attestation now. Returns `Ok(())` on
+/// pass and an `&'static str` reason on rejection.
+///
+/// Rejection cases:
+/// - `"future_skew"` when the timestamp is more than
+///   `ATTESTATION_FORWARD_SKEW_SECS` ahead of `now` (anomalous clock
+///   state or malicious account).
+/// - `"stale"` when the timestamp is older than
+///   `ATTESTATION_VERIFICATION_MAX_AGE_SECS`. Indicates the wallet
+///   hasn't completed a recent `mint_anchor` / `update_anchor` /
+///   `reset_identity_state` tx — either the SDK's client-side
+///   confirmation gate was bypassed or the on-chain tx silently
+///   reverted earlier in the flow.
+///
+/// Separated as a free function so the freshness contract is unit-
+/// testable without spinning up an `AudioContext`-equivalent fixture
+/// or a real SAS attestor.
+fn check_attestation_freshness(ts: i64, now: i64) -> Result<(), &'static str> {
+    if ts > now.saturating_add(ATTESTATION_FORWARD_SKEW_SECS) {
+        return Err("future_skew");
+    }
+    let age = (now.saturating_sub(ts)).max(0);
+    if age > ATTESTATION_VERIFICATION_MAX_AGE_SECS {
+        return Err("stale");
+    }
+    Ok(())
 }
 
 /// Deserialize trust_score and last_verification_timestamp from raw IdentityState account data.
@@ -290,5 +363,56 @@ mod tests {
         let pda1 = find_sas_attestation_pda(&cred, &schema, &nonce);
         let pda2 = find_sas_attestation_pda(&cred, &schema, &nonce);
         assert_eq!(pda1, pda2);
+    }
+
+    // --- check_attestation_freshness ---
+
+    #[test]
+    fn freshness_accepts_just_verified_state() {
+        // Verification 1 second ago: trivially within the window.
+        let now = 1_700_000_000;
+        assert!(check_attestation_freshness(now - 1, now).is_ok());
+    }
+
+    #[test]
+    fn freshness_accepts_state_at_window_edge() {
+        // Exactly at the max-age boundary — accepted (strictly greater rejects).
+        let now = 1_700_000_000;
+        let ts = now - ATTESTATION_VERIFICATION_MAX_AGE_SECS;
+        assert!(check_attestation_freshness(ts, now).is_ok());
+    }
+
+    #[test]
+    fn freshness_rejects_stale_state() {
+        // One second beyond the max-age window.
+        let now = 1_700_000_000;
+        let ts = now - ATTESTATION_VERIFICATION_MAX_AGE_SECS - 1;
+        assert_eq!(check_attestation_freshness(ts, now), Err("stale"));
+    }
+
+    #[test]
+    fn freshness_accepts_small_forward_skew() {
+        // Cluster clock running a few seconds ahead of executor wall clock.
+        // Within ATTESTATION_FORWARD_SKEW_SECS, accepted.
+        let now = 1_700_000_000;
+        let ts = now + ATTESTATION_FORWARD_SKEW_SECS;
+        assert!(check_attestation_freshness(ts, now).is_ok());
+    }
+
+    #[test]
+    fn freshness_rejects_far_future_timestamp() {
+        // Far-future timestamp is anomalous — likely cluster clock
+        // misconfiguration or malicious account.
+        let now = 1_700_000_000;
+        let ts = now + ATTESTATION_FORWARD_SKEW_SECS + 1;
+        assert_eq!(check_attestation_freshness(ts, now), Err("future_skew"));
+    }
+
+    #[test]
+    fn freshness_handles_default_zero_timestamp() {
+        // A freshly-created IdentityState (or a wallet that never verified)
+        // has timestamp 0. Age = now, far beyond the window → rejected.
+        let now = 1_700_000_000;
+        assert_eq!(check_attestation_freshness(0, now), Err("stale"));
     }
 }
