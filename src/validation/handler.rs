@@ -32,14 +32,19 @@ pub struct ValidateFeaturesRequest {
     /// with Bluetooth codec negotiation).
     #[serde(default)]
     pub audio_sample_rate_hz: Option<u32>,
-    /// Hex-encoded 32-byte commitment that will be submitted on-chain in
-    /// the upcoming `mint_anchor` transaction (master-list #146 Phase 2).
-    /// Forwarded unchanged to the validation service, which signs a
-    /// (wallet, commitment, validated_at) receipt when this is present and
-    /// validation passes. Absent for re-verification (`update_anchor`)
-    /// flows and pre-receipt SDK versions.
+    /// Legacy mint-intent signal. Forwarded unchanged to the validation
+    /// service, whose receipt is signed over a SERVER-DERIVED commitment — the
+    /// bytes here are no longer trusted, only their presence triggers signing
+    /// for SDKs predating `request_receipt`. Absent for re-verification
+    /// (`update_anchor`) flows and pre-receipt SDK versions.
     #[serde(default)]
     pub commitment_new_hex: Option<String>,
+    /// Explicit mint-intent flag (current SDKs). Forwarded unchanged; the
+    /// validation service signs a receipt over the commitment it derives from
+    /// `features` when this is set and validation passes. Absent for
+    /// re-verification and pre-`request_receipt` SDKs.
+    #[serde(default)]
+    pub request_receipt: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -47,15 +52,24 @@ pub struct ValidateFeaturesResponse {
     pub valid: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_quota: Option<u64>,
-    /// Validator-signed receipt forwarded from the validation service when
-    /// the request included `commitment_new_hex` (master-list #146 Phase 2).
-    /// The SDK uses this to build an `Ed25519Program::verify` instruction
-    /// bundled before `mint_anchor` in the same atomic transaction. Absent
-    /// when the validator isn't configured for signing, when the SDK didn't
-    /// supply a commitment, or when the validator returned a body without
-    /// the field (older validator versions).
+    /// Validator-signed receipt forwarded from the validation service when the
+    /// request signaled mint intent. The SDK uses this to build an
+    /// `Ed25519Program::verify` instruction bundled before `mint_anchor` in
+    /// the same atomic transaction. Absent when the validator isn't configured
+    /// for signing, when the request didn't signal mint intent, or when the
+    /// validator returned a body without the field (older validator versions).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signed_receipt: Option<SignedReceiptDto>,
+    /// Server-derived commitment (hex, 32-byte big-endian) the receipt binds —
+    /// the value the SDK must submit to `mint_anchor`. Forwarded from the
+    /// validation service; present iff `signed_receipt` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commitment_hex: Option<String>,
+    /// Salt (hex, 32-byte big-endian) the validator used to derive the
+    /// commitment. NOT in the signed receipt; the SDK stores it to rebuild the
+    /// commitment for future rotation proofs. Present iff `signed_receipt` is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub salt_hex: Option<String>,
 }
 
 /// Wire-format mirror of `entros_validation::SignedReceiptDto`. Defined
@@ -82,9 +96,8 @@ pub async fn validate_features_handler(
 
     // Parse the wallet once. Valid wallets proceed; malformed inputs are
     // rejected before touching the rate limiter or validation service.
-    let wallet = Pubkey::from_str(&req.wallet_id).map_err(|_| {
-        AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id))
-    })?;
+    let wallet = Pubkey::from_str(&req.wallet_id)
+        .map_err(|_| AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id)))?;
 
     // Per-wallet attempt cap (master-list #94). Atomic check-and-record
     // under a single DashMap entry write lock — concurrent requests for
@@ -134,6 +147,8 @@ pub async fn validate_features_handler(
                 valid: true,
                 remaining_quota: Some(remaining_after_refund),
                 signed_receipt: None,
+                commitment_hex: None,
+                salt_hex: None,
             }));
         }
     };
@@ -166,6 +181,7 @@ pub async fn validate_features_handler(
             "audio_sample_rate_hz": req.audio_sample_rate_hz,
             "expected_phrase": expected_phrase,
             "commitment_new_hex": req.commitment_new_hex,
+            "request_receipt": req.request_receipt,
         }))
         .timeout(std::time::Duration::from_secs(8));
 
@@ -257,12 +273,21 @@ pub async fn validate_features_handler(
     struct ValidatorSuccessBody {
         #[serde(default)]
         signed_receipt: Option<SignedReceiptDto>,
+        #[serde(default)]
+        commitment_hex: Option<String>,
+        #[serde(default)]
+        salt_hex: Option<String>,
     }
-    let signed_receipt = response
-        .json::<ValidatorSuccessBody>()
-        .await
-        .ok()
-        .and_then(|body| body.signed_receipt);
+    // Parse the body once and forward all three receipt artifacts together so
+    // they stay coherent — the SDK needs the commitment + salt alongside the
+    // receipt to mint and to seed future rotation proofs. Older validators
+    // omit all three; parse failure maps every field to `None` and the SDK
+    // falls back to the no-binding mint flow.
+    let (signed_receipt, commitment_hex, salt_hex) =
+        match response.json::<ValidatorSuccessBody>().await {
+            Ok(body) => (body.signed_receipt, body.commitment_hex, body.salt_hex),
+            Err(_) => (None, None, None),
+        };
 
     tracing::info!(
         api_key = %crate::auth::redact::redact_api_key(&api_key),
@@ -274,6 +299,8 @@ pub async fn validate_features_handler(
         valid: true,
         remaining_quota: Some(remaining),
         signed_receipt,
+        commitment_hex,
+        salt_hex,
     }))
 }
 
@@ -291,6 +318,7 @@ mod tests {
             audio_samples_b64: None,
             audio_sample_rate_hz: None,
             commitment_new_hex: None,
+            request_receipt: None,
         }
     }
 
