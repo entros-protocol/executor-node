@@ -18,9 +18,6 @@ use tracing_subscriber::EnvFilter;
 
 use attestation::sas::SasAttestor;
 use challenge::registry::ChallengeNonceRegistry;
-use solana_sdk::signature::Keypair;
-use solana_sdk::signer::Signer;
-use zeroize::Zeroize;
 use config::Config;
 use integrator::tracker::IntegratorTracker;
 use integrator::wallet_attempts::WalletAttemptTracker;
@@ -29,6 +26,9 @@ use relayer::commitment_registry::CommitmentRegistry;
 use relayer::transaction::RelayerTransaction;
 use server::{create_router, AppState};
 use solana::client::SolanaClient;
+use solana_sdk::signature::Keypair;
+use solana_sdk::signer::Signer;
+use zeroize::Zeroize;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -122,7 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // present, skipped otherwise so local development isn't blocked on the
     // signing tool. Use `scripts/sign-validator-url.ts` to produce signatures.
     if let Some(url) = &config.validation_service_url {
-        match (environment.as_str(), &config.validation_service_url_signature) {
+        match (
+            environment.as_str(),
+            &config.validation_service_url_signature,
+        ) {
             ("prod", None) => {
                 return Err(
                     "VALIDATION_SERVICE_URL_SIGNATURE is required when ENVIRONMENT=prod \
@@ -139,6 +142,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::info!(url = %url, "Validation service configured (dev mode, no URL signature)");
             }
         }
+    } else if environment == "prod" {
+        // Fail closed: in prod an unset VALIDATION_SERVICE_URL would make the request
+        // handler pass every submission through as valid without any validation running.
+        // Refuse to launch rather than silently accept unvalidated traffic.
+        return Err(
+            "VALIDATION_SERVICE_URL is required when ENVIRONMENT=prod \
+             (refusing to launch without a validator — unvalidated requests \
+             would otherwise be accepted as valid)"
+                .into(),
+        );
     } else {
         tracing::info!("Validation service not configured (VALIDATION_SERVICE_URL not set)");
     }
@@ -154,11 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(k) => k,
                 None => {
                     if environment == "prod" {
-                        return Err(
-                            "SAS_AUTHORITY_KEYPAIR is required when ENVIRONMENT=prod \
+                        return Err("SAS_AUTHORITY_KEYPAIR is required when ENVIRONMENT=prod \
                              (refusing to use relayer keypair as SAS authority in production)"
-                                .into(),
-                        );
+                            .into());
                     }
                     tracing::warn!(
                         environment,
@@ -184,7 +195,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )))
         }
         _ => {
-            tracing::info!("SAS attestation disabled (SAS_CREDENTIAL_PDA or SAS_SCHEMA_PDA not set)");
+            tracing::info!(
+                "SAS attestation disabled (SAS_CREDENTIAL_PDA or SAS_SCHEMA_PDA not set)"
+            );
             None
         }
     };
