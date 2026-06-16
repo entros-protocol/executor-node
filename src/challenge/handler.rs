@@ -28,9 +28,8 @@ pub async fn challenge_handler(
     State(state): State<AppState>,
     Query(req): Query<ChallengeRequest>,
 ) -> Result<PaddedJson<ChallengeResponse>, AppError> {
-    let wallet = Pubkey::from_str(&req.wallet).map_err(|_| {
-        AppError::InvalidRequest(format!("Invalid wallet address: {}", req.wallet))
-    })?;
+    let wallet = Pubkey::from_str(&req.wallet)
+        .map_err(|_| AppError::InvalidRequest(format!("Invalid wallet address: {}", req.wallet)))?;
 
     let (nonce, phrase) = state.challenge_registry.issue(wallet);
 

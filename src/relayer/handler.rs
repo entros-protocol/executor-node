@@ -141,7 +141,11 @@ pub async fn verify_handler(
 
     tracing::info!(api_key = %crate::auth::redact::redact_api_key(&api_key), "Submitting re-verification proof");
 
-    let outcome = match state.relayer_tx.submit_verification(&req.proof_bytes, &inputs).await {
+    let outcome = match state
+        .relayer_tx
+        .submit_verification(&req.proof_bytes, &inputs)
+        .await
+    {
         Ok(outcome) => outcome,
         Err(e) => {
             state.tracker.refund(&api_key);

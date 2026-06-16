@@ -42,9 +42,10 @@ pub async fn attest_handler(
     Json(req): Json<AttestRequest>,
 ) -> Result<PaddedJson<AttestResponse>, AppError> {
     // 1. Check SAS is configured
-    let attestor = state.sas_attestor.as_ref().ok_or_else(|| {
-        AppError::InvalidRequest("SAS attestation is not configured".into())
-    })?;
+    let attestor = state
+        .sas_attestor
+        .as_ref()
+        .ok_or_else(|| AppError::InvalidRequest("SAS attestation is not configured".into()))?;
 
     // 2. Require all three ownership-proof fields. Walletless flows no longer
     //    write to SAS — they were the captcha-equivalent tier, and aliasing
@@ -125,11 +126,15 @@ fn verify_wallet_signature(
     // 1. Validate message format before expensive signature verification
     let parts: Vec<&str> = message.split(':').collect();
     if parts.len() != 3 || parts[0] != "Entros-ATTEST" {
-        return Err(AppError::Forbidden("Invalid attestation message format".into()));
+        return Err(AppError::Forbidden(
+            "Invalid attestation message format".into(),
+        ));
     }
 
     if parts[1] != wallet.to_string() {
-        return Err(AppError::Forbidden("Message wallet does not match request".into()));
+        return Err(AppError::Forbidden(
+            "Message wallet does not match request".into(),
+        ));
     }
 
     let msg_timestamp: u64 = parts[2]
@@ -153,7 +158,9 @@ fn verify_wallet_signature(
         ));
     }
     if now > msg_timestamp && now - msg_timestamp > ATTEST_MESSAGE_MAX_AGE_SECS {
-        return Err(AppError::Forbidden("Attestation message has expired".into()));
+        return Err(AppError::Forbidden(
+            "Attestation message has expired".into(),
+        ));
     }
 
     // 2. Decode hex signature and verify ed25519. Ed25519 signatures are
@@ -167,18 +174,17 @@ fn verify_wallet_signature(
     }
     let sig_bytes: Vec<u8> = (0..128)
         .step_by(2)
-        .map(|i| {
-            u8::from_str_radix(&signature_hex[i..i + 2], 16)
-        })
+        .map(|i| u8::from_str_radix(&signature_hex[i..i + 2], 16))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| AppError::Forbidden("Invalid signature hex encoding".into()))?;
 
-    let sig = Signature::try_from(sig_bytes.as_slice()).map_err(|_| {
-        AppError::Forbidden("Invalid signature length".into())
-    })?;
+    let sig = Signature::try_from(sig_bytes.as_slice())
+        .map_err(|_| AppError::Forbidden("Invalid signature length".into()))?;
 
     if !sig.verify(wallet.as_ref(), message.as_bytes()) {
-        return Err(AppError::Forbidden("Wallet signature verification failed".into()));
+        return Err(AppError::Forbidden(
+            "Wallet signature verification failed".into(),
+        ));
     }
 
     Ok(())

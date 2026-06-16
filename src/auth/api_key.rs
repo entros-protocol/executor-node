@@ -82,7 +82,10 @@ mod tests {
     #[test]
     fn rejects_wrong_length_long() {
         let keys = vec!["secret-abc-123".to_string()];
-        assert!(!is_valid_api_key(b"this-is-much-longer-than-expected", &keys));
+        assert!(!is_valid_api_key(
+            b"this-is-much-longer-than-expected",
+            &keys
+        ));
     }
 
     #[test]

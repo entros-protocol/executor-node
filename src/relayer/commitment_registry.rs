@@ -34,12 +34,13 @@ impl CommitmentRegistry {
     /// Atomically check if a commitment is known and record it if not.
     /// Returns true if the commitment was already known (re-verification required).
     pub fn check_and_record(&self, api_key: &str, commitment: [u8; 32]) -> bool {
-        let mut entry = self.entries.entry(api_key.to_string()).or_insert_with(|| {
-            CommitmentEntry {
-                commitments: HashSet::new(),
-                last_activity: Instant::now(),
-            }
-        });
+        let mut entry =
+            self.entries
+                .entry(api_key.to_string())
+                .or_insert_with(|| CommitmentEntry {
+                    commitments: HashSet::new(),
+                    last_activity: Instant::now(),
+                });
 
         entry.last_activity = Instant::now();
 
@@ -64,9 +65,8 @@ impl CommitmentRegistry {
     /// Called periodically (e.g., from a background task).
     pub fn evict_stale(&self) {
         let now = Instant::now();
-        self.entries.retain(|_, entry| {
-            now.duration_since(entry.last_activity).as_secs() < ENTRY_TTL_SECS
-        });
+        self.entries
+            .retain(|_, entry| now.duration_since(entry.last_activity).as_secs() < ENTRY_TTL_SECS);
     }
 }
 
@@ -111,7 +111,8 @@ mod tests {
 
         // Manually age the entry
         if let Some(mut entry) = registry.entries.get_mut("key1") {
-            entry.last_activity = Instant::now() - std::time::Duration::from_secs(ENTRY_TTL_SECS + 1);
+            entry.last_activity =
+                Instant::now() - std::time::Duration::from_secs(ENTRY_TTL_SECS + 1);
         }
 
         registry.evict_stale();

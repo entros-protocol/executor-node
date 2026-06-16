@@ -34,8 +34,8 @@ impl RateLimiter {
         // return None on the outer call. The previous `.expect("literal 1")`
         // fallback was dead defensive code that would never execute.
         let clamped = requests_per_minute.max(1);
-        let per_minute = NonZeroU32::new(clamped)
-            .unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
+        let per_minute =
+            NonZeroU32::new(clamped).unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
         let quota = Quota::per_minute(per_minute);
         Self {
             limiters: DashMap::new(),
@@ -55,10 +55,12 @@ impl RateLimiter {
             return Err(());
         }
 
-        let mut limiter = self
-            .limiters
-            .entry(api_key.to_string())
-            .or_insert_with(|| (Arc::new(GovernorLimiter::direct(self.quota)), Instant::now()));
+        let mut limiter = self.limiters.entry(api_key.to_string()).or_insert_with(|| {
+            (
+                Arc::new(GovernorLimiter::direct(self.quota)),
+                Instant::now(),
+            )
+        });
 
         // Update last-seen timestamp
         limiter.1 = Instant::now();
@@ -99,8 +101,8 @@ pub struct PerIpRateLimiter {
 impl PerIpRateLimiter {
     pub fn new(requests_per_minute: u32) -> Self {
         let clamped = requests_per_minute.max(1);
-        let per_minute = NonZeroU32::new(clamped)
-            .unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
+        let per_minute =
+            NonZeroU32::new(clamped).unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
         let quota = Quota::per_minute(per_minute);
         // ceil(60 / clamped); never less than 1 second so the header is
         // always meaningful even at very high configured rates.
@@ -122,10 +124,12 @@ impl PerIpRateLimiter {
             return Err(self.retry_after_secs);
         }
 
-        let mut limiter = self
-            .limiters
-            .entry(ip)
-            .or_insert_with(|| (Arc::new(GovernorLimiter::direct(self.quota)), Instant::now()));
+        let mut limiter = self.limiters.entry(ip).or_insert_with(|| {
+            (
+                Arc::new(GovernorLimiter::direct(self.quota)),
+                Instant::now(),
+            )
+        });
 
         limiter.1 = Instant::now();
         let lim = limiter.0.clone();

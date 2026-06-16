@@ -57,10 +57,7 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8"
 
 pub async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
     let body = render_metrics(&state.metrics);
-    (
-        [(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)],
-        body,
-    )
+    ([(header::CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE)], body)
 }
 
 /// Pure render function — separated from the handler so unit tests can
@@ -200,12 +197,17 @@ mod tests {
         // Uptime starts at 0 (start_time captured "now" in StatusMetrics::new).
         // It MUST NOT be negative — saturating_sub guards against clock skew.
         // A naive subtraction would underflow if SystemTime drifts backwards.
-        assert!(body.contains("entros_uptime_seconds 0") || body.contains("entros_uptime_seconds 1"));
+        assert!(
+            body.contains("entros_uptime_seconds 0") || body.contains("entros_uptime_seconds 1")
+        );
     }
 
     #[test]
     fn content_type_is_prometheus_v004() {
         // Scrapers parse based on this header. Drift = scraper drops the body.
-        assert_eq!(PROMETHEUS_CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8");
+        assert_eq!(
+            PROMETHEUS_CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
     }
 }

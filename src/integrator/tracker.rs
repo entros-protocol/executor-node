@@ -115,7 +115,11 @@ impl IntegratorTracker {
         self.state
             .get(api_key)
             .map(|s| {
-                if s.quota == 0 { u64::MAX } else { s.quota.saturating_sub(s.used) }
+                if s.quota == 0 {
+                    u64::MAX
+                } else {
+                    s.quota.saturating_sub(s.used)
+                }
             })
             .unwrap_or(0)
     }

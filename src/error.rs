@@ -107,11 +107,8 @@ impl IntoResponse for AppError {
                 "reason": "ip_rate_limited",
                 "retry_after": retry_after_secs,
             });
-            let mut resp = (
-                StatusCode::TOO_MANY_REQUESTS,
-                axum::Json(Padded::new(body)),
-            )
-                .into_response();
+            let mut resp =
+                (StatusCode::TOO_MANY_REQUESTS, axum::Json(Padded::new(body))).into_response();
             // `u64::to_string` is always valid header bytes, so the parse
             // can't fail. unreachable! documents the invariant.
             let header = HeaderValue::from_str(&retry_after_secs.to_string())
@@ -129,9 +126,10 @@ impl IntoResponse for AppError {
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many attempts. Please wait before trying again.".into(),
             ),
-            AppError::InsufficientQuota => {
-                (StatusCode::PAYMENT_REQUIRED, "Insufficient verification quota".into())
-            }
+            AppError::InsufficientQuota => (
+                StatusCode::PAYMENT_REQUIRED,
+                "Insufficient verification quota".into(),
+            ),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::SolanaRpcUnavailable => (
                 StatusCode::BAD_GATEWAY,
@@ -203,9 +201,17 @@ mod tests {
         );
 
         for forbidden in [
-            "tcp", "dns", "refused", "timeout", "ipv4", "ipv6",
-            "rpc response error", "custom program error", "instruction",
-            "wallet ", "pubkey",
+            "tcp",
+            "dns",
+            "refused",
+            "timeout",
+            "ipv4",
+            "ipv6",
+            "rpc response error",
+            "custom program error",
+            "instruction",
+            "wallet ",
+            "pubkey",
         ] {
             assert!(
                 !body_str.to_lowercase().contains(forbidden),

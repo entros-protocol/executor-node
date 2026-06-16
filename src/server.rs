@@ -8,17 +8,17 @@ use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::attestation::handler::attest_handler;
+use crate::attestation::sas::SasAttestor;
 use crate::auth::api_key::api_key_auth;
 use crate::auth::client_ip::extract_client_ip;
 use crate::auth::rate_limit::{PerIpRateLimiter, RateLimiter};
+use crate::challenge::handler::challenge_handler;
+use crate::challenge::registry::ChallengeNonceRegistry;
 use crate::error::AppError;
 use crate::integrator::tracker::IntegratorTracker;
 use crate::integrator::wallet_attempts::WalletAttemptTracker;
 use crate::relayer::commitment_registry::CommitmentRegistry;
-use crate::attestation::handler::attest_handler;
-use crate::attestation::sas::SasAttestor;
-use crate::challenge::handler::challenge_handler;
-use crate::challenge::registry::ChallengeNonceRegistry;
 use crate::relayer::handler::{health_handler, verify_handler};
 use crate::relayer::transaction::RelayerTransaction;
 use crate::status::handler::status_handler;
@@ -195,12 +195,13 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
     // so hostile traffic is rejected before consuming server resources.
     // Excluded: /health, /status, /metrics — Railway healthchecks and
     // Prometheus scrapers are expected to hit at high cadence.
-    let verify_routes = timed_routes
-        .merge(untimed_routes)
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            per_ip_rate_limit_middleware,
-        ));
+    let verify_routes =
+        timed_routes
+            .merge(untimed_routes)
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                per_ip_rate_limit_middleware,
+            ));
 
     let cors = if cors_origins.is_empty() {
         // No origins configured — permissive for development
@@ -216,11 +217,21 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
                 }
             })
             .collect();
-        tracing::info!(count = parsed.len(), "CORS restricted to configured origins");
+        tracing::info!(
+            count = parsed.len(),
+            "CORS restricted to configured origins"
+        );
         CorsLayer::new()
             .allow_origin(parsed)
-            .allow_methods([axum::http::Method::GET, axum::http::Method::POST, axum::http::Method::OPTIONS])
-            .allow_headers([axum::http::header::CONTENT_TYPE, axum::http::header::HeaderName::from_static("x-api-key")])
+            .allow_methods([
+                axum::http::Method::GET,
+                axum::http::Method::POST,
+                axum::http::Method::OPTIONS,
+            ])
+            .allow_headers([
+                axum::http::header::CONTENT_TYPE,
+                axum::http::header::HeaderName::from_static("x-api-key"),
+            ])
     };
 
     Router::new()
@@ -371,7 +382,11 @@ mod per_ip_middleware_tests {
         let app = app(limiter);
         // Burn the budget.
         for _ in 0..2 {
-            let resp = app.clone().oneshot(req_with_xff("203.0.113.5")).await.unwrap();
+            let resp = app
+                .clone()
+                .oneshot(req_with_xff("203.0.113.5"))
+                .await
+                .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
         }
         let resp = app.oneshot(req_with_xff("203.0.113.5")).await.unwrap();
@@ -382,7 +397,9 @@ mod per_ip_middleware_tests {
             .expect("Retry-After header must be present on per-IP 429")
             .to_str()
             .unwrap();
-        let secs: u64 = retry_after.parse().expect("Retry-After must be integer seconds");
+        let secs: u64 = retry_after
+            .parse()
+            .expect("Retry-After must be integer seconds");
         assert!(secs >= 1, "Retry-After must be at least 1s, got {secs}");
     }
 
@@ -391,13 +408,25 @@ mod per_ip_middleware_tests {
         let limiter = Arc::new(PerIpRateLimiter::new(1));
         let app = app(limiter);
         // IP A: burn the budget, then verify it's rejected.
-        let r1 = app.clone().oneshot(req_with_xff("203.0.113.10")).await.unwrap();
+        let r1 = app
+            .clone()
+            .oneshot(req_with_xff("203.0.113.10"))
+            .await
+            .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
-        let r2 = app.clone().oneshot(req_with_xff("203.0.113.10")).await.unwrap();
+        let r2 = app
+            .clone()
+            .oneshot(req_with_xff("203.0.113.10"))
+            .await
+            .unwrap();
         assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
         // IP B: should still pass first request.
         let r3 = app.oneshot(req_with_xff("203.0.113.11")).await.unwrap();
-        assert_eq!(r3.status(), StatusCode::OK, "different IP must have its own budget");
+        assert_eq!(
+            r3.status(),
+            StatusCode::OK,
+            "different IP must have its own budget"
+        );
     }
 
     #[tokio::test]
@@ -447,7 +476,10 @@ mod per_ip_middleware_tests {
         // don't care about IP wiring continue to work.
         let limiter = Arc::new(PerIpRateLimiter::new(1));
         let app = app(limiter);
-        let req = Request::builder().uri("/probe").body(Body::empty()).unwrap();
+        let req = Request::builder()
+            .uri("/probe")
+            .body(Body::empty())
+            .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -471,7 +503,11 @@ mod per_ip_middleware_tests {
             .with_state(state);
 
         // 1 r/m budget — first request OK, second rejected.
-        let r1 = app.clone().oneshot(req_with_xff("203.0.113.99")).await.unwrap();
+        let r1 = app
+            .clone()
+            .oneshot(req_with_xff("203.0.113.99"))
+            .await
+            .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
         let r2 = app.oneshot(req_with_xff("203.0.113.99")).await.unwrap();
         assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -505,13 +541,21 @@ mod per_ip_middleware_tests {
             .with_state(state);
 
         // First request: under cap → no counter increment.
-        let r1 = app.clone().oneshot(req_with_xff("203.0.113.123")).await.unwrap();
+        let r1 = app
+            .clone()
+            .oneshot(req_with_xff("203.0.113.123"))
+            .await
+            .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
         assert_eq!(metrics.per_ip_rate_limit_rejected(), 0);
 
         // Two more requests: both over cap → two increments.
         for _ in 0..2 {
-            let r = app.clone().oneshot(req_with_xff("203.0.113.123")).await.unwrap();
+            let r = app
+                .clone()
+                .oneshot(req_with_xff("203.0.113.123"))
+                .await
+                .unwrap();
             assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
         }
         assert_eq!(metrics.per_ip_rate_limit_rejected(), 2);

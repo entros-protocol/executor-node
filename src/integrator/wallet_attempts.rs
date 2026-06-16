@@ -172,7 +172,9 @@ mod tests {
         let tracker = WalletAttemptTracker::default_for_tests();
         let wallet = dummy_wallet(2);
         for _ in 0..TEST_MAX {
-            tracker.check_and_record_attempt(&wallet).expect("attempt within cap");
+            tracker
+                .check_and_record_attempt(&wallet)
+                .expect("attempt within cap");
         }
         match tracker.check_and_record_attempt(&wallet) {
             Err(retry_after) => {
@@ -189,7 +191,9 @@ mod tests {
         let w1 = dummy_wallet(3);
         let w2 = dummy_wallet(4);
         for _ in 0..TEST_MAX {
-            tracker.check_and_record_attempt(&w1).expect("attempt within cap");
+            tracker
+                .check_and_record_attempt(&w1)
+                .expect("attempt within cap");
         }
         assert!(tracker.check_and_record_attempt(&w1).is_err());
         assert!(tracker.check_and_record_attempt(&w2).is_ok());
@@ -222,7 +226,9 @@ mod tests {
         // Burn the cap with successful attempts, refunding each — the
         // counter should always have room.
         for _ in 0..(TEST_MAX as usize * 5) {
-            tracker.check_and_record_attempt(&wallet).expect("attempt within cap");
+            tracker
+                .check_and_record_attempt(&wallet)
+                .expect("attempt within cap");
             tracker.refund_on_success(&wallet);
         }
         // After all the refunds the wallet is still allowed.
@@ -236,7 +242,9 @@ mod tests {
         // Refund before any attempt: should be a no-op (entry doesn't exist).
         tracker.refund_on_success(&wallet);
         // Single attempt then double refund: counter should saturate at 0.
-        tracker.check_and_record_attempt(&wallet).expect("attempt within cap");
+        tracker
+            .check_and_record_attempt(&wallet)
+            .expect("attempt within cap");
         tracker.refund_on_success(&wallet);
         tracker.refund_on_success(&wallet);
         // Still allowed.
@@ -275,10 +283,14 @@ mod tests {
         let tracker = WalletAttemptTracker::default_for_tests();
         // Add a wallet with active count — should NOT be evicted even if window expired.
         let active = dummy_wallet(9);
-        tracker.check_and_record_attempt(&active).expect("attempt within cap");
+        tracker
+            .check_and_record_attempt(&active)
+            .expect("attempt within cap");
         // Add a wallet at zero count — eligible for eviction once window expires.
         let zero = dummy_wallet(10);
-        tracker.check_and_record_attempt(&zero).expect("zero-window attempt allowed");
+        tracker
+            .check_and_record_attempt(&zero)
+            .expect("zero-window attempt allowed");
         tracker.refund_on_success(&zero);
 
         // Without forcing time, neither is window-expired → nothing evicted.

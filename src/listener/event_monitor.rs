@@ -56,9 +56,7 @@ impl EventMonitor {
     async fn subscribe(&self) -> Result<(), Box<dyn std::error::Error>> {
         let client = PubsubClient::new(&self.ws_url).await?;
 
-        let filter = RpcTransactionLogsFilter::Mentions(vec![
-            self.verifier_program_id.to_string(),
-        ]);
+        let filter = RpcTransactionLogsFilter::Mentions(vec![self.verifier_program_id.to_string()]);
 
         let config = RpcTransactionLogsConfig {
             commitment: Some(CommitmentConfig::confirmed()),
@@ -85,19 +83,17 @@ impl EventMonitor {
             // Match log entries from the verifier program only
             let program_id_str = self.verifier_program_id.to_string();
             let is_verifier_log = |l: &str| l.contains(&program_id_str);
-            let has_challenge = logs.iter().any(|l| is_verifier_log(l) && l.contains("ChallengeCreated"));
-            let has_verification = logs.iter().any(|l| is_verifier_log(l) && l.contains("VerificationComplete"));
+            let has_challenge = logs
+                .iter()
+                .any(|l| is_verifier_log(l) && l.contains("ChallengeCreated"));
+            let has_verification = logs
+                .iter()
+                .any(|l| is_verifier_log(l) && l.contains("VerificationComplete"));
 
             if has_verification {
-                tracing::info!(
-                    signature,
-                    "Verification completed on-chain"
-                );
+                tracing::info!(signature, "Verification completed on-chain");
             } else if has_challenge {
-                tracing::info!(
-                    signature,
-                    "Challenge created on-chain"
-                );
+                tracing::info!(signature, "Challenge created on-chain");
             }
         }
 

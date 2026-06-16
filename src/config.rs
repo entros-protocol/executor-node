@@ -98,21 +98,17 @@ mod tests {
     #[test]
     fn rejects_malformed_bs58() {
         let authority = Keypair::new();
-        assert!(verify_url_signature_against(
-            "http://x",
-            "not-valid-bs58!!!",
-            &authority.pubkey()
-        )
-        .is_err());
+        assert!(
+            verify_url_signature_against("http://x", "not-valid-bs58!!!", &authority.pubkey())
+                .is_err()
+        );
     }
 
     #[test]
     fn rejects_wrong_length_signature() {
         let authority = Keypair::new();
         let too_short = bs58::encode([0u8; 32]).into_string();
-        assert!(
-            verify_url_signature_against("http://x", &too_short, &authority.pubkey()).is_err()
-        );
+        assert!(verify_url_signature_against("http://x", &too_short, &authority.pubkey()).is_err());
     }
 
     #[test]
@@ -211,7 +207,8 @@ impl Config {
         };
 
         let rate_limit_per_minute: u32 = match std::env::var("RATE_LIMIT_PER_MINUTE") {
-            Ok(s) => s.parse()
+            Ok(s) => s
+                .parse()
                 .map_err(|e| format!("RATE_LIMIT_PER_MINUTE is not a valid u32: {e}"))?,
             Err(_) => 60,
         };
@@ -251,8 +248,9 @@ impl Config {
             )
         } else if let Ok(path) = std::env::var("SAS_AUTHORITY_KEYPAIR_PATH") {
             Some(
-                read_keypair_file(&path)
-                    .map_err(|e| format!("Failed to read SAS authority keypair from {path}: {e}"))?,
+                read_keypair_file(&path).map_err(|e| {
+                    format!("Failed to read SAS authority keypair from {path}: {e}")
+                })?,
             )
         } else {
             None

@@ -65,7 +65,8 @@ impl StatusMetrics {
     }
 
     pub fn per_ip_rate_limit_rejected(&self) -> u64 {
-        self.total_per_ip_rate_limit_rejected.load(Ordering::Relaxed)
+        self.total_per_ip_rate_limit_rejected
+            .load(Ordering::Relaxed)
     }
 
     pub fn start_time(&self) -> u64 {
@@ -77,7 +78,10 @@ impl StatusMetrics {
     }
 
     pub fn update_cached_balance(&self, balance: u64, fetched_at: u64) {
-        let mut cache = self.balance_cache.write().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self
+            .balance_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
         *cache = (balance, fetched_at);
     }
 }
