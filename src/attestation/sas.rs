@@ -128,11 +128,8 @@ impl SasAttestor {
         )?;
 
         // 4. Derive attestation PDA
-        let attestation_pda = find_sas_attestation_pda(
-            &self.credential_pda,
-            &self.schema_pda,
-            user_wallet,
-        );
+        let attestation_pda =
+            find_sas_attestation_pda(&self.credential_pda, &self.schema_pda, user_wallet);
 
         // 5. Check if attestation already exists
         let existing = self.client.get_account_data(&attestation_pda).await?;
@@ -154,11 +151,7 @@ impl SasAttestor {
         }
 
         // 6. Serialize attestation data using the `now` captured at step 2.
-        let data = serialize_attestation_data(
-            identity.trust_score,
-            now,
-            "wallet-connected",
-        );
+        let data = serialize_attestation_data(identity.trust_score, now, "wallet-connected");
 
         // 7. Build CreateAttestation instruction
         let expiry = now + (self.ttl_days as i64 * 86_400);
@@ -186,11 +179,7 @@ impl SasAttestor {
 
 /// Derive the SAS attestation PDA for a given user.
 /// Seeds: ["attestation", credential, schema, nonce(user_wallet)]
-fn find_sas_attestation_pda(
-    credential: &Pubkey,
-    schema: &Pubkey,
-    nonce: &Pubkey,
-) -> Pubkey {
+fn find_sas_attestation_pda(credential: &Pubkey, schema: &Pubkey, nonce: &Pubkey) -> Pubkey {
     let (pda, _) = Pubkey::find_program_address(
         &[
             b"attestation",
@@ -206,10 +195,8 @@ fn find_sas_attestation_pda(
 /// Derive the event authority PDA (singleton).
 /// Seeds: ["__event_authority"]
 fn find_event_authority_pda() -> Pubkey {
-    let (pda, _) = Pubkey::find_program_address(
-        &[b"__event_authority"],
-        &SOLANA_ATTESTATION_SERVICE_ID,
-    );
+    let (pda, _) =
+        Pubkey::find_program_address(&[b"__event_authority"], &SOLANA_ATTESTATION_SERVICE_ID);
     pda
 }
 
@@ -259,6 +246,16 @@ fn deserialize_identity_state(data: &[u8]) -> Result<IdentityStateData, String> 
             "IdentityState data too short: {} bytes (need >= 62)",
             data.len()
         ));
+    }
+
+    // Verify the Anchor account discriminator = sha256("account:IdentityState")[..8]
+    // before trusting the raw offsets below. The PDA is program-derived, but a wrong-type
+    // or uninitialized account at that address would otherwise have arbitrary bytes read as
+    // a trust score. Mirrors the on-chain guard in entros-voter-weight so the off-chain
+    // attestor enforces the same type check.
+    const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
+    if data[..8] != IDENTITY_DISCRIMINATOR {
+        return Err("IdentityState discriminator mismatch (not an IdentityState account)".to_string());
     }
 
     let last_verification_timestamp = i64::from_le_bytes(
