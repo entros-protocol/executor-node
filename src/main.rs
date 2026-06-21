@@ -72,6 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Rate limiters initialized"
     );
 
+    // Surface the resolved observe-only automation-detection state (#196, A1)
+    // so a misconfigured EXECUTOR_AUTOMATION_OBSERVE is visible at boot rather
+    // than silently changing logging behaviour.
+    tracing::info!(
+        automation_observe = config.automation_observe,
+        "Automation-signal observe logging configured"
+    );
+
     // Initialize integrator quota tracker. Refuse to start in production
     // unless `INTEGRATORS` is explicitly populated. `API_KEYS` alone is not
     // sufficient: keys without an integrator entry fall through to the
@@ -300,6 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         validation_api_key: config.validation_api_key,
         challenge_registry,
         challenge_ttl_secs: config.challenge_ttl_secs,
+        automation_observe: config.automation_observe,
     };
 
     let app = create_router(state, &config.cors_origins);

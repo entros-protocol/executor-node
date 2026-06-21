@@ -45,6 +45,46 @@ pub struct ValidateFeaturesRequest {
     /// re-verification and pre-`request_receipt` SDKs.
     #[serde(default)]
     pub request_receipt: Option<bool>,
+    /// Observe-only automation-detection signals (master-list #196, Layer A1).
+    /// Collected client-side by the SDK and logged here for calibration. NOT
+    /// forwarded to the validation service and NOT part of the pass/fail
+    /// decision. Privacy-first — the SDK reports only automation-framework
+    /// artifacts (the WebDriver flag + framework labels), never fingerprints or
+    /// user data. Absent for older SDKs (logged as such).
+    #[serde(default)]
+    pub client_signals: Option<ClientSignals>,
+}
+
+/// The `client_signals` envelope (Layer A1). Wire mirror of the SDK's
+/// `ClientSignals`. Namespaced so future signal groups (interaction realism,
+/// capture realism) slot in as siblings of `automation` without a breaking wire
+/// change. Every field is `#[serde(default)]` so a partial or older payload
+/// deserializes cleanly. Observe-only — never influences the verification
+/// outcome.
+#[derive(Deserialize, Debug)]
+pub struct ClientSignals {
+    /// Envelope schema version emitted by the SDK collector.
+    #[serde(default)]
+    pub v: u32,
+    /// "browser", or "non-browser" for React Native / Node / SSR runtimes.
+    #[serde(default)]
+    pub env: Option<String>,
+    /// Automation-framework detection group.
+    #[serde(default)]
+    pub automation: Option<AutomationSignals>,
+}
+
+/// Automation-framework detection group inside `client_signals`. Wire mirror of
+/// the SDK's `AutomationSignals`.
+#[derive(Deserialize, Debug)]
+pub struct AutomationSignals {
+    /// `navigator.webdriver === true` — the W3C WebDriver automation flag.
+    #[serde(default)]
+    pub webdriver: bool,
+    /// Automation-framework labels found in the page (e.g. "puppeteer",
+    /// "selenium"). Empty for a real human session.
+    #[serde(default)]
+    pub tells: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -98,6 +138,45 @@ pub async fn validate_features_handler(
     // rejected before touching the rate limiter or validation service.
     let wallet = Pubkey::from_str(&req.wallet_id)
         .map_err(|_| AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id)))?;
+
+    // Observe-only automation-detection signal (master-list #196, Layer A1).
+    // Logged for real-traffic calibration; NOT forwarded to the validation
+    // service and NOT part of the pass/fail decision below. Privacy-first: the
+    // SDK reports only automation-framework artifacts (the WebDriver flag +
+    // framework labels), never fingerprints or user data, so a privacy-hardened
+    // browser (Tor / RFP) is never flagged. We measure real-user trip rates
+    // before this signal influences anything. Info-level only when a tell
+    // fires (the rare, interesting case); clean/absent stays at debug so prod
+    // logs are quiet until we flip to debug for baseline measurement.
+    if state.automation_observe {
+        let signals = req.client_signals.as_ref();
+        match signals.and_then(|c| c.automation.as_ref()) {
+            Some(a) if a.webdriver || !a.tells.is_empty() => {
+                // Cap the logged labels so a malicious oversized payload can't
+                // bloat the log line; the full count is logged separately. `env`
+                // is attacker-controlled free text, so it is Debug-formatted
+                // (`?`) — like `tells` — to escape control chars and prevent
+                // log-line injection against the plaintext log subscriber.
+                let tells: Vec<&str> = a.tells.iter().take(16).map(String::as_str).collect();
+                tracing::info!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                    webdriver = a.webdriver,
+                    env = ?signals.and_then(|c| c.env.as_deref()).unwrap_or("unknown"),
+                    tell_count = a.tells.len(),
+                    tells = ?tells,
+                    schema = signals.map_or(0, |c| c.v),
+                    "Automation signal observed"
+                );
+            }
+            Some(_) => {
+                tracing::debug!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                    "Client signals present and clean"
+                );
+            }
+            None => tracing::debug!("No automation signals on request (older SDK or non-browser)"),
+        }
+    }
 
     // Per-wallet attempt cap (master-list #94). Atomic check-and-record
     // under a single DashMap entry write lock — concurrent requests for
@@ -319,7 +398,70 @@ mod tests {
             audio_sample_rate_hz: None,
             commitment_new_hex: None,
             request_receipt: None,
+            client_signals: None,
         }
+    }
+
+    #[test]
+    fn older_payload_without_client_signals_deserializes() {
+        // Backward compatibility: a pre-A1 SDK omits the field entirely.
+        let json = serde_json::json!({
+            "features": [0.0, 1.0, 2.0],
+            "wallet_id": "abc",
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        assert!(req.client_signals.is_none());
+    }
+
+    #[test]
+    fn client_signals_deserialize_and_tells_round_trip() {
+        let json = serde_json::json!({
+            "features": [0.0],
+            "wallet_id": "abc",
+            "client_signals": {
+                "v": 1,
+                "env": "browser",
+                "automation": { "webdriver": true, "tells": ["puppeteer", "selenium"] },
+            },
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        let sig = req.client_signals.expect("client_signals present");
+        assert_eq!(sig.v, 1);
+        assert_eq!(sig.env.as_deref(), Some("browser"));
+        let automation = sig.automation.expect("automation group present");
+        assert!(automation.webdriver);
+        assert_eq!(automation.tells, vec!["puppeteer", "selenium"]);
+    }
+
+    #[test]
+    fn partial_client_signals_default_missing_subfields() {
+        // A forward-compat or trimmed payload: only the automation group with
+        // `tells` present. Missing subfields fall back to defaults, not failure.
+        let json = serde_json::json!({
+            "features": [0.0],
+            "wallet_id": "abc",
+            "client_signals": { "automation": { "tells": ["phantom"] } },
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        let sig = req.client_signals.unwrap();
+        assert_eq!(sig.v, 0);
+        assert_eq!(sig.env, None);
+        let automation = sig.automation.unwrap();
+        assert!(!automation.webdriver);
+        assert_eq!(automation.tells, vec!["phantom"]);
+    }
+
+    #[test]
+    fn unknown_extra_fields_are_ignored() {
+        // The request struct has no `deny_unknown_fields`, so a future SDK can
+        // add fields without breaking an older executor.
+        let json = serde_json::json!({
+            "features": [0.0],
+            "wallet_id": "abc",
+            "some_future_field": { "nested": true },
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        assert!(req.client_signals.is_none());
     }
 
     #[tokio::test]
@@ -337,6 +479,68 @@ mod tests {
             10,
             "dev-skip path must refund the integrator quota"
         );
+    }
+
+    #[tokio::test]
+    async fn client_signals_present_do_not_change_the_outcome() {
+        // Observe-only contract: a request carrying automation tells (here, the
+        // strongest — webdriver true plus framework labels) must reach the same
+        // verdict as one without. The handler runs with automation_observe=true
+        // (build_test_state default), so this exercises the live observe branch
+        // and confirms it is side-effect-free on the decision.
+        let tracker = tracker_with_quota("test-key", 10);
+        let state = build_test_state(tracker.clone(), None);
+        let headers = headers_with_key("test-key");
+        let mut req = baseline_request(random_wallet_id());
+        req.client_signals = Some(ClientSignals {
+            v: 1,
+            env: Some("browser".into()),
+            automation: Some(AutomationSignals {
+                webdriver: true,
+                tells: vec!["puppeteer".into(), "selenium".into()],
+            }),
+        });
+
+        let result = validate_features_handler(State(state), headers, Json(req)).await;
+
+        assert!(
+            result.is_ok(),
+            "automation tells must not block the verification path (observe-only); got {:?}",
+            result.err()
+        );
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            10,
+            "observe-only path must not perturb quota accounting"
+        );
+    }
+
+    #[tokio::test]
+    async fn malicious_env_string_does_not_break_the_handler() {
+        // `env` is attacker-controlled free text. A newline-laden value (a
+        // log-injection attempt) must neither panic nor alter the outcome; the
+        // handler Debug-formats `env`, which escapes control chars in the log.
+        let tracker = tracker_with_quota("test-key", 10);
+        let state = build_test_state(tracker.clone(), None);
+        let headers = headers_with_key("test-key");
+        let mut req = baseline_request(random_wallet_id());
+        req.client_signals = Some(ClientSignals {
+            v: 1,
+            env: Some("browser\n2099-01-01 INFO forged-admin-login".into()),
+            automation: Some(AutomationSignals {
+                webdriver: true,
+                tells: vec!["x\nforged".into()],
+            }),
+        });
+
+        let result = validate_features_handler(State(state), headers, Json(req)).await;
+
+        assert!(
+            result.is_ok(),
+            "malicious env must not break the path: {:?}",
+            result.err()
+        );
+        assert_eq!(tracker.get_remaining("test-key"), 10);
     }
 
     #[tokio::test]

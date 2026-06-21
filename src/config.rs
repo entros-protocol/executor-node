@@ -170,6 +170,12 @@ pub struct Config {
     /// Sliding-window length for `wallet_max_attempts`. Configurable via
     /// `VALIDATION_WALLET_WINDOW_SECS`. Default 3600 (1 hour).
     pub wallet_window_secs: u64,
+    /// Observe-only automation-detection logging (master-list #196, Layer A1).
+    /// When true, the `/validate-features` handler logs the client-collected
+    /// automation signal for calibration — it never affects the verification
+    /// decision either way. Configurable via `EXECUTOR_AUTOMATION_OBSERVE`.
+    /// Default true (observe-first).
+    pub automation_observe: bool,
 }
 
 impl Config {
@@ -291,6 +297,20 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3600);
 
+        // Observe-first: default ON so we collect calibration data as soon as
+        // SDKs start sending the signal. Set `EXECUTOR_AUTOMATION_OBSERVE=false`
+        // (or `0`/`no`/`off`) to silence the logging. An unrecognized value
+        // KEEPS the observe-first default rather than silently disabling the
+        // signal on a typo; the resolved value is logged at startup in main.rs.
+        let automation_observe: bool = match std::env::var("EXECUTOR_AUTOMATION_OBSERVE") {
+            Err(_) => true,
+            Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => true,
+                "0" | "false" | "no" | "off" => false,
+                _ => true,
+            },
+        };
+
         Ok(Config {
             rpc_url,
             ws_url,
@@ -311,6 +331,7 @@ impl Config {
             challenge_ttl_secs,
             wallet_max_attempts,
             wallet_window_secs,
+            automation_observe,
         })
     }
 }

@@ -43,6 +43,10 @@ pub struct AppState {
     pub validation_api_key: Option<String>,
     pub challenge_registry: Arc<ChallengeNonceRegistry>,
     pub challenge_ttl_secs: u64,
+    /// Observe-only automation-detection logging (master-list #196, Layer A1).
+    /// Gates the calibration log in `validate_features_handler`; never affects
+    /// the verification decision.
+    pub automation_observe: bool,
 }
 
 async fn auth_middleware(
@@ -286,6 +290,7 @@ pub fn build_test_state(
         validation_api_key: None,
         challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
         challenge_ttl_secs: 300,
+        automation_observe: true,
     }
 }
 
