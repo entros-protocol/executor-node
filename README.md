@@ -78,6 +78,8 @@ cargo test
 | `CORS_ORIGINS` | `[]` | JSON array of allowed origins (permissive if empty) |
 | `SAS_CREDENTIAL_PDA` | — | SAS credential PDA for attestation issuance |
 | `SAS_SCHEMA_PDA` | — | SAS schema PDA for attestation issuance |
+| `EXECUTOR_AUTOMATION_OBSERVE` | `true` | Log client automation signals for calibration (observe-only; never affects the decision). `0`/`false`/`no`/`off` to disable |
+| `EXECUTOR_WALLET_REPUTATION_OBSERVE` | `true` | Log a verifying wallet's on-chain reputation for calibration (observe-only; never affects the decision). `0`/`false`/`no`/`off` to disable |
 
 ## License
 
