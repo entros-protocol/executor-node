@@ -19,6 +19,13 @@ impl RelayerTransaction {
         Self { client }
     }
 
+    /// Shared Solana client handle. Cloned (cheap Arc bump) by the observe-only
+    /// wallet-reputation read (#196, D1) so the read can run in a detached task
+    /// without borrowing the request path.
+    pub fn client(&self) -> Arc<SolanaClient> {
+        Arc::clone(&self.client)
+    }
+
     /// Submit a verification: create_challenge + verify_proof in one transaction.
     /// After the verify_proof revert fix, a confirmed transaction guarantees the
     /// proof was valid (invalid proofs revert the entire transaction).

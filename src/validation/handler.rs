@@ -209,6 +209,39 @@ pub async fn validate_features_handler(
         }
     };
 
+    // Observe-only wallet reputation (master-list #196, Layer D1). Reads the
+    // verifying wallet's PUBLIC on-chain reputation (balance + recent activity)
+    // as a risk prior and logs it for calibration. Placed AFTER the per-wallet
+    // cap and integrator-quota gates so rate-limited / quota-exhausted traffic
+    // can't drive RPC reads — and so the logged population is real, admitted
+    // verification attempts. Detached (tokio::spawn) so it adds ZERO latency and
+    // can never block, fail, or alter the decision/quota. A process-wide gate
+    // bounds concurrent reads (they share the relayer's RpcClient); when
+    // saturated the sample is skipped. Public chain data only — no surveillance,
+    // no profile store.
+    if state.wallet_reputation_observe {
+        if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
+            let client = state.relayer_tx.client();
+            let redacted = crate::auth::redact::redact_wallet_id(&req.wallet_id);
+            tokio::spawn(async move {
+                let _permit = permit; // released when the read completes
+                match crate::reputation::fetch_wallet_reputation(&client, &wallet).await {
+                    Ok(rep) => tracing::info!(
+                        wallet_id = %redacted,
+                        sol_lamports = rep.sol_lamports,
+                        signature_count = rep.signature_count,
+                        oldest_block_time = ?rep.oldest_block_time,
+                        "Wallet reputation observed"
+                    ),
+                    Err(_) => tracing::debug!(
+                        wallet_id = %redacted,
+                        "Wallet reputation unavailable (observe-only, non-blocking)"
+                    ),
+                }
+            });
+        }
+    }
+
     // If validation service is not configured, pass through. No
     // validation actually ran — refund the wallet slot AND the integrator
     // quota so dev environments without a validator don't tick either
@@ -538,6 +571,31 @@ mod tests {
         assert!(
             result.is_ok(),
             "malicious env must not break the path: {:?}",
+            result.err()
+        );
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+    }
+
+    #[tokio::test]
+    async fn wallet_reputation_observe_does_not_change_the_outcome() {
+        // The D1 reputation read is detached (fire-and-forget) and must never
+        // affect the verdict or quota. build_test_state enables it; the test RPC
+        // endpoint is unreachable, so the spawned read fails and logs
+        // "unavailable" — the handler outcome is unchanged either way.
+        let tracker = tracker_with_quota("test-key", 10);
+        let state = build_test_state(tracker.clone(), None);
+        assert!(
+            state.wallet_reputation_observe,
+            "observe flag on by default in tests"
+        );
+        let headers = headers_with_key("test-key");
+        let req = baseline_request(random_wallet_id());
+
+        let result = validate_features_handler(State(state), headers, Json(req)).await;
+
+        assert!(
+            result.is_ok(),
+            "reputation observe must not change outcome: {:?}",
             result.err()
         );
         assert_eq!(tracker.get_remaining("test-key"), 10);

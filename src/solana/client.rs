@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::rpc_client::GetConfirmedSignaturesForAddress2Config;
 use solana_sdk::commitment_config::CommitmentConfig;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::instruction::Instruction;
@@ -13,6 +14,23 @@ use crate::error::AppError;
 const MAX_RETRIES: usize = 3;
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Cap on the signature-history window for observe-only reputation reads
+/// (#196, D1). 100 is plenty to distinguish a fresh wallet (≈0 signatures) from
+/// one with real history, while keeping the RPC response small — avoiding the
+/// ~1000-entry default for active wallets on a per-verification path.
+const RECENT_SIGNATURE_WINDOW: usize = 100;
+
+/// Recent on-chain activity summary for a wallet (#196, D1).
+#[derive(Debug, Clone, Default)]
+pub struct RecentActivity {
+    /// Signatures seen in the query window (saturates at `RECENT_SIGNATURE_WINDOW`).
+    /// Near-zero for a fresh wallet — the coarse signal a risk prior needs.
+    pub signature_count: usize,
+    /// Block time of the oldest signature in the window that carries one — an
+    /// approximate account-age anchor (exact for wallets below the window).
+    pub oldest_block_time: Option<i64>,
+}
 
 pub struct SolanaClient {
     rpc: RpcClient,
@@ -59,6 +77,48 @@ impl SolanaClient {
                     );
                     Err(AppError::SolanaRpcUnavailable)
                 }
+            }
+        }
+    }
+
+    /// Native SOL balance (lamports) of an arbitrary wallet. Used by the
+    /// observe-only wallet-reputation read (#196, D1) — public on-chain data,
+    /// never a gate. Failures log at `debug` (not `error` like the decision-path
+    /// reads): a miss on this non-blocking calibration read is non-actionable.
+    pub async fn get_balance_of(&self, pubkey: &Pubkey) -> Result<u64, AppError> {
+        self.rpc.get_balance(pubkey).await.map_err(|e| {
+            tracing::debug!(error = %e, pubkey = %pubkey, "get_balance_of RPC call failed");
+            AppError::SolanaRpcUnavailable
+        })
+    }
+
+    /// Recent on-chain activity for an arbitrary wallet (#196, D1, observe-only):
+    /// signature count + the oldest block time in a bounded window. The window
+    /// is capped at `RECENT_SIGNATURE_WINDOW` and read at the client's commitment
+    /// (matching `get_balance_of`) so the snapshot is internally consistent.
+    pub async fn get_recent_activity(&self, pubkey: &Pubkey) -> Result<RecentActivity, AppError> {
+        let config = GetConfirmedSignaturesForAddress2Config {
+            limit: Some(RECENT_SIGNATURE_WINDOW),
+            commitment: Some(self.rpc.commitment()),
+            ..Default::default()
+        };
+        match self
+            .rpc
+            .get_signatures_for_address_with_config(pubkey, config)
+            .await
+        {
+            Ok(sigs) => {
+                // Signatures come newest-first; the last entry carrying a block
+                // time is the oldest in the window.
+                let oldest_block_time = sigs.iter().rev().find_map(|s| s.block_time);
+                Ok(RecentActivity {
+                    signature_count: sigs.len(),
+                    oldest_block_time,
+                })
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, pubkey = %pubkey, "get_recent_activity RPC call failed");
+                Err(AppError::SolanaRpcUnavailable)
             }
         }
     }

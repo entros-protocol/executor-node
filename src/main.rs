@@ -7,6 +7,7 @@ mod integrator;
 mod listener;
 mod padding;
 mod relayer;
+mod reputation;
 mod server;
 mod solana;
 mod status;
@@ -77,7 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // than silently changing logging behaviour.
     tracing::info!(
         automation_observe = config.automation_observe,
-        "Automation-signal observe logging configured"
+        wallet_reputation_observe = config.wallet_reputation_observe,
+        "Observe-only signal logging configured"
     );
 
     // Initialize integrator quota tracker. Refuse to start in production
@@ -309,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         challenge_registry,
         challenge_ttl_secs: config.challenge_ttl_secs,
         automation_observe: config.automation_observe,
+        wallet_reputation_observe: config.wallet_reputation_observe,
     };
 
     let app = create_router(state, &config.cors_origins);

@@ -47,6 +47,10 @@ pub struct AppState {
     /// Gates the calibration log in `validate_features_handler`; never affects
     /// the verification decision.
     pub automation_observe: bool,
+    /// Observe-only wallet-reputation logging (master-list #196, Layer D1).
+    /// Gates the detached on-chain reputation read in `validate_features_handler`;
+    /// never affects the verification decision, quota, or latency.
+    pub wallet_reputation_observe: bool,
 }
 
 async fn auth_middleware(
@@ -291,6 +295,7 @@ pub fn build_test_state(
         challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
         challenge_ttl_secs: 300,
         automation_observe: true,
+        wallet_reputation_observe: true,
     }
 }
 

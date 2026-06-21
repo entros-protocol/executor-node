@@ -50,10 +50,44 @@ pub fn verify_validation_url_signature(url: &str, signature_bs58: &str) -> Resul
     verify_url_signature_against(url, signature_bs58, &authority)
 }
 
+/// Read a boolean env var with lenient truthy/falsy spellings. An unset or
+/// unrecognized value returns `default`, so a typo never silently flips an
+/// observe-first flag off.
+fn parse_bool_env(key: &str, default: bool) -> bool {
+    parse_bool(std::env::var(key).ok().as_deref(), default)
+}
+
+/// Pure core of [`parse_bool_env`], split out so the spelling rules are unit
+/// testable without touching process env.
+fn parse_bool(value: Option<&str>, default: bool) -> bool {
+    match value {
+        None => default,
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use solana_sdk::signer::Signer;
+
+    #[test]
+    fn parse_bool_handles_spellings_and_keeps_default_on_unknown() {
+        assert!(parse_bool(Some("TRUE"), false));
+        assert!(parse_bool(Some(" on "), false));
+        assert!(parse_bool(Some("1"), false));
+        assert!(!parse_bool(Some("off"), true));
+        assert!(!parse_bool(Some("0"), true));
+        // Unset and unrecognized both fall back to the caller's default.
+        assert!(parse_bool(None, true));
+        assert!(!parse_bool(None, false));
+        assert!(parse_bool(Some("garbage"), true));
+        assert!(!parse_bool(Some("garbage"), false));
+    }
 
     fn sign(authority: &Keypair, url: &str) -> String {
         let message = format!("{VALIDATION_URL_DOMAIN_PREFIX}{url}");
@@ -176,6 +210,13 @@ pub struct Config {
     /// decision either way. Configurable via `EXECUTOR_AUTOMATION_OBSERVE`.
     /// Default true (observe-first).
     pub automation_observe: bool,
+    /// Observe-only wallet-reputation logging (master-list #196, Layer D1).
+    /// When true, the `/validate-features` handler reads the verifying wallet's
+    /// public on-chain reputation (balance + recent activity) in a detached task
+    /// and logs it for calibration — it never affects the verification decision,
+    /// quota, or latency. Configurable via `EXECUTOR_WALLET_REPUTATION_OBSERVE`.
+    /// Default true (observe-first).
+    pub wallet_reputation_observe: bool,
 }
 
 impl Config {
@@ -297,19 +338,13 @@ impl Config {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3600);
 
-        // Observe-first: default ON so we collect calibration data as soon as
-        // SDKs start sending the signal. Set `EXECUTOR_AUTOMATION_OBSERVE=false`
-        // (or `0`/`no`/`off`) to silence the logging. An unrecognized value
-        // KEEPS the observe-first default rather than silently disabling the
-        // signal on a typo; the resolved value is logged at startup in main.rs.
-        let automation_observe: bool = match std::env::var("EXECUTOR_AUTOMATION_OBSERVE") {
-            Err(_) => true,
-            Ok(s) => match s.trim().to_ascii_lowercase().as_str() {
-                "1" | "true" | "yes" | "on" => true,
-                "0" | "false" | "no" | "off" => false,
-                _ => true,
-            },
-        };
+        // Observe-first: both default ON so we collect calibration data as soon
+        // as SDKs/traffic provide the signal. Set `=false` (or `0`/`no`/`off`)
+        // to silence. An unrecognized value KEEPS the default rather than
+        // silently disabling the signal on a typo; resolved values are logged at
+        // startup in main.rs.
+        let automation_observe = parse_bool_env("EXECUTOR_AUTOMATION_OBSERVE", true);
+        let wallet_reputation_observe = parse_bool_env("EXECUTOR_WALLET_REPUTATION_OBSERVE", true);
 
         Ok(Config {
             rpc_url,
@@ -332,6 +367,7 @@ impl Config {
             wallet_max_attempts,
             wallet_window_secs,
             automation_observe,
+            wallet_reputation_observe,
         })
     }
 }
