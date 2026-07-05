@@ -110,6 +110,9 @@ pub struct ValidateFeaturesResponse {
     /// commitment for future rotation proofs. Present iff `signed_receipt` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salt_hex: Option<String>,
+    
+    // Layer E Composite Risk Score
+    pub composite_risk_score: f64,
 }
 
 /// Wire-format mirror of `entros_validation::SignedReceiptDto`. Defined
@@ -219,29 +222,6 @@ pub async fn validate_features_handler(
     // bounds concurrent reads (they share the relayer's RpcClient); when
     // saturated the sample is skipped. Public chain data only — no surveillance,
     // no profile store.
-    if state.wallet_reputation_observe {
-        if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
-            let client = state.relayer_tx.client();
-            let redacted = crate::auth::redact::redact_wallet_id(&req.wallet_id);
-            tokio::spawn(async move {
-                let _permit = permit; // released when the read completes
-                match crate::reputation::fetch_wallet_reputation(&client, &wallet).await {
-                    Ok(rep) => tracing::info!(
-                        wallet_id = %redacted,
-                        sol_lamports = rep.sol_lamports,
-                        signature_count = rep.signature_count,
-                        oldest_block_time = ?rep.oldest_block_time,
-                        "Wallet reputation observed"
-                    ),
-                    Err(_) => tracing::debug!(
-                        wallet_id = %redacted,
-                        "Wallet reputation unavailable (observe-only, non-blocking)"
-                    ),
-                }
-            });
-        }
-    }
-
     // If validation service is not configured, pass through. No
     // validation actually ran — refund the wallet slot AND the integrator
     // quota so dev environments without a validator don't tick either
@@ -261,6 +241,7 @@ pub async fn validate_features_handler(
                 signed_receipt: None,
                 commitment_hex: None,
                 salt_hex: None,
+                composite_risk_score: 0.0,
             }));
         }
     };
@@ -302,7 +283,28 @@ pub async fn validate_features_handler(
         request = request.bearer_auth(key);
     }
 
-    let response = match request.send().await {
+    // Run the validator request and the wallet reputation fetch in parallel.
+    // RPC fetch shares a semaphored concurrency limit.
+    let reputation_future = async {
+        if state.wallet_reputation_observe {
+            if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
+                let client = state.relayer_tx.client();
+                let _permit = permit;
+                crate::reputation::fetch_wallet_reputation(&client, &wallet).await.ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    let (response_res, reputation_opt) = tokio::join!(
+        request.send(),
+        reputation_future
+    );
+
+    let response = match response_res {
         Ok(r) => r,
         Err(e) => {
             // Full error detail stays in ops logs; the wire response
@@ -327,6 +329,60 @@ pub async fn validate_features_handler(
 
     state.metrics.increment_validations();
 
+    // 1. Automation Risk (Layer A1)
+    let mut automation_risk = 0.0;
+    if let Some(signals) = req.client_signals.as_ref() {
+        if let Some(a) = signals.automation.as_ref() {
+            if a.webdriver {
+                automation_risk = 1.0;
+            } else if !a.tells.is_empty() {
+                automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
+            }
+        }
+    }
+
+    // 2. Reputation Risk (Layer D1)
+    let reputation_risk = if let Some(rep) = &reputation_opt {
+        let sol_score = (rep.sol_lamports as f64 / 100_000_000.0).min(1.0);
+        let activity_score = (rep.signature_count as f64 / 10.0).min(1.0);
+        let rep_prior = 0.5 * sol_score + 0.5 * activity_score;
+        1.0 - rep_prior
+    } else {
+        0.5
+    };
+
+    #[derive(serde::Deserialize)]
+    struct ValidatorSuccessBody {
+        #[serde(default)]
+        signed_receipt: Option<SignedReceiptDto>,
+        #[serde(default)]
+        commitment_hex: Option<String>,
+        #[serde(default)]
+        salt_hex: Option<String>,
+        #[serde(default)]
+        biometric_risk: f64,
+        #[serde(default)]
+        tts_risk: f64,
+        #[serde(default)]
+        temporal_risk: f64,
+        #[serde(default)]
+        audio_realism_risk: f64,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ValidatorErrorBody {
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        biometric_risk: f64,
+        #[serde(default)]
+        tts_risk: f64,
+        #[serde(default)]
+        temporal_risk: f64,
+        #[serde(default)]
+        audio_realism_risk: f64,
+    }
+
     if !response.status().is_success() {
         // Validator surfaces a whitelisted `reason` for `phrase_content_mismatch`
         // only (the user already knows whether they said the assigned phrase,
@@ -336,37 +392,33 @@ pub async fn validate_features_handler(
         // entros.io frontend so the soft-reject retry UX can route on the
         // per-category hint. Other categories stay opaque end-to-end per
         // the 2026-04-29 directed-signal strip.
-        //
-        // Defense in depth: even if the validator misbehaves and returns
-        // an unwhitelisted reason, this handler re-filters against the same
-        // allowlist before forwarding. Locks the contract on both ends so
-        // a single misconfiguration can't open a calibration channel.
-        // Threat-model note: the validator's wire body length differs by
-        // ~35 bytes between reason-present vs reason-absent rejections,
-        // but the validator is internal-only (only the executor talks to
-        // it on Railway) and the executor's `Padded::new` outbound layer
-        // pads every response to a uniform length, so external observers
-        // see no length oracle.
-        //
-        // Note: the per-wallet attempt slot consumed at the top of this
-        // handler stays consumed — it's a real failed attempt against the
-        // wallet's window budget.
-        #[derive(serde::Deserialize)]
-        struct ValidatorErrorBody {
-            #[serde(default)]
-            reason: Option<String>,
-        }
         const REASON_ALLOWLIST: &[&str] = &["phrase_content_mismatch"];
-        let raw_reason = response
-            .json::<ValidatorErrorBody>()
-            .await
-            .ok()
-            .and_then(|body| body.reason);
+        
+        let err_body = response.json::<ValidatorErrorBody>().await.ok();
+        let raw_reason = err_body.as_ref().and_then(|body| body.reason.clone());
         let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
+
+        let (biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match &err_body {
+            Some(body) => (body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
+            None => (1.0, 0.0, 0.0, 0.0),
+        };
+
+        let composite_risk_score = 0.35 * biometric_risk
+            + 0.25 * tts_risk
+            + 0.15 * temporal_risk
+            + 0.15 * automation_risk
+            + 0.10 * reputation_risk;
+
         tracing::info!(
             api_key = %crate::auth::redact::redact_api_key(&api_key),
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             reason = ?reason,
+            biometric_risk,
+            tts_risk,
+            temporal_risk,
+            automation_risk,
+            reputation_risk,
+            composite_risk_score,
             "Feature validation rejected"
         );
         return Err(AppError::ValidationFailed { reason });
@@ -376,36 +428,39 @@ pub async fn validate_features_handler(
     // with all-successful verifications never accumulates against the cap.
     state.wallet_attempts.refund_on_success(&wallet);
 
-    // Read the validator's success body to forward the signed receipt
-    // (master-list #146 Phase 2). Older validator versions return
-    // `{ "valid": true }` without the `signed_receipt` field — parse
-    // failure or missing field both map to `None` and the SDK falls back
-    // to the no-binding mint flow.
-    #[derive(serde::Deserialize)]
-    struct ValidatorSuccessBody {
-        #[serde(default)]
-        signed_receipt: Option<SignedReceiptDto>,
-        #[serde(default)]
-        commitment_hex: Option<String>,
-        #[serde(default)]
-        salt_hex: Option<String>,
-    }
-    // Parse the body once and forward all three receipt artifacts together so
-    // they stay coherent — the SDK needs the commitment + salt alongside the
-    // receipt to mint and to seed future rotation proofs. Older validators
-    // omit all three; parse failure maps every field to `None` and the SDK
-    // falls back to the no-binding mint flow.
-    let (signed_receipt, commitment_hex, salt_hex) =
-        match response.json::<ValidatorSuccessBody>().await {
-            Ok(body) => (body.signed_receipt, body.commitment_hex, body.salt_hex),
-            Err(_) => (None, None, None),
-        };
+    let parsed_body = response.json::<ValidatorSuccessBody>().await.ok();
+    let (signed_receipt, commitment_hex, salt_hex, biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match parsed_body {
+        Some(body) => (body.signed_receipt, body.commitment_hex, body.salt_hex, body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
+        None => (None, None, None, 0.0, 0.0, 0.0, 0.0),
+    };
+
+    let composite_risk_score = 0.35 * biometric_risk
+        + 0.25 * tts_risk
+        + 0.15 * temporal_risk
+        + 0.15 * automation_risk
+        + 0.10 * reputation_risk;
 
     tracing::info!(
         api_key = %crate::auth::redact::redact_api_key(&api_key),
         wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-        "Feature validation passed"
+        biometric_risk,
+        tts_risk,
+        temporal_risk,
+        automation_risk,
+        reputation_risk,
+        composite_risk_score,
+        "Feature validation passed biometric checks"
     );
+
+    // Apply policy threshold: high risk rejects
+    if composite_risk_score > 0.75 {
+        tracing::warn!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+            composite_risk_score,
+            "Validation rejected: Composite risk score exceeds threshold"
+        );
+        return Err(AppError::ValidationFailed { reason: None });
+    }
 
     Ok(PaddedJson(ValidateFeaturesResponse {
         valid: true,
@@ -413,6 +468,7 @@ pub async fn validate_features_handler(
         signed_receipt,
         commitment_hex,
         salt_hex,
+        composite_risk_score,
     }))
 }
 

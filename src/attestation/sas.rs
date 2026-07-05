@@ -332,6 +332,9 @@ mod tests {
     fn deserialize_identity_state_valid() {
         let mut data = vec![0u8; 200];
 
+        // Write Anchor discriminator
+        data[..8].copy_from_slice(&[156, 32, 87, 93, 52, 155, 248, 207]);
+
         // Write last_verification_timestamp at offset 48
         let ts: i64 = 1_700_000_000;
         data[48..56].copy_from_slice(&ts.to_le_bytes());
