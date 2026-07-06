@@ -72,6 +72,16 @@ pub struct ClientSignals {
     /// Automation-framework detection group.
     #[serde(default)]
     pub automation: Option<AutomationSignals>,
+    /// Capture environment signals (e.g. virtual devices).
+    #[serde(default)]
+    pub capture: Option<CaptureSignals>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CaptureSignals {
+    /// Virtual audio/video device detection flag.
+    #[serde(default)]
+    pub virtual_device: bool,
 }
 
 /// Automation-framework detection group inside `client_signals`. Wire mirror of
@@ -339,6 +349,11 @@ pub async fn validate_features_handler(
                 automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
             }
         }
+        if let Some(c) = signals.capture.as_ref() {
+            if c.virtual_device {
+                automation_risk = 1.0;
+            }
+        }
     }
 
     // 2. Reputation Risk (Layer D1)
@@ -588,6 +603,7 @@ mod tests {
                 webdriver: true,
                 tells: vec!["puppeteer".into(), "selenium".into()],
             }),
+            capture: None,
         });
 
         let result = validate_features_handler(State(state), headers, Json(req)).await;
@@ -620,6 +636,7 @@ mod tests {
                 webdriver: true,
                 tells: vec!["x\nforged".into()],
             }),
+            capture: None,
         });
 
         let result = validate_features_handler(State(state), headers, Json(req)).await;
