@@ -82,6 +82,12 @@ pub struct CaptureSignals {
     /// Virtual audio/video device detection flag.
     #[serde(default)]
     pub virtual_device: bool,
+    /// Spectral flatness of the audio capture (Wiener entropy).
+    #[serde(default)]
+    pub flatness: Option<f64>,
+    /// Spectral centroid of the audio capture in Hz.
+    #[serde(default)]
+    pub centroid: Option<f64>,
 }
 
 /// Automation-framework detection group inside `client_signals`. Wire mirror of
@@ -188,6 +194,17 @@ pub async fn validate_features_handler(
                 );
             }
             None => tracing::debug!("No automation signals on request (older SDK or non-browser)"),
+        }
+        if let Some(c) = signals.and_then(|sig| sig.capture.as_ref()) {
+            if c.virtual_device || c.flatness.is_some() || c.centroid.is_some() {
+                tracing::info!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                    virtual_device = c.virtual_device,
+                    flatness = ?c.flatness,
+                    centroid = ?c.centroid,
+                    "Capture signals observed"
+                );
+            }
         }
     }
 
@@ -352,6 +369,11 @@ pub async fn validate_features_handler(
         if let Some(c) = signals.capture.as_ref() {
             if c.virtual_device {
                 automation_risk = 1.0;
+            }
+            if let Some(flatness) = c.flatness {
+                if flatness > 0.85 || flatness < 0.015 {
+                    automation_risk = (automation_risk + 0.8).min(1.0);
+                }
             }
         }
     }
@@ -692,5 +714,28 @@ mod tests {
             10,
             "wallet-shape failure happens before deduct — quota must be untouched"
         );
+    }
+
+    #[test]
+    fn client_signals_capture_realism_deserializes() {
+        let json = serde_json::json!({
+            "features": [0.0],
+            "wallet_id": "abc",
+            "client_signals": {
+                "v": 3,
+                "env": "browser",
+                "capture": {
+                    "virtual_device": true,
+                    "flatness": 0.05,
+                    "centroid": 1200.5
+                }
+            }
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        let sig = req.client_signals.expect("client_signals present");
+        let cap = sig.capture.expect("capture signals present");
+        assert!(cap.virtual_device);
+        assert_eq!(cap.flatness, Some(0.05));
+        assert_eq!(cap.centroid, Some(1200.5));
     }
 }
