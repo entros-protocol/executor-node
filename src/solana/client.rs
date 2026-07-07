@@ -8,6 +8,7 @@ use solana_sdk::instruction::Instruction;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{Keypair, Signature, Signer};
 use solana_sdk::transaction::Transaction;
+use solana_transaction_status::UiTransactionEncoding;
 
 use crate::error::AppError;
 
@@ -278,5 +279,64 @@ impl SolanaClient {
         // Unreachable in practice: the loop above returns Ok or Err on every iteration.
         // Kept as a defensive fallback so the function signature stays total.
         Err(AppError::TransactionSubmissionFailed)
+    }
+
+    /// Trace the funding source (Parent Wallet) of `pubkey`.
+    /// Fetches up to 10 signatures of the account, grabs the oldest one, and
+    /// decodes the transaction to find the fee payer (which funded the account).
+    pub async fn get_funding_parent(&self, pubkey: &Pubkey) -> Result<Option<Pubkey>, AppError> {
+        let config = GetConfirmedSignaturesForAddress2Config {
+            limit: Some(10),
+            commitment: Some(self.rpc.commitment()),
+            ..Default::default()
+        };
+        
+        let sigs = match self
+            .rpc
+            .get_signatures_for_address_with_config(pubkey, config)
+            .await
+        {
+            Ok(sigs) => sigs,
+            Err(e) => {
+                tracing::debug!(error = %e, pubkey = %pubkey, "get_funding_parent: signatures read failed");
+                return Err(AppError::SolanaRpcUnavailable);
+            }
+        };
+
+        // If no signatures, the account is fresh or has no history
+        let oldest_sig_info = match sigs.last() {
+            Some(sig) => sig,
+            None => return Ok(None),
+        };
+
+        let signature = match oldest_sig_info.signature.parse::<Signature>() {
+            Ok(sig) => sig,
+            Err(_) => return Ok(None),
+        };
+
+        // Fetch transaction details in base64 binary encoding for robust decoding
+        let tx = match self
+            .rpc
+            .get_transaction(&signature, UiTransactionEncoding::Base64)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(e) => {
+                tracing::debug!(error = %e, signature = %signature, "get_funding_parent: transaction fetch failed");
+                return Err(AppError::SolanaRpcUnavailable);
+            }
+        };
+
+        // Extract fee payer key from the decoded VersionedTransaction
+        if let Some(versioned_tx) = tx.transaction.transaction.decode() {
+            let account_keys = versioned_tx.message.static_account_keys();
+            if let Some(parent) = account_keys.first() {
+                if parent != pubkey {
+                    return Ok(Some(*parent));
+                }
+            }
+        }
+
+        Ok(None)
     }
 }

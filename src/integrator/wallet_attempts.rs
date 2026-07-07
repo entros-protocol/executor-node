@@ -134,6 +134,11 @@ impl WalletAttemptTracker {
     /// it just reclaims the entry — the next attempt re-creates it from
     /// fresh state (which is what would happen anyway via the
     /// window-reset branch in `check_and_record_attempt`).
+    /// Get the current attempt count of a wallet.
+    pub fn get_attempts(&self, wallet: &Pubkey) -> u8 {
+        self.state.get(wallet).map(|e| e.attempts).unwrap_or(0)
+    }
+
     pub fn evict_expired(&self) -> usize {
         let now = Instant::now();
         let before = self.state.len();

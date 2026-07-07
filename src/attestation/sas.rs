@@ -239,7 +239,7 @@ fn check_attestation_freshness(ts: i64, now: i64) -> Result<(), &'static str> {
 ///   4 bytes: verification_count (u32)
 ///   2 bytes: trust_score (u16)
 ///  ... remaining fields not needed
-fn deserialize_identity_state(data: &[u8]) -> Result<IdentityStateData, String> {
+pub fn deserialize_identity_state(data: &[u8]) -> Result<IdentityStateData, String> {
     // Minimum size: 8 + 32 + 8 + 8 + 4 + 2 = 62 bytes
     if data.len() < 62 {
         return Err(format!(

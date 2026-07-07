@@ -383,7 +383,16 @@ pub async fn validate_features_handler(
         let sol_score = (rep.sol_lamports as f64 / 100_000_000.0).min(1.0);
         let activity_score = (rep.signature_count as f64 / 10.0).min(1.0);
         let rep_prior = 0.5 * sol_score + 0.5 * activity_score;
-        1.0 - rep_prior
+        let mut risk = 1.0 - rep_prior;
+        if rep.sybil_risk > 0.0 {
+            risk = (risk + 0.5).min(1.0);
+            tracing::warn!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                parent_wallet = ?rep.parent_wallet.map(|p| p.to_string()),
+                "Sybil wallet funding activity detected! Parent wallet registered within 24h."
+            );
+        }
+        risk
     } else {
         0.5
     };
@@ -435,7 +444,7 @@ pub async fn validate_features_handler(
         let raw_reason = err_body.as_ref().and_then(|body| body.reason.clone());
         let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
 
-        let (biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match &err_body {
+        let (biometric_risk, tts_risk, temporal_risk, _audio_realism_risk) = match &err_body {
             Some(body) => (body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
             None => (1.0, 0.0, 0.0, 0.0),
         };
@@ -466,7 +475,7 @@ pub async fn validate_features_handler(
     state.wallet_attempts.refund_on_success(&wallet);
 
     let parsed_body = response.json::<ValidatorSuccessBody>().await.ok();
-    let (signed_receipt, commitment_hex, salt_hex, biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match parsed_body {
+    let (signed_receipt, commitment_hex, salt_hex, biometric_risk, tts_risk, temporal_risk, _audio_realism_risk) = match parsed_body {
         Some(body) => (body.signed_receipt, body.commitment_hex, body.salt_hex, body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
         None => (None, None, None, 0.0, 0.0, 0.0, 0.0),
     };
@@ -499,6 +508,20 @@ pub async fn validate_features_handler(
         return Err(AppError::ValidationFailed { reason: None });
     }
 
+    // Suspicious range graduated friction (Layer C)
+    let attempts = state.wallet_attempts.get_attempts(&wallet);
+    if composite_risk_score >= 0.45 && attempts <= 1 {
+        tracing::warn!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+            composite_risk_score,
+            attempts,
+            "Validation flagged: Composite risk score in suspicious range on first attempt, requiring dynamic captcha"
+        );
+        return Err(AppError::ValidationFailed {
+            reason: Some("captcha_required".to_string()),
+        });
+    }
+
     Ok(PaddedJson(ValidateFeaturesResponse {
         valid: true,
         remaining_quota: Some(remaining),
@@ -513,6 +536,7 @@ pub async fn validate_features_handler(
 mod tests {
     use super::*;
     use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
+    use crate::integrator::wallet_attempts::WalletAttemptTracker;
 
     fn baseline_request(wallet_id: String) -> ValidateFeaturesRequest {
         ValidateFeaturesRequest {
@@ -737,5 +761,21 @@ mod tests {
         assert!(cap.virtual_device);
         assert_eq!(cap.flatness, Some(0.05));
         assert_eq!(cap.centroid, Some(1200.5));
+    }
+
+    #[test]
+    fn wallet_attempts_counter_tracks_increments() {
+        let tracker = WalletAttemptTracker::new(5, std::time::Duration::from_secs(3600));
+        let wallet = Pubkey::new_unique();
+        assert_eq!(tracker.get_attempts(&wallet), 0);
+        
+        tracker.check_and_record_attempt(&wallet).unwrap();
+        assert_eq!(tracker.get_attempts(&wallet), 1);
+        
+        tracker.check_and_record_attempt(&wallet).unwrap();
+        assert_eq!(tracker.get_attempts(&wallet), 2);
+        
+        tracker.refund_on_success(&wallet);
+        assert_eq!(tracker.get_attempts(&wallet), 1);
     }
 }

@@ -32,25 +32,51 @@ pub struct WalletReputation {
     /// Block time of the oldest signature in the window — an approximate
     /// account-age anchor (exact for wallets below the window size).
     pub oldest_block_time: Option<i64>,
+    /// Sybil threat score (e.g. 1.0 if parent wallet has registered recently, else 0.0).
+    pub sybil_risk: f64,
+    /// Parent wallet address if traced.
+    pub parent_wallet: Option<Pubkey>,
 }
 
-/// Fetch the reputation snapshot for `wallet`. The balance and activity reads
-/// are independent, so they run concurrently to minimize latency. Returns an
-/// error if either RPC read fails; callers treat that as "reputation
+/// Fetch the reputation snapshot for `wallet`. The balance, activity, and parent
+/// wallet reads are independent, so they run concurrently to minimize latency. Returns an
+/// error if RPC reads fail; callers treat that as "reputation
 /// unavailable" and proceed (observe-only — it never blocks verification).
 pub async fn fetch_wallet_reputation(
     client: &SolanaClient,
     wallet: &Pubkey,
 ) -> Result<WalletReputation, AppError> {
-    let (balance, activity) = tokio::join!(
+    let (balance, activity, parent) = tokio::join!(
         client.get_balance_of(wallet),
-        client.get_recent_activity(wallet)
+        client.get_recent_activity(wallet),
+        client.get_funding_parent(wallet)
     );
     let activity = activity?;
+    let parent_opt = parent.ok().flatten();
+
+    let mut sybil_risk = 0.0;
+    if let Some(parent) = parent_opt {
+        let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&parent);
+        if let Ok(Some(identity_data)) = client.get_account_data(&identity_pda).await {
+            if let Ok(identity) = crate::attestation::sas::deserialize_identity_state(&identity_data) {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let age_secs = now.saturating_sub(identity.last_verification_timestamp);
+                if age_secs >= 0 && age_secs < 86400 {
+                    sybil_risk = 1.0;
+                }
+            }
+        }
+    }
+
     Ok(WalletReputation {
         sol_lamports: balance?,
         signature_count: activity.signature_count,
         oldest_block_time: activity.oldest_block_time,
+        sybil_risk,
+        parent_wallet: parent_opt,
     })
 }
 
@@ -64,5 +90,7 @@ mod tests {
         assert_eq!(rep.sol_lamports, 0);
         assert_eq!(rep.signature_count, 0);
         assert_eq!(rep.oldest_block_time, None);
+        assert_eq!(rep.sybil_risk, 0.0);
+        assert_eq!(rep.parent_wallet, None);
     }
 }
