@@ -31,6 +31,7 @@ pub struct WalletReputation {
     pub signature_count: usize,
     /// Block time of the oldest signature in the window — an approximate
     /// account-age anchor (exact for wallets below the window size).
+    #[allow(dead_code)]
     pub oldest_block_time: Option<i64>,
     /// Sybil threat score (e.g. 1.0 if parent wallet has registered recently, else 0.0).
     pub sybil_risk: f64,
@@ -64,7 +65,7 @@ pub async fn fetch_wallet_reputation(
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0);
                 let age_secs = now.saturating_sub(identity.last_verification_timestamp);
-                if age_secs >= 0 && age_secs < 86400 {
+                if (0..86400).contains(&age_secs) {
                     sybil_risk = 1.0;
                 }
             }

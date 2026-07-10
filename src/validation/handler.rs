@@ -317,8 +317,34 @@ pub async fn validate_features_handler(
             if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
                 let client = state.relayer_tx.client();
                 let _permit = permit;
-                crate::reputation::fetch_wallet_reputation(&client, &wallet).await.ok()
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(1500),
+                    crate::reputation::fetch_wallet_reputation(&client, &wallet),
+                )
+                .await
+                {
+                    Ok(Ok(rep)) => Some(rep),
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            error = %e,
+                            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                            "Observe-only reputation fetch failed"
+                        );
+                        None
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                            "Observe-only reputation fetch timed out after 1500ms"
+                        );
+                        None
+                    }
+                }
             } else {
+                tracing::warn!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                    "Reputation RPC gate saturated; skipping observe-only check"
+                );
                 None
             }
         } else {
@@ -371,7 +397,7 @@ pub async fn validate_features_handler(
                 automation_risk = 1.0;
             }
             if let Some(flatness) = c.flatness {
-                if flatness > 0.85 || flatness < 0.015 {
+                if !(0.015..=0.85).contains(&flatness) {
                     automation_risk = (automation_risk + 0.8).min(1.0);
                 }
             }
