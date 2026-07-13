@@ -1211,7 +1211,7 @@ dependencies = [
 
 [[package]]
 name = "executor-node"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "axum",
  "borsh 1.6.1",
