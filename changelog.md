@@ -2,6 +2,12 @@
 
 All notable changes to the `executor-node` (relayer service) will be documented in this file.
 
+## [0.1.2] - 2026-07-13
+
+### Added
+- **Cross-Wallet Cooldown Tracker**: Implemented a thread-safe relayer-side tracker tracking IP-subnet (IPv4 `/24`, IPv6 `/48`) + User-Agent fingerprint cooldown limits. Enforces same-device wallet swaps cool-down to mitigate bot farming.
+- **Dynamic Errors**: Return active remaining cooldown seconds in `/validate-features` returns via `AppError::CrossWalletCooldownActive` mapped responses.
+
 ## [Unreleased] - 2026-07-07
 
 ### Added

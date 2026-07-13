@@ -1,8 +1,10 @@
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
 use axum::Json;
+use axum::Extension;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
+use std::net::SocketAddr;
 use std::str::FromStr;
 
 use crate::error::AppError;
@@ -94,7 +96,7 @@ pub struct CaptureSignals {
 /// the SDK's `AutomationSignals`.
 #[derive(Deserialize, Debug)]
 pub struct AutomationSignals {
-    /// `navigator.webdriver === true` — the W3C WebDriver automation flag.
+    /// navigator.webdriver === true — the W3C WebDriver automation flag.
     #[serde(default)]
     pub webdriver: bool,
     /// Automation-framework labels found in the page (e.g. "puppeteer",
@@ -110,7 +112,7 @@ pub struct ValidateFeaturesResponse {
     pub remaining_quota: Option<u64>,
     /// Validator-signed receipt forwarded from the validation service when the
     /// request signaled mint intent. The SDK uses this to build an
-    /// `Ed25519Program::verify` instruction bundled before `mint_anchor` in
+    /// Ed25519Program::verify instruction bundled before `mint_anchor` in
     /// the same atomic transaction. Absent when the validator isn't configured
     /// for signing, when the request didn't signal mint intent, or when the
     /// validator returned a body without the field (older validator versions).
@@ -144,6 +146,7 @@ pub struct SignedReceiptDto {
 
 pub async fn validate_features_handler(
     State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(req): Json<ValidateFeaturesRequest>,
 ) -> Result<PaddedJson<ValidateFeaturesResponse>, AppError> {
@@ -157,6 +160,28 @@ pub async fn validate_features_handler(
     // rejected before touching the rate limiter or validation service.
     let wallet = Pubkey::from_str(&req.wallet_id)
         .map_err(|_| AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id)))?;
+
+    // Extract client IP and User-Agent for cross-wallet cooldown check (master-list #142)
+    let ip = crate::auth::client_ip::extract_client_ip(&headers, peer.map(|Extension(c)| c.0))
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    if let Err(remaining_secs) = state.cross_wallet_cooldown.check_cooldown(ip, user_agent, &req.wallet_id) {
+        tracing::warn!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+            ip = %crate::auth::redact::redact_ip(ip),
+            enforced = state.cross_wallet_cooldown_enforce,
+            remaining_secs,
+            "Cross-wallet verification cooldown active"
+        );
+        if state.cross_wallet_cooldown_enforce {
+            return Err(AppError::CrossWalletCooldownActive { retry_after_secs: remaining_secs });
+        }
+    }
 
     // Observe-only automation-detection signal (master-list #196, Layer A1).
     // Logged for real-traffic calibration; NOT forwarded to the validation
@@ -647,7 +672,7 @@ mod tests {
         let headers = headers_with_key("test-key");
         let req = baseline_request(random_wallet_id());
 
-        let result = validate_features_handler(State(state), headers, Json(req)).await;
+        let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
         assert!(result.is_ok(), "expected success, got {:?}", result.err());
         assert_eq!(
@@ -678,7 +703,7 @@ mod tests {
             capture: None,
         });
 
-        let result = validate_features_handler(State(state), headers, Json(req)).await;
+        let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
         assert!(
             result.is_ok(),
@@ -711,7 +736,7 @@ mod tests {
             capture: None,
         });
 
-        let result = validate_features_handler(State(state), headers, Json(req)).await;
+        let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
         assert!(
             result.is_ok(),
@@ -736,7 +761,7 @@ mod tests {
         let headers = headers_with_key("test-key");
         let req = baseline_request(random_wallet_id());
 
-        let result = validate_features_handler(State(state), headers, Json(req)).await;
+        let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
         assert!(
             result.is_ok(),
@@ -753,7 +778,7 @@ mod tests {
         let headers = headers_with_key("test-key");
         let req = baseline_request("not-a-pubkey".into());
 
-        let result = validate_features_handler(State(state), headers, Json(req)).await;
+        let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
         assert!(
             matches!(result, Err(AppError::InvalidRequest(_))),

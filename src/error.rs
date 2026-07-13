@@ -88,10 +88,29 @@ pub enum AppError {
     /// the call-site `tracing::error!` for ops.
     #[error("Validation service temporarily unavailable")]
     ValidationServiceUnavailable,
+
+    /// Cross-wallet verification cooldown active (master-list #142).
+    /// Surfaces as `429 Too Many Requests` with a `Retry-After` header.
+    #[error("Cross-wallet cooldown active")]
+    CrossWalletCooldownActive { retry_after_secs: u64 },
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if let AppError::CrossWalletCooldownActive { retry_after_secs } = &self {
+            let body = json!({
+                "error": "A different wallet was recently verified from this device. Please wait before trying again.",
+                "reason": "cross_wallet_cooldown",
+                "retry_after": retry_after_secs,
+            });
+            let mut resp =
+                (StatusCode::TOO_MANY_REQUESTS, axum::Json(Padded::new(body))).into_response();
+            let header = HeaderValue::from_str(&retry_after_secs.to_string())
+                .unwrap_or_else(|_| unreachable!("u64 stringification is valid header bytes"));
+            resp.headers_mut().insert("retry-after", header);
+            return resp;
+        }
+
         // IpRateLimited needs a `Retry-After` header alongside the JSON body.
         // Handled before the standard match so we can attach the header
         // without restructuring the rest of the variant handling.
@@ -122,6 +141,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".into()),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limited".into()),
             AppError::IpRateLimited { .. } => unreachable!("handled above"),
+            AppError::CrossWalletCooldownActive { .. } => unreachable!("handled above"),
             AppError::WalletRateLimited { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 "Too many attempts. Please wait before trying again.".into(),
@@ -165,6 +185,13 @@ impl IntoResponse for AppError {
                 json!({
                     "error": message,
                     "reason": "rate_limited",
+                    "retry_after": retry_after_secs,
+                })
+            }
+            AppError::CrossWalletCooldownActive { retry_after_secs } => {
+                json!({
+                    "error": message,
+                    "reason": "cross_wallet_cooldown",
                     "retry_after": retry_after_secs,
                 })
             }

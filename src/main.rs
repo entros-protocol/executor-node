@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use attestation::sas::SasAttestor;
+use auth::cross_wallet_cooldown::CrossWalletCooldownTracker;
 use challenge::registry::ChallengeNonceRegistry;
 use config::Config;
 use integrator::tracker::IntegratorTracker;
@@ -122,6 +123,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ttl_secs = config.challenge_ttl_secs,
         "Challenge nonce registry initialized"
     );
+
+    let cross_wallet_cooldown = Arc::new(CrossWalletCooldownTracker::new(config.cross_wallet_cooldown_secs));
+    tracing::info!(
+        cooldown_secs = config.cross_wallet_cooldown_secs,
+        enforce = config.cross_wallet_cooldown_enforce,
+        "Cross-wallet cooldown tracker initialized"
+    );
+
+    // Spawn background eviction task for stale cross-wallet cooldown entries
+    let cooldown_ref = Arc::clone(&cross_wallet_cooldown);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let evicted = cooldown_ref.evict_stale();
+            if evicted > 0 {
+                tracing::debug!(evicted, "Evicted stale cross-wallet cooldown entries");
+            }
+        }
+    });
 
     let http_client = Arc::new(reqwest::Client::new());
     // Pin VALIDATION_SERVICE_URL with a deploy-time Ed25519 signature so an
@@ -312,6 +333,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         challenge_ttl_secs: config.challenge_ttl_secs,
         automation_observe: config.automation_observe,
         wallet_reputation_observe: config.wallet_reputation_observe,
+        cross_wallet_cooldown,
+        cross_wallet_cooldown_enforce: config.cross_wallet_cooldown_enforce,
     };
 
     let app = create_router(state, &config.cors_origins);

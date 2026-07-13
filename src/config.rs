@@ -217,6 +217,13 @@ pub struct Config {
     /// quota, or latency. Configurable via `EXECUTOR_WALLET_REPUTATION_OBSERVE`.
     /// Default true (observe-first).
     pub wallet_reputation_observe: bool,
+    /// Cross-wallet verification cooldown duration in seconds (master-list #142).
+    /// Configurable via `VALIDATION_CROSS_WALLET_COOLDOWN_SECS`. Default 86400 (24h).
+    pub cross_wallet_cooldown_secs: u64,
+    /// Enforces cross-wallet cooldown blocks when true. When false, overlaps are
+    /// logged but verification proceeds. Configurable via `VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE`.
+    /// Default false (observe-only for NAT/shared-network safety).
+    pub cross_wallet_cooldown_enforce: bool,
 }
 
 impl Config {
@@ -346,6 +353,13 @@ impl Config {
         let automation_observe = parse_bool_env("EXECUTOR_AUTOMATION_OBSERVE", true);
         let wallet_reputation_observe = parse_bool_env("EXECUTOR_WALLET_REPUTATION_OBSERVE", true);
 
+        let cross_wallet_cooldown_secs: u64 = std::env::var("VALIDATION_CROSS_WALLET_COOLDOWN_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(86400);
+
+        let cross_wallet_cooldown_enforce = parse_bool_env("VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE", false);
+
         Ok(Config {
             rpc_url,
             ws_url,
@@ -368,6 +382,8 @@ impl Config {
             wallet_window_secs,
             automation_observe,
             wallet_reputation_observe,
+            cross_wallet_cooldown_secs,
+            cross_wallet_cooldown_enforce,
         })
     }
 }

@@ -12,6 +12,7 @@ use crate::attestation::handler::attest_handler;
 use crate::attestation::sas::SasAttestor;
 use crate::auth::api_key::api_key_auth;
 use crate::auth::client_ip::extract_client_ip;
+use crate::auth::cross_wallet_cooldown::CrossWalletCooldownTracker;
 use crate::auth::rate_limit::{PerIpRateLimiter, RateLimiter};
 use crate::challenge::handler::challenge_handler;
 use crate::challenge::registry::ChallengeNonceRegistry;
@@ -51,6 +52,10 @@ pub struct AppState {
     /// Gates the detached on-chain reputation read in `validate_features_handler`;
     /// never affects the verification decision, quota, or latency.
     pub wallet_reputation_observe: bool,
+    /// Cross-wallet verification cooldown tracker (master-list #142).
+    pub cross_wallet_cooldown: Arc<CrossWalletCooldownTracker>,
+    /// Enforces cross-wallet cooldown blocks when true.
+    pub cross_wallet_cooldown_enforce: bool,
 }
 
 async fn auth_middleware(
@@ -296,6 +301,8 @@ pub fn build_test_state(
         challenge_ttl_secs: 300,
         automation_observe: true,
         wallet_reputation_observe: true,
+        cross_wallet_cooldown: Arc::new(CrossWalletCooldownTracker::new(86400)),
+        cross_wallet_cooldown_enforce: false,
     }
 }
 
