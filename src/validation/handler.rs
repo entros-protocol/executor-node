@@ -307,6 +307,44 @@ pub async fn validate_features_handler(
         .challenge_registry
         .peek_phrase(&wallet, state.challenge_ttl_secs);
 
+    // Fetch user's verification timestamps from on-chain IdentityState
+    let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&wallet);
+    let mut recent_timestamps = Vec::new();
+    if let Ok(Some(data)) = state.relayer_tx.client().get_account_data(&identity_pda).await {
+        const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
+        if data.len() >= 8 && data[..8] == IDENTITY_DISCRIMINATOR {
+            // Offset for recent_timestamps is 127
+            // Struct layout: recent_timestamps is [i64; 52] = 416 bytes
+            if data.len() >= 127 + 52 * 8 {
+                for i in 0..52 {
+                    let offset = 127 + i * 8;
+                    let ts = i64::from_le_bytes(
+                        data[offset..offset + 8]
+                            .try_into()
+                            .expect("slice of 8 bytes is always convertible to [u8; 8]"),
+                    );
+                    if ts > 0 {
+                        recent_timestamps.push(ts);
+                    }
+                }
+            } else if data.len() > 127 {
+                // Support partial / legacy accounts if they were not realloc'd yet
+                let available_slots = (data.len() - 127) / 8;
+                for i in 0..available_slots {
+                    let offset = 127 + i * 8;
+                    let ts = i64::from_le_bytes(
+                        data[offset..offset + 8]
+                            .try_into()
+                            .expect("slice of 8 bytes is always convertible to [u8; 8]"),
+                    );
+                    if ts > 0 {
+                        recent_timestamps.push(ts);
+                    }
+                }
+            }
+        }
+    }
+
     // Build request to internal validation service. Forward time-series and
     // audio fields unchanged — the validation service handles absence of any
     // field (old SDK versions).
@@ -327,6 +365,7 @@ pub async fn validate_features_handler(
             "expected_phrase": expected_phrase,
             "commitment_new_hex": req.commitment_new_hex,
             "request_receipt": req.request_receipt,
+            "recent_timestamps": recent_timestamps,
         }))
         .timeout(std::time::Duration::from_secs(8));
 
