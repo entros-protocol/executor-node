@@ -56,6 +56,8 @@ pub struct AppState {
     pub cross_wallet_cooldown: Arc<CrossWalletCooldownTracker>,
     /// Enforces cross-wallet cooldown blocks when true.
     pub cross_wallet_cooldown_enforce: bool,
+    /// IP blocklist for probing attacks. Maps IP address to block expiration time.
+    pub probing_blocklist: Arc<dashmap::DashMap<std::net::IpAddr, std::time::Instant>>,
 }
 
 async fn auth_middleware(
@@ -303,6 +305,7 @@ pub fn build_test_state(
         wallet_reputation_observe: true,
         cross_wallet_cooldown: Arc::new(CrossWalletCooldownTracker::new(86400)),
         cross_wallet_cooldown_enforce: false,
+        probing_blocklist: Arc::new(dashmap::DashMap::new()),
     }
 }
 

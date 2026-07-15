@@ -170,6 +170,22 @@ pub async fn validate_features_handler(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
+    // Check probing blocklist (Item #135)
+    if let Some(expire_time) = state.probing_blocklist.get(&ip).map(|r| *r) {
+        let now = std::time::Instant::now();
+        if expire_time > now {
+            let retry_after_secs = expire_time.duration_since(now).as_secs();
+            tracing::warn!(
+                ip = %crate::auth::redact::redact_ip(ip),
+                retry_after_secs,
+                "Probing blocklist active for client IP"
+            );
+            return Err(AppError::IpRateLimited { retry_after_secs: retry_after_secs.max(1) });
+        } else {
+            state.probing_blocklist.remove(&ip);
+        }
+    }
+
     if let Err(remaining_secs) = state.cross_wallet_cooldown.check_cooldown(ip, user_agent, &req.wallet_id) {
         tracing::warn!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -366,6 +382,8 @@ pub async fn validate_features_handler(
             "commitment_new_hex": req.commitment_new_hex,
             "request_receipt": req.request_receipt,
             "recent_timestamps": recent_timestamps,
+            "origin_ip": Some(ip.to_string()),
+            "origin_ua": Some(user_agent.to_string()),
         }))
         .timeout(std::time::Duration::from_secs(8));
 
@@ -488,6 +506,7 @@ pub async fn validate_features_handler(
     };
 
     #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
     struct ValidatorSuccessBody {
         #[serde(default)]
         signed_receipt: Option<SignedReceiptDto>,
@@ -503,9 +522,12 @@ pub async fn validate_features_handler(
         temporal_risk: f64,
         #[serde(default)]
         audio_realism_risk: f64,
+        #[serde(default)]
+        probing_detected: Option<bool>,
     }
 
     #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
     struct ValidatorErrorBody {
         #[serde(default)]
         reason: Option<String>,
@@ -517,6 +539,8 @@ pub async fn validate_features_handler(
         temporal_risk: f64,
         #[serde(default)]
         audio_realism_risk: f64,
+        #[serde(default)]
+        probing_detected: Option<bool>,
     }
 
     if !response.status().is_success() {
@@ -531,6 +555,18 @@ pub async fn validate_features_handler(
         const REASON_ALLOWLIST: &[&str] = &["phrase_content_mismatch"];
         
         let err_body = response.json::<ValidatorErrorBody>().await.ok();
+
+        // If probing was detected, insert into state.probing_blocklist
+        if let Some(true) = err_body.as_ref().and_then(|body| body.probing_detected) {
+            tracing::warn!(
+                ip = %crate::auth::redact::redact_ip(ip),
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                "Upstream validator flagged probing campaign! IP added to blocklist for 24 hours."
+            );
+            let expire_time = std::time::Instant::now() + std::time::Duration::from_secs(24 * 3600);
+            state.probing_blocklist.insert(ip, expire_time);
+        }
+
         let raw_reason = err_body.as_ref().and_then(|body| body.reason.clone());
         let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
 
@@ -867,5 +903,46 @@ mod tests {
         
         tracker.refund_on_success(&wallet);
         assert_eq!(tracker.get_attempts(&wallet), 1);
+    }
+
+    #[tokio::test]
+    async fn test_probing_blocklist_handling() {
+        use axum::Extension;
+        use axum::extract::ConnectInfo;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+        use std::time::{Duration, Instant};
+
+        let tracker = tracker_with_quota("test-key", 10);
+        let state = build_test_state(tracker.clone(), None);
+
+        let client_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let peer = Extension(ConnectInfo(SocketAddr::new(client_ip, 12345)));
+        let headers = headers_with_key("test-key");
+
+        // 1. Add IP to blocklist with future expiration
+        state.probing_blocklist.insert(client_ip, Instant::now() + Duration::from_secs(60));
+
+        let req1 = baseline_request(random_wallet_id());
+        let result1 = validate_features_handler(State(state.clone()), Some(peer.clone()), headers.clone(), Json(req1)).await;
+        
+        let is_ip_rate_limited = match result1 {
+            Err(AppError::IpRateLimited { .. }) => true,
+            _ => false,
+        };
+        assert!(is_ip_rate_limited, "Expected IpRateLimited due to active probing blocklist");
+
+        // 2. Modify blocklist entry to be expired
+        state.probing_blocklist.insert(client_ip, Instant::now() - Duration::from_secs(60));
+
+        let req2 = baseline_request(random_wallet_id());
+        let result2 = validate_features_handler(State(state.clone()), Some(peer.clone()), headers.clone(), Json(req2)).await;
+        
+        let is_ip_rate_limited = match result2 {
+            Err(AppError::IpRateLimited { .. }) => true,
+            _ => false,
+        };
+        assert!(!is_ip_rate_limited, "Expected request to bypass block list once expired");
+        // It should have cleaned up the entry
+        assert!(!state.probing_blocklist.contains_key(&client_ip));
     }
 }

@@ -315,6 +315,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let probing_blocklist = Arc::new(dashmap::DashMap::new());
+
+    // Spawn background eviction task for probing_blocklist
+    let probing_blocklist_ref = Arc::clone(&probing_blocklist);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            let now = std::time::Instant::now();
+            probing_blocklist_ref.retain(|_, &mut expire_time| expire_time > now);
+        }
+    });
+
     let state = AppState {
         relayer_tx,
         api_keys: Arc::new(config.api_keys),
@@ -335,6 +348,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         wallet_reputation_observe: config.wallet_reputation_observe,
         cross_wallet_cooldown,
         cross_wallet_cooldown_enforce: config.cross_wallet_cooldown_enforce,
+        probing_blocklist,
     };
 
     let app = create_router(state, &config.cors_origins);
