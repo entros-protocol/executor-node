@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::str::FromStr;
 
+use crate::challenge::lissajous::LissajousParams;
 use crate::error::AppError;
 use crate::padding::PaddedJson;
 use crate::server::AppState;
@@ -22,6 +23,8 @@ pub struct ChallengeResponse {
     /// via `peek_phrase(wallet, ttl)` and forwards it to the validation
     /// service for word-level content matching (master-list #89).
     pub phrase: String,
+    /// Server-issued Lissajous curve parameters for the touch challenge.
+    pub curve: LissajousParams,
 }
 
 pub async fn challenge_handler(
@@ -31,16 +34,17 @@ pub async fn challenge_handler(
     let wallet = Pubkey::from_str(&req.wallet)
         .map_err(|_| AppError::InvalidRequest(format!("Invalid wallet address: {}", req.wallet)))?;
 
-    let (nonce, phrase) = state.challenge_registry.issue(wallet);
+    let (nonce, phrase, curve) = state.challenge_registry.issue(wallet);
 
     tracing::debug!(
         wallet = %crate::auth::redact::redact_wallet_id(&wallet.to_string()),
-        "Challenge nonce and phrase issued"
+        "Challenge nonce, phrase, and curve issued"
     );
 
     Ok(PaddedJson(ChallengeResponse {
         nonce: nonce.to_vec(),
         expires_in: state.challenge_ttl_secs,
         phrase,
+        curve,
     }))
 }
