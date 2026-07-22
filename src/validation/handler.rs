@@ -923,24 +923,18 @@ mod tests {
         state.probing_blocklist.insert(client_ip, Instant::now() + Duration::from_secs(60));
 
         let req1 = baseline_request(random_wallet_id());
-        let result1 = validate_features_handler(State(state.clone()), Some(peer.clone()), headers.clone(), Json(req1)).await;
+        let result1 = validate_features_handler(State(state.clone()), Some(peer), headers.clone(), Json(req1)).await;
         
-        let is_ip_rate_limited = match result1 {
-            Err(AppError::IpRateLimited { .. }) => true,
-            _ => false,
-        };
+        let is_ip_rate_limited = matches!(result1, Err(AppError::IpRateLimited { .. }));
         assert!(is_ip_rate_limited, "Expected IpRateLimited due to active probing blocklist");
 
         // 2. Modify blocklist entry to be expired
         state.probing_blocklist.insert(client_ip, Instant::now() - Duration::from_secs(60));
 
         let req2 = baseline_request(random_wallet_id());
-        let result2 = validate_features_handler(State(state.clone()), Some(peer.clone()), headers.clone(), Json(req2)).await;
+        let result2 = validate_features_handler(State(state.clone()), Some(peer), headers.clone(), Json(req2)).await;
         
-        let is_ip_rate_limited = match result2 {
-            Err(AppError::IpRateLimited { .. }) => true,
-            _ => false,
-        };
+        let is_ip_rate_limited = matches!(result2, Err(AppError::IpRateLimited { .. }));
         assert!(!is_ip_rate_limited, "Expected request to bypass block list once expired");
         // It should have cleaned up the entry
         assert!(!state.probing_blocklist.contains_key(&client_ip));
