@@ -47,22 +47,27 @@ pub struct ValidateFeaturesRequest {
     /// re-verification and pre-`request_receipt` SDKs.
     #[serde(default)]
     pub request_receipt: Option<bool>,
-    /// Observe-only automation-detection signals (master-list #196, Layer A1).
-    /// Collected client-side by the SDK and logged here for calibration. NOT
-    /// forwarded to the validation service and NOT part of the pass/fail
-    /// decision. Privacy-first — the SDK reports only automation-framework
-    /// artifacts (the WebDriver flag + framework labels), never fingerprints or
-    /// user data. Absent for older SDKs (logged as such).
+    /// Client-reported browser signals (master-list #196), evaluated in the
+    /// executor and NOT forwarded to the validation service. Two groups with
+    /// DIFFERENT decision roles: the `automation` group (WebDriver flag +
+    /// framework tells, Layer A1) currently contributes to `automation_risk`
+    /// and thus the composite; the `capture` group (acoustic realism, Layer B1)
+    /// is observe/telemetry only and does not affect the outcome — its
+    /// authoritative counterpart is computed server-side (Item #15, which also
+    /// tracks whether A1 should revert to observe-only). All signals are
+    /// client-reported and therefore spoofable — risk nudges, not gates.
+    /// Privacy-first — only automation artifacts + coarse acoustic stats, never
+    /// fingerprints or user data. Absent for older SDKs (logged as such).
     #[serde(default)]
     pub client_signals: Option<ClientSignals>,
 }
 
-/// The `client_signals` envelope (Layer A1). Wire mirror of the SDK's
-/// `ClientSignals`. Namespaced so future signal groups (interaction realism,
-/// capture realism) slot in as siblings of `automation` without a breaking wire
-/// change. Every field is `#[serde(default)]` so a partial or older payload
-/// deserializes cleanly. Observe-only — never influences the verification
-/// outcome.
+/// The `client_signals` envelope. Wire mirror of the SDK's `ClientSignals`.
+/// Namespaced so future signal groups slot in as siblings without a breaking
+/// wire change. Every field is `#[serde(default)]` so a partial or older
+/// payload deserializes cleanly. Decision roles differ per group: `automation`
+/// can influence the composite via `automation_risk`; `capture` is
+/// observe/telemetry only (see the `client_signals` field doc above).
 #[derive(Deserialize, Debug)]
 pub struct ClientSignals {
     /// Envelope schema version emitted by the SDK collector.
@@ -199,15 +204,37 @@ pub async fn validate_features_handler(
         }
     }
 
-    // Observe-only automation-detection signal (master-list #196, Layer A1).
-    // Logged for real-traffic calibration; NOT forwarded to the validation
-    // service and NOT part of the pass/fail decision below. Privacy-first: the
-    // SDK reports only automation-framework artifacts (the WebDriver flag +
-    // framework labels), never fingerprints or user data, so a privacy-hardened
-    // browser (Tor / RFP) is never flagged. We measure real-user trip rates
-    // before this signal influences anything. Info-level only when a tell
-    // fires (the rare, interesting case); clean/absent stays at debug so prod
-    // logs are quiet until we flip to debug for baseline measurement.
+    // Layer A1 automation hard gate. A browser reporting navigator.webdriver
+    // === true is rejected before the validation round-trip (prod only — the
+    // dev pass-through with no validator configured is unaffected). This is a
+    // client-reported signal, so it stops lazy automation (Puppeteer / Selenium
+    // that don't strip the flag), NOT a determined attacker who hides it — the
+    // biometric pipeline is the backstop, and no public claim should imply this
+    // alone blocks sophisticated bots. Framework `tells` stay a graduated nudge
+    // below (page-scan tells are more false-positive-prone). Disable for the
+    // team's own E2E automation via EXECUTOR_AUTOMATION_WEBDRIVER_REJECT=false.
+    if state.automation_webdriver_reject
+        && state.validation_url.is_some()
+        && req
+            .client_signals
+            .as_ref()
+            .and_then(|c| c.automation.as_ref())
+            .map_or(false, |a| a.webdriver)
+    {
+        tracing::info!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+            "Automated browser detected (navigator.webdriver) — rejecting verification"
+        );
+        return Err(AppError::ValidationFailed {
+            reason: Some("automated_browser_detected".into()),
+        });
+    }
+
+    // The `automation_observe` block below logs the automation signal for
+    // real-traffic calibration; it never affects the decision. Privacy-first:
+    // only automation-framework artifacts (WebDriver flag + framework labels)
+    // are reported, never fingerprints or user data, and a privacy-hardened
+    // browser (Tor / RFP) reports no webdriver flag and is never rejected.
     if state.automation_observe {
         let signals = req.client_signals.as_ref();
         match signals.and_then(|c| c.automation.as_ref()) {
@@ -464,7 +491,10 @@ pub async fn validate_features_handler(
 
     state.metrics.increment_validations();
 
-    // 1. Automation Risk (Layer A1)
+    // 1. Automation Risk (Layer A1). NOTE: automation tells (webdriver +
+    // framework labels) currently feed automation_risk and thus the composite.
+    // Whether Layer A1 should be observe-only (its original master-list #196
+    // framing) or decision-affecting is an open question — see Item #15.
     let mut automation_risk = 0.0;
     if let Some(signals) = req.client_signals.as_ref() {
         if let Some(a) = signals.automation.as_ref() {
@@ -474,15 +504,23 @@ pub async fn validate_features_handler(
                 automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
             }
         }
-        if let Some(c) = signals.capture.as_ref() {
-            if c.virtual_device {
-                automation_risk = 1.0;
-            }
-            if let Some(flatness) = c.flatness {
-                if !(0.015..=0.85).contains(&flatness) {
-                    automation_risk = (automation_risk + 0.8).min(1.0);
-                }
-            }
+        // Acoustic realism (Layer B1) from client-reported CaptureSignals is
+        // OBSERVE / TELEMETRY ONLY — spoofable (computed in the browser), so it
+        // MUST NOT feed the pass/fail decision. Log for calibration; do NOT add
+        // it to automation_risk. The un-forgeable acoustic check is computed
+        // server-side from the raw audio the validator already receives; wiring
+        // that into the composite (observe -> calibrate -> enforce) is tracked
+        // in remaining-public-tasks.md Item #15.
+        let acoustic_eval = crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
+        if acoustic_eval.risk_score > 0.0 {
+            tracing::info!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                virtual_device = acoustic_eval.virtual_device_detected,
+                flatness_out_of_bounds = acoustic_eval.flatness_out_of_bounds,
+                centroid_out_of_bounds = acoustic_eval.centroid_out_of_bounds,
+                acoustic_risk = acoustic_eval.risk_score,
+                "REALISM_OBSERVATION: client-reported acoustic anomaly (telemetry only, not scored)"
+            );
         }
     }
 

@@ -345,6 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         challenge_registry,
         challenge_ttl_secs: config.challenge_ttl_secs,
         automation_observe: config.automation_observe,
+        automation_webdriver_reject: config.automation_webdriver_reject,
         wallet_reputation_observe: config.wallet_reputation_observe,
         cross_wallet_cooldown,
         cross_wallet_cooldown_enforce: config.cross_wallet_cooldown_enforce,

@@ -15,6 +15,7 @@ struct NonceEntry {
     /// validation service for word-level edit-distance match.
     phrase: String,
     /// Server-issued Lissajous curve parameters for the touch challenge.
+    #[allow(dead_code)]
     curve: LissajousParams,
     issued_at: Instant,
 }
@@ -87,6 +88,7 @@ impl ChallengeNonceRegistry {
     }
 
     /// Look up the issued phrase and Lissajous curve for a wallet without consuming the entry.
+    #[allow(dead_code)]
     pub fn peek_challenge(
         &self,
         wallet: &Pubkey,

@@ -48,6 +48,10 @@ pub struct AppState {
     /// Gates the calibration log in `validate_features_handler`; never affects
     /// the verification decision.
     pub automation_observe: bool,
+    /// Layer A1 automation hard gate: reject requests reporting
+    /// navigator.webdriver === true (prod only). Disable for E2E via
+    /// `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT`.
+    pub automation_webdriver_reject: bool,
     /// Observe-only wallet-reputation logging (master-list #196, Layer D1).
     /// Gates the detached on-chain reputation read in `validate_features_handler`;
     /// never affects the verification decision, quota, or latency.
@@ -302,6 +306,7 @@ pub fn build_test_state(
         challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
         challenge_ttl_secs: 300,
         automation_observe: true,
+        automation_webdriver_reject: false,
         wallet_reputation_observe: true,
         cross_wallet_cooldown: Arc::new(CrossWalletCooldownTracker::new(86400)),
         cross_wallet_cooldown_enforce: false,

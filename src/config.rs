@@ -210,6 +210,14 @@ pub struct Config {
     /// decision either way. Configurable via `EXECUTOR_AUTOMATION_OBSERVE`.
     /// Default true (observe-first).
     pub automation_observe: bool,
+    /// Layer A1 automation hard gate. When true, a request reporting
+    /// navigator.webdriver === true is rejected outright (prod only — no effect
+    /// on the dev pass-through with no validator configured). Disable for the
+    /// team's own E2E automation via `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT`.
+    /// Default true. Client-reported, so it stops lazy automation, not a
+    /// determined attacker who hides the flag — the biometric pipeline is the
+    /// backstop.
+    pub automation_webdriver_reject: bool,
     /// Observe-only wallet-reputation logging (master-list #196, Layer D1).
     /// When true, the `/validate-features` handler reads the verifying wallet's
     /// public on-chain reputation (balance + recent activity) in a detached task
@@ -351,6 +359,8 @@ impl Config {
         // silently disabling the signal on a typo; resolved values are logged at
         // startup in main.rs.
         let automation_observe = parse_bool_env("EXECUTOR_AUTOMATION_OBSERVE", true);
+        let automation_webdriver_reject =
+            parse_bool_env("EXECUTOR_AUTOMATION_WEBDRIVER_REJECT", true);
         let wallet_reputation_observe = parse_bool_env("EXECUTOR_WALLET_REPUTATION_OBSERVE", true);
 
         let cross_wallet_cooldown_secs: u64 = std::env::var("VALIDATION_CROSS_WALLET_COOLDOWN_SECS")
@@ -381,6 +391,7 @@ impl Config {
             wallet_max_attempts,
             wallet_window_secs,
             automation_observe,
+            automation_webdriver_reject,
             wallet_reputation_observe,
             cross_wallet_cooldown_secs,
             cross_wallet_cooldown_enforce,
