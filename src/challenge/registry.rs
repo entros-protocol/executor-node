@@ -15,7 +15,6 @@ struct NonceEntry {
     /// validation service for word-level edit-distance match.
     phrase: String,
     /// Server-issued Lissajous curve parameters for the touch challenge.
-    #[allow(dead_code)]
     curve: LissajousParams,
     issued_at: Instant,
 }
@@ -76,19 +75,10 @@ impl ChallengeNonceRegistry {
         (nonce, phrase, curve)
     }
 
-    /// Look up the issued phrase for a wallet without consuming the entry.
-    /// Returns `None` if no challenge is outstanding OR the entry has
-    /// already aged past `max_age_secs`.
-    pub fn peek_phrase(&self, wallet: &Pubkey, max_age_secs: u64) -> Option<String> {
-        let entry = self.entries.get(wallet)?;
-        if entry.issued_at.elapsed().as_secs() > max_age_secs {
-            return None;
-        }
-        Some(entry.phrase.clone())
-    }
-
-    /// Look up the issued phrase and Lissajous curve for a wallet without consuming the entry.
-    #[allow(dead_code)]
+    /// Look up the issued phrase and Lissajous curve for a wallet without
+    /// consuming the entry. Returns `None` if no challenge is outstanding OR the
+    /// entry has already aged past `max_age_secs`. The single peek accessor —
+    /// callers needing only the phrase take `.0`.
     pub fn peek_challenge(
         &self,
         wallet: &Pubkey,
@@ -170,14 +160,6 @@ mod tests {
     }
 
     #[test]
-    fn peek_phrase_returns_issued_phrase() {
-        let registry = ChallengeNonceRegistry::new();
-        let wallet = test_wallet();
-        let (_, phrase, _) = registry.issue(wallet);
-        assert_eq!(registry.peek_phrase(&wallet, 60).as_ref(), Some(&phrase));
-    }
-
-    #[test]
     fn peek_challenge_returns_issued_challenge() {
         let registry = ChallengeNonceRegistry::new();
         let wallet = test_wallet();
@@ -188,14 +170,14 @@ mod tests {
     }
 
     #[test]
-    fn peek_phrase_returns_none_for_unknown_wallet() {
+    fn peek_challenge_returns_none_for_unknown_wallet() {
         let registry = ChallengeNonceRegistry::new();
         let wallet = test_wallet();
-        assert!(registry.peek_phrase(&wallet, 60).is_none());
+        assert!(registry.peek_challenge(&wallet, 60).is_none());
     }
 
     #[test]
-    fn peek_phrase_returns_none_for_stale_entry() {
+    fn peek_challenge_returns_none_for_stale_entry() {
         let registry = ChallengeNonceRegistry::new();
         let wallet = test_wallet();
         registry.issue(wallet);
@@ -204,17 +186,17 @@ mod tests {
             entry.issued_at = Instant::now() - std::time::Duration::from_secs(120);
         }
 
-        assert!(registry.peek_phrase(&wallet, 60).is_none());
+        assert!(registry.peek_challenge(&wallet, 60).is_none());
     }
 
     #[test]
-    fn peek_phrase_does_not_consume() {
+    fn peek_challenge_does_not_consume() {
         let registry = ChallengeNonceRegistry::new();
         let wallet = test_wallet();
         let (nonce, _, _) = registry.issue(wallet);
         // Peeking multiple times leaves the entry consumable.
-        assert!(registry.peek_phrase(&wallet, 60).is_some());
-        assert!(registry.peek_phrase(&wallet, 60).is_some());
+        assert!(registry.peek_challenge(&wallet, 60).is_some());
+        assert!(registry.peek_challenge(&wallet, 60).is_some());
         assert!(registry.validate_and_consume(&wallet, &nonce, 60).is_ok());
     }
 

@@ -225,6 +225,12 @@ pub struct Config {
     /// quota, or latency. Configurable via `EXECUTOR_WALLET_REPUTATION_OBSERVE`.
     /// Default true (observe-first).
     pub wallet_reputation_observe: bool,
+    /// Observe-only curve-trace region/kinematics logging (touch-curve Stage 1).
+    /// When true, `/validate-features` scores the client's coarse curve-trace
+    /// outline against the issued curve (region proximity + gesture speed/nature)
+    /// and logs it for calibration — it never affects the verification decision.
+    /// Configurable via `EXECUTOR_CURVE_TRACE_OBSERVE`. Default true (observe-first).
+    pub curve_trace_observe: bool,
     /// Cross-wallet verification cooldown duration in seconds (master-list #142).
     /// Configurable via `VALIDATION_CROSS_WALLET_COOLDOWN_SECS`. Default 86400 (24h).
     pub cross_wallet_cooldown_secs: u64,
@@ -362,6 +368,7 @@ impl Config {
         let automation_webdriver_reject =
             parse_bool_env("EXECUTOR_AUTOMATION_WEBDRIVER_REJECT", true);
         let wallet_reputation_observe = parse_bool_env("EXECUTOR_WALLET_REPUTATION_OBSERVE", true);
+        let curve_trace_observe = parse_bool_env("EXECUTOR_CURVE_TRACE_OBSERVE", true);
 
         let cross_wallet_cooldown_secs: u64 = std::env::var("VALIDATION_CROSS_WALLET_COOLDOWN_SECS")
             .ok()
@@ -393,6 +400,7 @@ impl Config {
             automation_observe,
             automation_webdriver_reject,
             wallet_reputation_observe,
+            curve_trace_observe,
             cross_wallet_cooldown_secs,
             cross_wallet_cooldown_enforce,
         })

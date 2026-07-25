@@ -20,7 +20,7 @@ pub struct ChallengeResponse {
     /// Server-issued 5-word phrase the user must speak aloud (drawn from
     /// the curated dictionary at `src/challenge/word_dict.rs`). Bound to the
     /// nonce in `ChallengeNonceRegistry`; `/validate-features` looks it up
-    /// via `peek_phrase(wallet, ttl)` and forwards it to the validation
+    /// via `peek_challenge(wallet, ttl)` and forwards it to the validation
     /// service for word-level content matching (master-list #89).
     pub phrase: String,
     /// Server-issued Lissajous curve parameters for the touch challenge.

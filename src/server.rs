@@ -56,6 +56,10 @@ pub struct AppState {
     /// Gates the detached on-chain reputation read in `validate_features_handler`;
     /// never affects the verification decision, quota, or latency.
     pub wallet_reputation_observe: bool,
+    /// Observe-only curve-trace region/kinematics logging (touch-curve Stage 1).
+    /// Gates the curve-trace scoring log in `validate_features_handler`; never
+    /// affects the verification decision.
+    pub curve_trace_observe: bool,
     /// Cross-wallet verification cooldown tracker (master-list #142).
     pub cross_wallet_cooldown: Arc<CrossWalletCooldownTracker>,
     /// Enforces cross-wallet cooldown blocks when true.
@@ -308,6 +312,7 @@ pub fn build_test_state(
         automation_observe: true,
         automation_webdriver_reject: false,
         wallet_reputation_observe: true,
+        curve_trace_observe: true,
         cross_wallet_cooldown: Arc::new(CrossWalletCooldownTracker::new(86400)),
         cross_wallet_cooldown_enforce: false,
         probing_blocklist: Arc::new(dashmap::DashMap::new()),

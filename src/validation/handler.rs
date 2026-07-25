@@ -60,6 +60,37 @@ pub struct ValidateFeaturesRequest {
     /// fingerprints or user data. Absent for older SDKs (logged as such).
     #[serde(default)]
     pub client_signals: Option<ClientSignals>,
+    /// Coarse curve-trace outline (touch-curve Stage 1). Equal-time resampled
+    /// `{x,y}` points of the user's trace in the client 200x200 viewBox frame,
+    /// plus the outline's wall-clock span. Scored against the issued Lissajous
+    /// curve (region proximity + gesture speed/nature) for observe-only
+    /// calibration — NOT forwarded to the validation service and never gates the
+    /// decision in Stage 1. Absent for older SDKs.
+    #[serde(default, deserialize_with = "deserialize_lenient_option")]
+    pub curve_trace: Option<CurveTracePayload>,
+}
+
+/// Coarse curve-trace outline payload (touch-curve Stage 1). Equal-time
+/// resampled `{x,y}` points in the client 200x200 viewBox frame plus the
+/// outline's wall-clock span. Optional/additive — older SDKs omit it.
+#[derive(Deserialize)]
+pub struct CurveTracePayload {
+    #[serde(default)]
+    pub points: Vec<[f64; 2]>,
+    #[serde(default)]
+    pub duration_ms: f64,
+}
+
+/// Deserialize an optional field leniently: a present-but-malformed value degrades
+/// to `None` instead of failing the whole request. Keeps the observe-only
+/// `curve_trace` field from ever 400-ing a live verification on a bad shape.
+fn deserialize_lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
 }
 
 /// The `client_signals` envelope. Wire mirror of the SDK's `ClientSignals`.
@@ -219,7 +250,7 @@ pub async fn validate_features_handler(
             .client_signals
             .as_ref()
             .and_then(|c| c.automation.as_ref())
-            .map_or(false, |a| a.webdriver)
+            .is_some_and(|a| a.webdriver)
     {
         tracing::info!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -346,9 +377,42 @@ pub async fn validate_features_handler(
     // was issued (old SDK path) or it has aged out, forward `None` — the
     // validation service treats missing phrase as skip, preserving backward
     // compatibility for pre-0.10.0 SDK clients.
-    let expected_phrase = state
+    // One atomic challenge lookup serves both the phrase content-binding forwarded
+    // to the validator AND the observe-only curve-trace scoring, so the two can
+    // never read different issued challenges and it is a single DashMap get.
+    let issued_challenge = state
         .challenge_registry
-        .peek_phrase(&wallet, state.challenge_ttl_secs);
+        .peek_challenge(&wallet, state.challenge_ttl_secs);
+    let expected_phrase = issued_challenge.as_ref().map(|(phrase, _)| phrase.clone());
+
+    // Touch-curve Stage 1 (observe-only): score the coarse outline against the
+    // issued curve OFF the request path. Detached (like `wallet_reputation_observe`)
+    // so it can never add latency or perturb the outcome; sanitized + capped so a
+    // hostile payload can neither burn CPU nor poison the calibration corpus. Runs
+    // only when the client sent an outline and a curve is outstanding.
+    if state.curve_trace_observe {
+        if let (Some(trace), Some((_, curve))) = (req.curve_trace.as_ref(), issued_challenge.as_ref())
+        {
+            let points = crate::challenge::curve_trace::sanitize_trace(&trace.points);
+            let duration_ms = trace.duration_ms;
+            let curve = curve.clone();
+            tokio::spawn(async move {
+                let report =
+                    crate::challenge::curve_trace::score_curve_trace(&points, duration_ms, &curve);
+                tracing::info!(
+                    region_score = report.region_score,
+                    kinematic_score = report.kinematic_score,
+                    median_deviation = report.median_deviation,
+                    path_length = report.path_length,
+                    max_segment = report.max_segment,
+                    speed_cov = report.speed_cov,
+                    mean_speed = report.mean_speed,
+                    point_count = report.point_count,
+                    "Curve-trace observe"
+                );
+            });
+        }
+    }
 
     // Fetch user's verification timestamps from on-chain IdentityState
     let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&wallet);
@@ -713,6 +777,7 @@ mod tests {
             commitment_new_hex: None,
             request_receipt: None,
             client_signals: None,
+            curve_trace: None,
         }
     }
 
@@ -725,6 +790,32 @@ mod tests {
         });
         let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
         assert!(req.client_signals.is_none());
+    }
+
+    #[test]
+    fn malformed_curve_trace_degrades_to_none_not_error() {
+        // An observe-only field must never 400 a live verification: a wrong-shaped
+        // curve_trace deserializes to None, not a hard error on the whole request.
+        let json = serde_json::json!({
+            "features": [0.0, 1.0, 2.0],
+            "wallet_id": "abc",
+            "curve_trace": [{ "x": 1, "y": 2 }],
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        assert!(req.curve_trace.is_none());
+    }
+
+    #[test]
+    fn well_formed_curve_trace_deserializes() {
+        let json = serde_json::json!({
+            "features": [0.0, 1.0, 2.0],
+            "wallet_id": "abc",
+            "curve_trace": { "points": [[1.0, 2.0], [3.0, 4.0]], "duration_ms": 9000.0 },
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
+        let ct = req.curve_trace.expect("well-formed curve_trace should parse");
+        assert_eq!(ct.points.len(), 2);
+        assert_eq!(ct.duration_ms, 9000.0);
     }
 
     #[test]
