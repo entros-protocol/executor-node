@@ -80,6 +80,7 @@ cargo test
 | `SAS_SCHEMA_PDA` | — | SAS schema PDA for attestation issuance |
 | `EXECUTOR_AUTOMATION_OBSERVE` | `true` | Log client automation signals for calibration (observe-only; never affects the decision). `0`/`false`/`no`/`off` to disable |
 | `EXECUTOR_WALLET_REPUTATION_OBSERVE` | `true` | Log a verifying wallet's on-chain reputation for calibration (observe-only; never affects the decision). `0`/`false`/`no`/`off` to disable |
+| `EXECUTOR_CURVE_TRACE_OBSERVE` | `true` | Score the client's coarse curve-trace outline against the issued curve (region proximity, gesture kinematics, and alignment residual) for calibration (observe-only, detached off the request path; never affects the decision). `0`/`false`/`no`/`off` to disable |
 
 ## License
 
