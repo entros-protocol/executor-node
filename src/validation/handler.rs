@@ -675,7 +675,7 @@ pub async fn validate_features_handler(
         let raw_reason = err_body.as_ref().and_then(|body| body.reason.clone());
         let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
 
-        let (biometric_risk, tts_risk, temporal_risk, _audio_realism_risk) = match &err_body {
+        let (biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match &err_body {
             Some(body) => (body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
             None => (1.0, 0.0, 0.0, 0.0),
         };
@@ -695,6 +695,7 @@ pub async fn validate_features_handler(
             temporal_risk,
             automation_risk,
             reputation_risk,
+            audio_realism_risk,
             composite_risk_score,
             "Feature validation rejected"
         );
@@ -706,7 +707,7 @@ pub async fn validate_features_handler(
     state.wallet_attempts.refund_on_success(&wallet);
 
     let parsed_body = response.json::<ValidatorSuccessBody>().await.ok();
-    let (signed_receipt, commitment_hex, salt_hex, biometric_risk, tts_risk, temporal_risk, _audio_realism_risk) = match parsed_body {
+    let (signed_receipt, commitment_hex, salt_hex, biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match parsed_body {
         Some(body) => (body.signed_receipt, body.commitment_hex, body.salt_hex, body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
         None => (None, None, None, 0.0, 0.0, 0.0, 0.0),
     };
@@ -725,6 +726,7 @@ pub async fn validate_features_handler(
         temporal_risk,
         automation_risk,
         reputation_risk,
+        audio_realism_risk,
         composite_risk_score,
         "Feature validation passed biometric checks"
     );
