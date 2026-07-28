@@ -771,7 +771,10 @@ mod tests {
     use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
     use crate::integrator::wallet_attempts::WalletAttemptTracker;
 
-    fn baseline_request(wallet_id: String) -> ValidateFeaturesRequest {
+    /// Shared by `validator_reached_tests` too. The literal names every field
+    /// explicitly (no `..Default::default()`), so it must exist exactly once —
+    /// two copies would silently diverge the moment a field is added.
+    pub(super) fn baseline_request(wallet_id: String) -> ValidateFeaturesRequest {
         ValidateFeaturesRequest {
             features: vec![0.0; 134],
             wallet_id,
@@ -892,12 +895,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_signals_present_do_not_change_the_outcome() {
-        // Observe-only contract: a request carrying automation tells (here, the
-        // strongest — webdriver true plus framework labels) must reach the same
-        // verdict as one without. The handler runs with automation_observe=true
-        // (build_test_state default), so this exercises the live observe branch
-        // and confirms it is side-effect-free on the decision.
+    async fn client_signals_on_the_dev_skip_path_do_not_perturb_quota() {
+        // Narrow successor to the former `client_signals_present_do_not_change
+        // _the_outcome`, which claimed automation tells were observe-only and
+        // asserted the same verdict with and without them. That contract is
+        // false in production: EXECUTOR_AUTOMATION_WEBDRIVER_REJECT defaults to
+        // true, so a webdriver request is refused outright, and even with the
+        // flag off it scores automation_risk = 1.0 into the composite. The old
+        // test passed only because it was shielded twice — build_test_state
+        // sets automation_webdriver_reject = false, and the gate additionally
+        // requires validation_url.is_some(), which `None` defeats.
+        //
+        // What remains true on the dev-skip path, and all this now asserts, is
+        // that the observe-only logging branch is side-effect-free on quota.
+        // The real gate contract is covered by the mock-validator tests below.
         let tracker = tracker_with_quota("test-key", 10);
         let state = build_test_state(tracker.clone(), None);
         let headers = headers_with_key("test-key");
@@ -916,13 +927,13 @@ mod tests {
 
         assert!(
             result.is_ok(),
-            "automation tells must not block the verification path (observe-only); got {:?}",
+            "dev-skip path returns before any gate can fire; got {:?}",
             result.err()
         );
         assert_eq!(
             tracker.get_remaining("test-key"),
             10,
-            "observe-only path must not perturb quota accounting"
+            "dev-skip path must refund the integrator quota"
         );
     }
 
@@ -1072,5 +1083,650 @@ mod tests {
         assert!(!is_ip_rate_limited, "Expected request to bypass block list once expired");
         // It should have cleaned up the entry
         assert!(!state.probing_blocklist.contains_key(&client_ip));
+    }
+}
+
+/// Tests that drive the handler through to the upstream validator.
+///
+/// Everything above exits at the dev-skip (`validation_url: None`), so until
+/// this module existed nothing exercised the validator round-trip, the
+/// composite risk score, the reject tier, the captcha tier, the safe-reveal
+/// reason filter, or the probing-blocklist write. The composite could have been
+/// inverted to refuse every honest user with the whole suite still green.
+#[cfg(test)]
+mod validator_reached_tests {
+    use super::*;
+    use crate::server::{headers_with_key, random_wallet_id, tracker_with_quota};
+    use crate::validation::mock_validator::{
+        error_body, state_with_mock_validator, success_body, MockValidator, REPUTATION_FLOOR,
+    };
+    use axum::http::StatusCode;
+    // Reused rather than re-declared: the request literal names every field, so
+    // a second copy would drift the moment `ValidateFeaturesRequest` changes.
+    use super::tests::baseline_request;
+
+    fn webdriver_signals() -> ClientSignals {
+        ClientSignals {
+            v: 1,
+            env: Some("browser".into()),
+            automation: Some(AutomationSignals {
+                webdriver: true,
+                tells: vec!["puppeteer".into(), "selenium".into()],
+            }),
+            capture: None,
+        }
+    }
+
+    /// Composite weights, restated so a change to the handler's table fails
+    /// here rather than silently altering who gets verified.
+    fn expected_composite(biometric: f64, tts: f64, temporal: f64, automation: f64) -> f64 {
+        0.35 * biometric + 0.25 * tts + 0.15 * temporal + 0.15 * automation + REPUTATION_FLOOR
+    }
+
+    // ---- reachability, and the gate whose contract was previously inverted ----
+
+    #[tokio::test]
+    async fn a_clean_request_reaches_the_upstream_validator() {
+        // Baseline for everything below: proves the harness actually gets past
+        // the dev-skip. If this fails, no other test in this module means
+        // anything, because they would all be asserting against an early return.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        let response = result.expect("a clean request must pass").0;
+        assert_eq!(
+            mock.request_count(),
+            1,
+            "the handler must actually call the validator, not short-circuit"
+        );
+        assert!(response.valid);
+        assert_eq!(
+            response.remaining_quota,
+            Some(9),
+            "a validated request consumes exactly one unit of integrator quota"
+        );
+        assert_eq!(
+            state.metrics.validations_performed(),
+            1,
+            "metrics must count work that actually happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn webdriver_is_refused_before_the_upstream_round_trip() {
+        // The gate at the top of the handler is guarded by
+        // `validation_url.is_some()`, so it is unreachable whenever the
+        // validator is unconfigured — which is why no previous test could
+        // observe it. Asserting the mock received *nothing* is the point:
+        // rejecting after paying for transcription would waste the expensive
+        // call the guard exists to avoid.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.automation_webdriver_reject = true;
+
+        let mut req = baseline_request(random_wallet_id());
+        req.client_signals = Some(webdriver_signals());
+
+        let result =
+            validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
+                .await;
+
+        // `PaddedJson` is not `Debug`; discard the success payload so the
+        // catch-all arm can report what came back instead.
+        match result.map(|_| ()) {
+            Err(AppError::ValidationFailed { reason }) => assert_eq!(
+                reason.as_deref(),
+                Some("automated_browser_detected"),
+                "the client needs this reason to explain itself to the user"
+            ),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+        assert_eq!(
+            mock.request_count(),
+            0,
+            "the webdriver gate must short-circuit before the validator call"
+        );
+    }
+
+    #[tokio::test]
+    async fn webdriver_with_the_reject_flag_off_scores_full_automation_risk() {
+        // With the hard gate disabled the signal is not discarded — it enters
+        // the composite at weight 0.15. Pinning both halves means this suite
+        // describes what the flag does in either position without asserting
+        // which default is correct; that policy question is open (see the note
+        // at the automation_risk computation and remaining-public-tasks #15).
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.automation_webdriver_reject = false;
+
+        let mut req = baseline_request(random_wallet_id());
+        req.client_signals = Some(webdriver_signals());
+
+        let response =
+            validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
+                .await
+                .expect("automation risk alone stays under the reject threshold")
+                .0;
+
+        assert_eq!(mock.request_count(), 1);
+        assert!(
+            (response.composite_risk_score - expected_composite(0.0, 0.0, 0.0, 1.0)).abs() < 1e-9,
+            "webdriver must contribute automation_risk = 1.0; got {}",
+            response.composite_risk_score
+        );
+    }
+
+    // ---- the composite and its two policy tiers ----
+
+    #[tokio::test]
+    async fn composite_risk_weights_each_layer_as_specified() {
+        // Pins the weight table itself. Stage 1b will add a term to this
+        // region, and this is the test that makes a silent re-weighting of the
+        // existing five impossible.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.4, 0.2, 0.1)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let response = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await
+        .expect("a low-risk capture must pass")
+        .0;
+
+        let expected = expected_composite(0.4, 0.2, 0.1, 0.0);
+        assert!(
+            (response.composite_risk_score - expected).abs() < 1e-9,
+            "expected composite {expected}, got {}",
+            response.composite_risk_score
+        );
+    }
+
+    #[tokio::test]
+    async fn a_composite_above_the_reject_threshold_fails_with_no_reason() {
+        // Above 0.75 the handler refuses and deliberately surfaces no reason:
+        // naming the failing layer would tell an attacker which signal to tune.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 1.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        // `PaddedJson` is not `Debug`; discard the success payload so the
+        // catch-all arm can report what came back instead.
+        match result.map(|_| ()) {
+            Err(AppError::ValidationFailed { reason }) => assert!(
+                reason.is_none(),
+                "the reject tier must not name the failing layer, got {reason:?}"
+            ),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_composite_in_the_suspicious_band_requires_a_captcha() {
+        // Between 0.45 and 0.75 the handler asks for graduated friction rather
+        // than refusing outright. The client routes this reason to a retry UX.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let composite = expected_composite(1.0, 1.0, 0.0, 0.0);
+        assert!(
+            (0.45..=0.75).contains(&composite),
+            "fixture must land in the captcha band, computed {composite}"
+        );
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        // `PaddedJson` is not `Debug`; discard the success payload so the
+        // catch-all arm can report what came back instead.
+        match result.map(|_| ()) {
+            Err(AppError::ValidationFailed { reason }) => assert_eq!(
+                reason.as_deref(),
+                Some("captcha_required"),
+                "the client keys its retry UX off this exact reason"
+            ),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_suspicious_score_is_admitted_once_attempts_exceed_one() {
+        // Characterization, not endorsement. The captcha tier is conditioned on
+        // `attempts <= 1`, and that count is read *after* the success path has
+        // already refunded this request's own slot — so a fresh wallet reads 0
+        // and always qualifies on a first request. Pre-seeding two attempts
+        // pushes the count to 2, and the identical risk score that demanded a
+        // captcha moments earlier now passes.
+        //
+        // Nothing server-side verifies that a captcha was actually solved, so
+        // the friction is advisory. Recorded here because it is invisible
+        // otherwise; whether it should hold is a policy question for the owner.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+        // Cap is 5, so two pre-seeded attempts leave headroom for the request.
+        state
+            .wallet_attempts
+            .check_and_record_attempt(&wallet)
+            .expect("first pre-seed is under the cap");
+        state
+            .wallet_attempts
+            .check_and_record_attempt(&wallet)
+            .expect("second pre-seed is under the cap");
+
+        let response = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await
+        .expect("the captcha tier no longer applies once attempts exceed one")
+        .0;
+
+        assert!(
+            response.composite_risk_score >= 0.45,
+            "the score must still be in the suspicious band, got {}",
+            response.composite_risk_score
+        );
+    }
+
+    // ---- the safe-reveal reason filter ----
+
+    #[tokio::test]
+    async fn an_allowlisted_rejection_reason_reaches_the_client() {
+        // `phrase_content_mismatch` is safe to reveal because the user already
+        // knows whether they said the assigned phrase, so it leaks nothing an
+        // attacker could not already observe.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(
+            StatusCode::BAD_REQUEST,
+            error_body("phrase_content_mismatch"),
+        )
+        .await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        // `PaddedJson` is not `Debug`; discard the success payload so the
+        // catch-all arm can report what came back instead.
+        match result.map(|_| ()) {
+            Err(AppError::ValidationFailed { reason }) => assert_eq!(
+                reason.as_deref(),
+                Some("phrase_content_mismatch"),
+                "allowlisted reasons must survive the filter"
+            ),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_non_allowlisted_rejection_reason_is_stripped() {
+        // The security property behind the allowlist: variance, entropy and
+        // temporal-coupling categories carry directed calibration value, so the
+        // executor must refuse to forward them even when the validator says so.
+        // Without this test the allowlist could be widened or dropped silently.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("variance_floor")).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        // `PaddedJson` is not `Debug`; discard the success payload so the
+        // catch-all arm can report what came back instead.
+        match result.map(|_| ()) {
+            Err(AppError::ValidationFailed { reason }) => assert!(
+                reason.is_none(),
+                "non-allowlisted reasons must be stripped, leaked {reason:?}"
+            ),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    // ---- refund and accounting invariants ----
+
+    #[tokio::test]
+    async fn an_unreachable_validator_refunds_both_budgets() {
+        // Infrastructure failure is not the user's fault: neither the
+        // integrator's quota nor the wallet's attempt budget may absorb it.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        // Port 1 is reserved and never listening, so this fails to connect.
+        state.validation_url = Some("http://127.0.0.1:1".into());
+
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(AppError::ValidationServiceUnavailable)),
+            "expected ValidationServiceUnavailable, got {:?}",
+            result.map(|_| ())
+        );
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            10,
+            "an unreachable validator must refund the integrator quota"
+        );
+        assert_eq!(
+            state.wallet_attempts.get_attempts(&wallet),
+            0,
+            "an unreachable validator must refund the wallet attempt slot"
+        );
+        assert_eq!(
+            state.metrics.validations_performed(),
+            0,
+            "no validation ran, so the counter must not move"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_validator_rejection_refunds_neither_budget() {
+        // A real rejection is the user's own failed attempt: it consumes the
+        // wallet slot so failures accumulate against the cap, and it consumes
+        // integrator quota because work was genuinely performed upstream.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("variance_floor")).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await;
+
+        assert!(result.is_err(), "the validator rejected this capture");
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            9,
+            "a validator-reached rejection must still consume integrator quota"
+        );
+        assert_eq!(
+            state.wallet_attempts.get_attempts(&wallet),
+            1,
+            "a genuine failure must accumulate against the per-wallet budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_threshold_rejection_refunds_the_wallet_slot_but_not_the_quota() {
+        // The success path refunds the wallet attempt before either policy tier
+        // runs, so a capture the validator accepted but the composite refused
+        // costs the user nothing against their own cap — while the integrator
+        // still pays, because the upstream work happened.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 1.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await;
+
+        assert!(result.is_err(), "composite above 0.75 must be refused");
+        assert_eq!(
+            tracker.get_remaining("test-key"),
+            9,
+            "the validator did the work, so integrator quota stays spent"
+        );
+        assert_eq!(
+            state.wallet_attempts.get_attempts(&wallet),
+            0,
+            "the wallet slot is refunded before the threshold gates run"
+        );
+    }
+
+    // ---- side effects and contract robustness ----
+
+    #[tokio::test]
+    async fn a_probing_verdict_blocklists_the_client_ip() {
+        // The only site that writes the probing blocklist. Without coverage a
+        // refactor could drop the insert and the sole consequence would be a
+        // silently disarmed defense.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = error_body("variance_floor");
+        body["probing_detected"] = serde_json::json!(true);
+        let mock = MockValidator::spawn(StatusCode::BAD_REQUEST, body).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        assert!(result.is_err(), "a probing verdict is a rejection");
+        // Handler tests pass no peer and no X-Forwarded-For, so the client IP
+        // resolves to the documented 127.0.0.1 fallback.
+        let fallback_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+        assert!(
+            state.probing_blocklist.contains_key(&fallback_ip),
+            "a probing verdict must blocklist the originating IP"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_success_body_omitting_optional_fields_parses_cleanly() {
+        // The real validator omits its optional fields rather than nulling them
+        // (`skip_serializing_if`), and every executor-side field carries
+        // `#[serde(default)]` to absorb that. An empty object is the extreme
+        // case: it must parse, not fall into the fallback arm.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let response = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await
+        .expect("an all-defaults body must pass")
+        .0;
+
+        assert!(response.signed_receipt.is_none());
+        assert!(
+            (response.composite_risk_score - REPUTATION_FLOOR).abs() < 1e-9,
+            "absent risks must default to zero, leaving only the reputation floor; got {}",
+            response.composite_risk_score
+        );
+    }
+
+    #[tokio::test]
+    async fn a_null_numeric_in_the_error_body_collapses_to_maximum_biometric_risk() {
+        // `#[serde(default)]` rescues a *missing* key, not a null one: a null
+        // numeric fails f64 deserialization, which fails the entire body, which
+        // `.ok()` turns into None. The error branch's fallback then assumes the
+        // worst and uses biometric_risk = 1.0. Pinned because the failure is
+        // silent — the reason is also lost, so the client sees a bare rejection.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = error_body("phrase_content_mismatch");
+        body["biometric_risk"] = serde_json::Value::Null;
+        let mock = MockValidator::spawn(StatusCode::BAD_REQUEST, body).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        // `PaddedJson` is not `Debug`; discard the success payload so the
+        // catch-all arm can report what came back instead.
+        match result.map(|_| ()) {
+            Err(AppError::ValidationFailed { reason }) => assert!(
+                reason.is_none(),
+                "an unparseable body loses the reason entirely, got {reason:?}"
+            ),
+            other => panic!("expected ValidationFailed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_issued_challenge_phrase_is_forwarded_to_the_validator() {
+        // The validator matches its transcription against this phrase, so the
+        // binding between the challenge the user was shown and the audio they
+        // produced lives entirely in this forward. The phrase is randomly
+        // generated per issue, so it is read back rather than hardcoded.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+        state.challenge_registry.issue(wallet);
+        let (issued_phrase, _) = state
+            .challenge_registry
+            .peek_challenge(&wallet, state.challenge_ttl_secs)
+            .expect("a freshly issued challenge is within its TTL");
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await
+        .expect("a clean request with an issued challenge must pass");
+
+        let sent = mock.received();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0]["expected_phrase"].as_str(),
+            Some(issued_phrase.as_str()),
+            "the issued phrase must reach the validator for transcription matching"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_issued_challenge_forwards_a_null_phrase() {
+        // Backward compatibility for pre-challenge SDKs: the validator treats a
+        // missing phrase as "skip the content check" rather than a failure, so
+        // the absence must be forwarded rather than fabricated.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await
+        .expect("a request without an issued challenge must still pass");
+
+        let sent = mock.received();
+        // Guard the index: `received()` is a Vec, so an empty log would panic
+        // here with an opaque out-of-bounds instead of naming the real failure.
+        assert_eq!(sent.len(), 1, "the validator must have been called");
+        assert!(
+            sent[0]["expected_phrase"].is_null(),
+            "no challenge means no phrase, got {}",
+            sent[0]["expected_phrase"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_two_hundred_carrying_valid_false_is_still_treated_as_a_pass() {
+        // Characterization of a latent coupling, not an endorsement. The
+        // executor decides pass/fail purely from the HTTP status and never
+        // deserializes the `valid` field that `entros-validation` sends, so a
+        // 200 body asserting its own failure is admitted. Benign today because
+        // the real validator only ever pairs `valid: true` with 200 and uses
+        // 400 to reject — but the two structs are hand-maintained in separate
+        // repos with no shared fixture, so nothing enforces that pairing.
+        //
+        // If this test ever starts failing, the executor grew a `valid` check,
+        // which is a hardening worth keeping — update the test, don't revert it.
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = success_body(0.0, 0.0, 0.0);
+        body["valid"] = serde_json::json!(false);
+        let mock = MockValidator::spawn(StatusCode::OK, body).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        let response = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await
+        .expect("status, not the body's `valid` field, decides the outcome today")
+        .0;
+
+        assert!(
+            response.valid,
+            "the executor reports success purely on the upstream 200"
+        );
     }
 }
