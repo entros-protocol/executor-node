@@ -10,6 +10,7 @@ use std::str::FromStr;
 use crate::error::AppError;
 use crate::padding::PaddedJson;
 use crate::server::AppState;
+use crate::validation::composite::{RiskComponents, CAPTCHA_THRESHOLD, REJECT_THRESHOLD};
 
 #[derive(Deserialize)]
 pub struct ValidateFeaturesRequest {
@@ -235,15 +236,13 @@ pub async fn validate_features_handler(
         }
     }
 
-    // Layer A1 automation hard gate. A browser reporting navigator.webdriver
-    // === true is rejected before the validation round-trip (prod only — the
-    // dev pass-through with no validator configured is unaffected). This is a
-    // client-reported signal, so it stops lazy automation (Puppeteer / Selenium
-    // that don't strip the flag), NOT a determined attacker who hides it — the
-    // biometric pipeline is the backstop, and no public claim should imply this
-    // alone blocks sophisticated bots. Framework `tells` stay a graduated nudge
-    // below (page-scan tells are more false-positive-prone). Disable for the
-    // team's own E2E automation via EXECUTOR_AUTOMATION_WEBDRIVER_REJECT=false.
+    // Layer A1 automation gate. A browser reporting navigator.webdriver === true
+    // is refused ahead of the validation round-trip, skipping the upstream call.
+    // The dev pass-through with no validator configured is unaffected. Framework
+    // `tells` are handled separately below. Disable for the team's own E2E
+    // automation via EXECUTOR_AUTOMATION_WEBDRIVER_REJECT=false.
+    //
+    // Scope and limits: docs/reference/EXECUTOR-SCORING-INTERNALS.md
     if state.automation_webdriver_reject
         && state.validation_url.is_some()
         && req
@@ -261,8 +260,7 @@ pub async fn validate_features_handler(
         });
     }
 
-    // The `automation_observe` block below logs the automation signal for
-    // real-traffic calibration; it never affects the decision. Privacy-first:
+    // Log the automation signal for real-traffic calibration. Privacy-first:
     // only automation-framework artifacts (WebDriver flag + framework labels)
     // are reported, never fingerprints or user data, and a privacy-hardened
     // browser (Tor / RFP) reports no webdriver flag and is never rejected.
@@ -680,11 +678,17 @@ pub async fn validate_features_handler(
             None => (1.0, 0.0, 0.0, 0.0),
         };
 
-        let composite_risk_score = 0.35 * biometric_risk
-            + 0.25 * tts_risk
-            + 0.15 * temporal_risk
-            + 0.15 * automation_risk
-            + 0.10 * reputation_risk;
+        // Computed even though this branch always returns Err: the log line
+        // below is the only record of how risky the captures the validator
+        // itself rejected were, and calibration reads it.
+        let composite_risk_score = RiskComponents {
+            biometric: biometric_risk,
+            tts: tts_risk,
+            temporal: temporal_risk,
+            automation: automation_risk,
+            reputation: reputation_risk,
+        }
+        .composite();
 
         tracing::info!(
             api_key = %crate::auth::redact::redact_api_key(&api_key),
@@ -712,11 +716,14 @@ pub async fn validate_features_handler(
         None => (None, None, None, 0.0, 0.0, 0.0, 0.0),
     };
 
-    let composite_risk_score = 0.35 * biometric_risk
-        + 0.25 * tts_risk
-        + 0.15 * temporal_risk
-        + 0.15 * automation_risk
-        + 0.10 * reputation_risk;
+    let composite_risk_score = RiskComponents {
+        biometric: biometric_risk,
+        tts: tts_risk,
+        temporal: temporal_risk,
+        automation: automation_risk,
+        reputation: reputation_risk,
+    }
+    .composite();
 
     tracing::info!(
         api_key = %crate::auth::redact::redact_api_key(&api_key),
@@ -731,8 +738,9 @@ pub async fn validate_features_handler(
         "Feature validation passed biometric checks"
     );
 
-    // Apply policy threshold: high risk rejects
-    if composite_risk_score > 0.75 {
+    // Apply policy threshold: high risk rejects. Strict, so a score landing
+    // exactly on the threshold passes.
+    if composite_risk_score > REJECT_THRESHOLD {
         tracing::warn!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             composite_risk_score,
@@ -743,7 +751,7 @@ pub async fn validate_features_handler(
 
     // Suspicious range graduated friction (Layer C)
     let attempts = state.wallet_attempts.get_attempts(&wallet);
-    if composite_risk_score >= 0.45 && attempts <= 1 {
+    if composite_risk_score >= CAPTCHA_THRESHOLD && attempts <= 1 {
         tracing::warn!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             composite_risk_score,
@@ -1258,7 +1266,7 @@ mod validator_reached_tests {
 
     #[tokio::test]
     async fn a_composite_above_the_reject_threshold_fails_with_no_reason() {
-        // Above 0.75 the handler refuses and deliberately surfaces no reason:
+        // Above REJECT_THRESHOLD the handler refuses and surfaces no reason:
         // naming the failing layer would tell an attacker which signal to tune.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 1.0)).await;
@@ -1285,7 +1293,7 @@ mod validator_reached_tests {
 
     #[tokio::test]
     async fn a_composite_in_the_suspicious_band_requires_a_captcha() {
-        // Between 0.45 and 0.75 the handler asks for graduated friction rather
+        // Inside the captcha band the handler asks for graduated friction rather
         // than refusing outright. The client routes this reason to a retry UX.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
@@ -1293,7 +1301,7 @@ mod validator_reached_tests {
 
         let composite = expected_composite(1.0, 1.0, 0.0, 0.0);
         assert!(
-            (0.45..=0.75).contains(&composite),
+            (CAPTCHA_THRESHOLD..=REJECT_THRESHOLD).contains(&composite),
             "fixture must land in the captcha band, computed {composite}"
         );
 
@@ -1356,7 +1364,7 @@ mod validator_reached_tests {
         .0;
 
         assert!(
-            response.composite_risk_score >= 0.45,
+            response.composite_risk_score >= CAPTCHA_THRESHOLD,
             "the score must still be in the suspicious band, got {}",
             response.composite_risk_score
         );
@@ -1527,7 +1535,10 @@ mod validator_reached_tests {
         )
         .await;
 
-        assert!(result.is_err(), "composite above 0.75 must be refused");
+        assert!(
+            result.is_err(),
+            "a composite above the reject threshold must be refused"
+        );
         assert_eq!(
             tracker.get_remaining("test-key"),
             9,
