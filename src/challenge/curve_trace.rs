@@ -1,27 +1,17 @@
-//! Curve-trace scoring for the touch half of the challenge (Stage 1, observe-only).
+//! Curve-trace scoring for the touch half of the challenge.
 //!
-//! Restores the touch half of the challenge's content binding. The audio half is
-//! bound by Whisper phrase-matching; this module scores the user's coarse
-//! curve-trace outline on three axes: whether it stayed in the issued curve's
-//! **region**, whether its speed and nature read as a genuine continuous human
-//! **gesture**, and whether it actually **followed** the issued path.
+//! The audio half is bound by phrase-matching against the transcription. This
+//! module scores the client's coarse curve-trace outline on three axes: whether
+//! it stayed in the issued curve's region, whether its speed and nature read as a
+//! continuous gesture, and whether it followed the issued path.
 //!
-//! This is NOT a precision / fidelity check. The curve is a complexity +
-//! temporal-coupling prompt, never a 1:1 tracing test — real traces are near the
-//! lines, following, incomplete, and never perfect, and those pass. A messy
-//! in-region gesture with human dynamics that follows the path is intentionally
-//! accepted — that is a human in the right place, which is exactly what the
-//! forgiving design wants.
+//! It is not a precision check. The curve is a complexity and temporal-coupling
+//! prompt rather than a 1:1 tracing test, so traces that are near the lines,
+//! incomplete, and imperfect are expected and accepted by design.
 //!
-//! **Calibration finding, 2026-07-25.** Region proximity alone does not
-//! discriminate. A Lissajous curve fills its own box densely enough that a
-//! continuous scribble *inside* the box scores a perfect region score with a median
-//! deviation indistinguishable from an honest trace (3.8 vs 4.0 on live data), and
-//! the score barely moves when the trace is of an entirely *different* issued
-//! curve. [`alignment_residual`] exists because of that finding.
-//!
-//! Stage 1 is observe-only: the scores here feed telemetry so we can calibrate a
-//! forgiving threshold on real traces. Nothing gates on them yet.
+//! Calibration history, scoring status, and the reasoning behind each constant
+//! are recorded internally in `docs/reference/EXECUTOR-SCORING-INTERNALS.md`.
+//! This repository is public; keep comments here factual.
 
 use crate::challenge::lissajous::LissajousParams;
 
@@ -56,14 +46,8 @@ const PROXIMITY_BAND: f64 = 25.0;
 const MIN_PATH_LENGTH: f64 = 40.0;
 
 /// A single equal-time segment longer than this reads as a discontinuity rather
-/// than a continuous human gesture.
-///
-/// CALIBRATION (2026-07-25): at 64 equal-time points over a ~12s capture a segment
-/// spans ~187 ms, so 60 units is ~320 units/s — an ordinary tracing speed, not a
-/// teleport. Both live human traces breached it (max segment 69.8 and 80.4,
-/// dropping `kinematic_score` to 0.84 and 0.66) while a moderate scribble passed
-/// cleanly. As it stands this constant penalises fast honest tracing rather than
-/// discontinuity, and must be retuned before it is allowed to gate anything.
+/// than a continuous gesture. Calibration status and history:
+/// docs/reference/EXECUTOR-SCORING-INTERNALS.md
 const TELEPORT_SEGMENT: f64 = 60.0;
 
 /// Minimum coefficient of variation of per-segment speed. Real tracing speeds up
@@ -509,8 +493,8 @@ pub fn sanitize_trace(points: &[[f64; 2]]) -> Vec<(f64, f64)> {
 
 /// Score a coarse curve-trace outline against the issued curve. `trace` is the
 /// equal-time-resampled outline in the client's 200x200 viewBox frame;
-/// `duration_ms` is the wall-clock span of the outline. Observe-only — the
-/// caller logs the report and gates nothing on it.
+/// `duration_ms` is the wall-clock span of the outline. The caller decides what
+/// to do with the report.
 pub fn score_curve_trace(
     trace: &[(f64, f64)],
     duration_ms: f64,
