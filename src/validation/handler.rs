@@ -12,6 +12,21 @@ use crate::padding::PaddedJson;
 use crate::server::AppState;
 use crate::validation::composite::{RiskComponents, CAPTCHA_THRESHOLD, REJECT_THRESHOLD};
 
+/// How long to wait on the internal validation service before giving up.
+///
+/// Sized off the validator's own worst case rather than a round number. A
+/// rejection there runs 5-8s with Whisper-tiny dominating (see
+/// `timing::HANDLER_MIN_DURATION`), and `VALIDATION_VAD_AB_LOGGING` adds a
+/// second full transcription pass on top when it is on. The previous 8s
+/// budget sat inside that range, so a legitimate two-pass validation could
+/// exhaust it and surface to the user as a generic failure: the executor
+/// timing out on a validator that was still working.
+///
+/// The margin is deliberate. `VALIDATION_VAD_AB_LOGGING` is an environment
+/// variable that can be turned back on for a calibration window, and this
+/// timeout must not become the thing that breaks when it is.
+const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 #[derive(Deserialize)]
 pub struct ValidateFeaturesRequest {
     pub features: Vec<f64>,
@@ -202,10 +217,22 @@ pub async fn validate_features_handler(
     let ip = crate::auth::client_ip::extract_client_ip(&headers, peer.map(|Extension(c)| c.0))
         .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
 
-    let user_agent = headers
+    // Bounded before it is used or forwarded. This is the one attacker-
+    // controlled string that crosses the service boundary unmeasured: it goes
+    // into the origin hash, into logs, and into the body sent to the
+    // validator, where it counts against that service's own body limit. A
+    // browser sends a couple of hundred bytes; anything past the bound is a
+    // client with something else in mind, and the prefix is all the origin
+    // hash needs.
+    const MAX_USER_AGENT_BYTES: usize = 512;
+    let user_agent_raw = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
+    let user_agent = match user_agent_raw.char_indices().nth(MAX_USER_AGENT_BYTES) {
+        Some((cut, _)) => &user_agent_raw[..cut],
+        None => user_agent_raw,
+    };
 
     // Check probing blocklist (Item #135)
     if let Some(expire_time) = state.probing_blocklist.get(&ip).map(|r| *r) {
@@ -456,10 +483,6 @@ pub async fn validate_features_handler(
     // Build request to internal validation service. Forward time-series and
     // audio fields unchanged — the validation service handles absence of any
     // field (old SDK versions).
-    //
-    // Whisper-tiny inference adds ~1s to the validation round trip. Bump the
-    // client-side timeout accordingly (3s → 8s) so legitimate audio payloads
-    // don't time out before transcription completes.
     let mut request = state
         .http_client
         .post(format!("{validation_url}/validate"))
@@ -477,7 +500,7 @@ pub async fn validate_features_handler(
             "origin_ip": Some(ip.to_string()),
             "origin_ua": Some(user_agent.to_string()),
         }))
-        .timeout(std::time::Duration::from_secs(8));
+        .timeout(VALIDATOR_REQUEST_TIMEOUT);
 
     // Add bearer token if configured
     if let Some(key) = &state.validation_api_key {
