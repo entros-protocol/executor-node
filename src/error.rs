@@ -9,6 +9,30 @@ pub enum AppError {
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
 
+    /// Request body exceeded `server::MAX_REQUEST_BODY_BYTES`.
+    ///
+    /// Normally returned by `RequestBodyLimitLayer` at the edge, before any
+    /// body byte is read, as a plain `text/plain` 413. This variant covers
+    /// the in-stack backstop in `timing::min_duration_middleware`, which is
+    /// reachable for a chunked body carrying no `Content-Length`. The client
+    /// classifies on status rather than on the `reason` field, so the two
+    /// shapes are equivalent to it; the field is here for log and proxy
+    /// readability.
+    #[error("Payload too large")]
+    PayloadTooLarge,
+
+    /// The request body stopped arriving and `RequestBodyTimeoutLayer`
+    /// reclaimed the connection.
+    ///
+    /// Distinct from `PayloadTooLarge` because the two mean opposite things
+    /// to a client. An oversized body is a permanent input error and a retry
+    /// is pure cost. A stalled body is a network condition and a retry is the
+    /// correct response. Both surface as a body error out of
+    /// `axum::body::to_bytes`, and collapsing them meant a mobile client on a
+    /// flaky uplink was told its data was too large and lost the capture.
+    #[error("Request body timed out")]
+    RequestBodyTimeout,
+
     #[error("Unauthorized")]
     Unauthorized,
 
@@ -138,6 +162,14 @@ impl IntoResponse for AppError {
 
         let (status, message) = match &self {
             AppError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+            AppError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Verification data was too large to submit.".into(),
+            ),
+            AppError::RequestBodyTimeout => (
+                StatusCode::REQUEST_TIMEOUT,
+                "The connection stalled while sending your verification. Please try again.".into(),
+            ),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".into()),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limited".into()),
             AppError::IpRateLimited { .. } => unreachable!("handled above"),
@@ -199,6 +231,21 @@ impl IntoResponse for AppError {
                 json!({
                     "error": message,
                     "reason": r,
+                })
+            }
+            AppError::PayloadTooLarge => {
+                json!({
+                    "error": message,
+                    "reason": "payload_too_large",
+                })
+            }
+            AppError::RequestBodyTimeout => {
+                json!({
+                    "error": message,
+                    // Reuses the SDK's client-origin timeout reason on
+                    // purpose: no verdict was rendered on this capture, so it
+                    // must not consume the wallet's verification budget.
+                    "reason": "validation_timeout",
                 })
             }
             _ => json!({ "error": message }),
