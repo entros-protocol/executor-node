@@ -5,7 +5,10 @@ use axum::routing::{get, post};
 use axum::Router;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::RequestBodyTimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::attestation::handler::attest_handler;
@@ -165,6 +168,31 @@ async fn attest_rate_limit_middleware(
     Ok(next.run(request).await)
 }
 
+/// Largest request body the executor accepts, in bytes.
+///
+/// The `/validate-features` body is the only one that approaches it. At the
+/// SDK's canonical 16 kHz and its 20 s transmitted-capture cap
+/// (`pulse-sdk` `MAX_TRANSMITTED_CAPTURE_MS`), the base64 audio is at most
+/// 640,000 raw bytes expanded 4/3, which leaves room for the 308-element
+/// feature vector, the two contours and the curve-trace outline.
+///
+/// Enforced three ways, all reading this one constant: `RequestBodyLimitLayer`
+/// rejects on `Content-Length` before a byte is read, the same layer caps the
+/// stream when that header is absent, and `DefaultBodyLimit` bounds what an
+/// extractor will buffer.
+pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
+
+/// How long a request body may go without delivering a frame before the
+/// connection is reclaimed.
+///
+/// This is an inactivity timeout, not a total-duration budget:
+/// `RequestBodyTimeoutLayer` resets it every time a frame arrives. A slow
+/// uplink that is still making progress is never killed, which is the whole
+/// point. The mobile failure this replaces was a healthy 9.4 s upload
+/// aborted by a fixed deadline. A genuinely stalled upload no longer holds a
+/// task and its partial buffer indefinitely.
+pub const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
     // Attest route with its own tighter rate limit (10/min)
     let attest_route = Router::new()
@@ -179,6 +207,22 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
     // wall-time as a successful validator round-trip. /challenge and /attest
     // stay off this path: their UX hits the user-perceptible latency budget
     // and their outcomes are already wallet-attributable.
+    //
+    // Layer order here is a security control, not a style choice.
+    // `route_layer` applies outermost-last, so this reads inside-out and the
+    // effective order is auth → min_duration → rate_limit → handler.
+    //
+    //   min_duration stays OUTSIDE rate_limit, because clamping the
+    //   sub-10ms rate-limit and quota rejections up to the validator's
+    //   5-8s is the entire reason the clamp exists. Moving it inside
+    //   reopens the oracle.
+    //
+    //   min_duration sits INSIDE auth, because it drains the request body
+    //   before starting its clock (see `timing::min_duration_middleware`).
+    //   Outside auth it would buffer bodies for callers holding no valid
+    //   key, which is the resource-exhaustion path this stack is meant to
+    //   close. Auth failures are already distinguishable by their 401, so
+    //   leaving them unclamped reveals nothing new.
     let timed_routes = Router::new()
         .route("/verify", post(verify_handler))
         .route("/validate-features", post(validate_features_handler))
@@ -186,11 +230,11 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
             state.clone(),
             rate_limit_middleware,
         ))
+        .route_layer(middleware::from_fn(crate::timing::min_duration_middleware))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
-        ))
-        .route_layer(middleware::from_fn(crate::timing::min_duration_middleware));
+        ));
 
     // Untimed authenticated routes: /challenge issues nonces (fast by design,
     // user-blocking before the verify call) and /attest already exposes its
@@ -265,13 +309,21 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
         // no per-wallet or per-API-key data. See `status/metrics_handler.rs`.
         .route("/metrics", get(metrics_handler))
         .merge(verify_routes)
-        // 1MB covers the MAX_CAPTURE_MS=60s path from the SDK plus the
-        // base64-encoded audio payload for phrase content binding (#89):
-        // 12s @ 16kHz × 2 bytes × 4/3 base64 overhead ≈ 512KB. The 134-
-        // element feature vector + F0/accel time-series still fit under the
-        // previous 256KB; audio is the only reason to grow the limit.
-        // Rate-limiting (60/min/key) bounds DoS exposure regardless.
-        .layer(DefaultBodyLimit::max(1_048_576))
+        // Extractor-level backstop. `DefaultBodyLimit` is a request
+        // extension that `Json`/`Bytes` consult while buffering, NOT a
+        // Service. Axum's own docs say so and recommend `tower_http::limit`
+        // for untrusted remotes. On its own it bounds nothing before an
+        // extractor runs, which is why the real limit is the layer below.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // Reclaim a stalled upload. Applied inside the size limit so only
+        // bodies that passed the cheap `Content-Length` check get wrapped.
+        .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_READ_TIMEOUT))
+        // The actual size limit. Rejects with 413 straight from the
+        // `Content-Length` header before reading any of the body, and caps
+        // the stream when the header is absent. Outermost of the three so
+        // an oversized upload never reaches auth, the rate limiters, or the
+        // body-buffering inside `min_duration_middleware`.
+        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
