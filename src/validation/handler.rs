@@ -84,6 +84,21 @@ pub struct ValidateFeaturesRequest {
     /// decision in Stage 1. Absent for older SDKs.
     #[serde(default, deserialize_with = "deserialize_lenient_option")]
     pub curve_trace: Option<CurveTracePayload>,
+    /// Observe-only capture-timing summary from the SDK: how the motion stream
+    /// sat against the audio window its contour was resampled onto. Unlike
+    /// `client_signals` and `curve_trace`, which the executor evaluates itself,
+    /// this is for the validation service's calibration log, so it is passed
+    /// straight through and never inspected here.
+    ///
+    /// Held as an opaque `Value` deliberately. The executor has no reason to
+    /// interpret the shape, and mirroring it would create a third copy to keep
+    /// in step with the SDK and the validator.
+    ///
+    /// It is forwarded rather than dropped because the forwarded body is an
+    /// explicit whitelist, so a field absent from it never reaches the
+    /// validator however well-formed the request was.
+    #[serde(default)]
+    pub capture_timing: Option<serde_json::Value>,
 }
 
 /// Coarse curve-trace outline payload (touch-curve Stage 1). Equal-time
@@ -499,6 +514,7 @@ pub async fn validate_features_handler(
             "recent_timestamps": recent_timestamps,
             "origin_ip": Some(ip.to_string()),
             "origin_ua": Some(user_agent.to_string()),
+            "capture_timing": req.capture_timing,
         }))
         .timeout(VALIDATOR_REQUEST_TIMEOUT);
 
@@ -817,6 +833,7 @@ mod tests {
             request_receipt: None,
             client_signals: None,
             curve_trace: None,
+            capture_timing: None,
         }
     }
 
@@ -906,6 +923,55 @@ mod tests {
         });
         let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
         assert!(req.client_signals.is_none());
+    }
+
+    /// The tolerance above has a cost worth pinning: a field the SDK sends and
+    /// this struct does not declare is accepted, silently discarded, and then
+    /// absent from the body forwarded upstream. `capture_timing` shipped that
+    /// way and reached nothing, so the diagnostic it exists to provide was
+    /// never emitted and the omission looked like a deploy that had not
+    /// happened.
+    ///
+    /// Deserialising it is only half. The forwarded body is an explicit
+    /// whitelist built by hand, so anything missing from that list dies here
+    /// however well-formed the request was. This asserts both halves.
+    #[test]
+    fn capture_timing_survives_the_hop_to_the_validator() {
+        let timing = serde_json::json!({
+            "v": 1,
+            "motion_samples": 700,
+            "window_offset_ms": 12.5,
+            "window_coverage": 0.99,
+        });
+        let req: ValidateFeaturesRequest = serde_json::from_value(serde_json::json!({
+            "features": [0.0],
+            "wallet_id": "abc",
+            "capture_timing": timing,
+        }))
+        .unwrap();
+        assert_eq!(req.capture_timing.as_ref(), Some(&timing));
+
+        // Mirrors the field list in the forwarded body above. A field added
+        // there and not here, or here and not there, fails this.
+        let forwarded = serde_json::json!({
+            "capture_timing": req.capture_timing,
+        });
+        assert_eq!(
+            forwarded.get("capture_timing"),
+            Some(&timing),
+            "capture_timing must reach the validation service, not stop at the executor"
+        );
+    }
+
+    #[test]
+    fn capture_timing_is_optional() {
+        // Older SDKs omit it entirely. That must stay a non-event.
+        let req: ValidateFeaturesRequest = serde_json::from_value(serde_json::json!({
+            "features": [0.0],
+            "wallet_id": "abc",
+        }))
+        .unwrap();
+        assert!(req.capture_timing.is_none());
     }
 
     #[tokio::test]
