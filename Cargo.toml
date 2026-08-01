@@ -17,7 +17,11 @@ borsh = { version = "1", features = ["derive"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.6", features = ["cors", "limit", "timeout", "trace"] }
+# Needed to name `LengthLimitError` when classifying a body-read failure.
+# Already in the tree via axum and tower-http; declared so the downcast in
+# `timing::classify_body_error` does not depend on a transitive path.
+http-body-util = "0.1"
 thiserror = "2"
 rand = "0.8"
 subtle = "2"
@@ -31,3 +35,7 @@ reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+# `test-util` gives `#[tokio::test(start_paused = true)]`, which lets the
+# timing tests assert against the real 4-second clamp in virtual time.
+# `full` does not include it. Dev-only, so it stays out of the binary.
+tokio = { version = "1", features = ["test-util"] }
