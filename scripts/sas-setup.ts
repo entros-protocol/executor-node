@@ -2,7 +2,12 @@
  * One-time setup script: Create Entros credential + schema on Solana devnet
  * for the Solana Attestation Service (SAS) integration.
  *
- * Run: cd executor-node/scripts && npm install && npm run setup
+ * Run: cd executor-node/scripts && npm install
+ *      CREDENTIAL_NAME=<name> SCHEMA_NAME=<name> npm run setup
+ *
+ * Both names are REQUIRED and both are permanent once created. A credential
+ * PDA derives from authority plus name, so a different name means a different
+ * account, not an edit to an existing one.
  *
  * Prerequisites:
  *   - Relayer keypair at ../relayer-keypair.json (or RELAYER_KEYPAIR_PATH env var)
@@ -88,11 +93,31 @@ async function main() {
 
   // 1. Create Entros Credential
   console.log("\n--- Creating Entros Credential ---");
-  const credentialName = "entros-protocol";
+
+  // Required, with no default. A credential PDA derives from authority plus
+  // name, so changing the name silently targets a different account. This
+  // script once defaulted to "entros-protocol" while the live devnet
+  // credential is named "iam-protocol", which meant running it created a
+  // second credential rather than reporting the first. Neither a credential
+  // name nor a schema name can be changed after creation, so the value is
+  // permanent and must be chosen deliberately.
+  const credentialName = process.env.CREDENTIAL_NAME;
+  if (!credentialName) {
+    console.error(
+      "CREDENTIAL_NAME is required.\n" +
+        "  Live devnet credential: iam-protocol " +
+        "(GaPTkZC6JEGds1G5h645qyUrogx7NWghR2JgjvKQwTDo)\n" +
+        "  For a new mainnet credential, choose the name you want to keep forever.\n" +
+        "  For a throwaway test credential, use something obviously disposable.",
+    );
+    process.exit(1);
+  }
+
   const [credentialPda] = await deriveCredentialPda({
     authority: authority.address,
     name: credentialName,
   });
+  console.log(`Credential name: ${credentialName}`);
   console.log(`Credential PDA: ${credentialPda}`);
 
   const credentialAccount = await rpc.getAccountInfo(credentialPda, { encoding: "base64" }).send();
@@ -113,7 +138,20 @@ async function main() {
 
   // 2. Create Entros Schema
   console.log("\n--- Creating Entros Schema ---");
-  const schemaName = "iam-humanity-v2";
+
+  // Same rule as the credential name. The live devnet schema is
+  // "iam-humanity-v2" at EPkajiGQjycPwcc3pupqExVdAmSfxWd31tRYZezd8c5g, with
+  // the description "IAM Protocol Proof-of-Humanity attestation". The
+  // description below no longer matches it. Descriptions are mutable through
+  // ChangeSchemaDescription, names are not.
+  const schemaName = process.env.SCHEMA_NAME;
+  if (!schemaName) {
+    console.error(
+      "SCHEMA_NAME is required. Live devnet schema: iam-humanity-v2 " +
+        "(EPkajiGQjycPwcc3pupqExVdAmSfxWd31tRYZezd8c5g)",
+    );
+    process.exit(1);
+  }
   const schemaVersion = 1;
   const [schemaPda] = await deriveSchemaPda({
     credential: credentialPda,
