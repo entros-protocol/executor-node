@@ -17,7 +17,7 @@ mod validation;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use attestation::sas::SasAttestor;
+use attestation::sas::{parse_credential_authorized_signers, SasAttestor};
 use auth::cross_wallet_cooldown::CrossWalletCooldownTracker;
 use challenge::registry::ChallengeNonceRegistry;
 use config::Config;
@@ -211,6 +211,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|_| "Relayer keypair bytes failed to parse for SAS fallback")?
                 }
             };
+            // Confirm the configured authority is actually an authorized
+            // signer on the credential before serving traffic. Without this
+            // a wrong key boots clean and then fails every attestation at
+            // send time with SignerNotAuthorized — once per user, after the
+            // user has already paid the fee and minted on chain. A key
+            // rotation is exactly the operation that can produce that state.
+            //
+            // Fail closed on a definite answer, open on an unknown one: a
+            // decoded list that omits the authority is a configuration error
+            // and must stop production, while an unreadable account is an RPC
+            // problem and must not make the executor's availability depend on
+            // devnet responding at start-up.
+            match solana_client.get_account_data(cred).await {
+                Ok(Some(data)) => match parse_credential_authorized_signers(&data) {
+                    Ok(signers) if signers.contains(&authority.pubkey()) => {
+                        tracing::info!(
+                            credential = %cred,
+                            authorized_signers = signers.len(),
+                            "SAS authority confirmed as an authorized signer"
+                        );
+                    }
+                    Ok(signers) => {
+                        let message = format!(
+                            "SAS authority {} is not an authorized signer on credential {} \
+                             ({} signer(s) registered). Every attestation would fail at send \
+                             time. Add it with ChangeAuthorizedSigners before starting.",
+                            authority.pubkey(),
+                            cred,
+                            signers.len()
+                        );
+                        if environment == "prod" {
+                            return Err(message.into());
+                        }
+                        tracing::warn!(environment, "{message}");
+                    }
+                    Err(e) => {
+                        let message = format!(
+                            "Could not decode SAS credential {cred} to verify the authority: {e}"
+                        );
+                        if environment == "prod" {
+                            return Err(message.into());
+                        }
+                        tracing::warn!(environment, "{message}");
+                    }
+                },
+                Ok(None) => {
+                    let message =
+                        format!("SAS credential {cred} does not exist on the configured cluster");
+                    if environment == "prod" {
+                        return Err(message.into());
+                    }
+                    tracing::warn!(environment, "{message}");
+                }
+                Err(e) => {
+                    // RPC failure. Unknown, not wrong — start anyway.
+                    tracing::warn!(
+                        credential = %cred,
+                        error = %e,
+                        "Could not read the SAS credential to verify the authority, continuing"
+                    );
+                }
+            }
+
             tracing::info!(
                 credential = %cred,
                 schema = %schema,

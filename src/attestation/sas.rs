@@ -229,6 +229,75 @@ fn check_attestation_freshness(ts: i64, now: i64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Discriminator byte the SAS program writes at offset 0 of a Credential
+/// account. Checked before the offsets below are trusted, so a Schema or
+/// Attestation account passed by mistake is rejected rather than decoded
+/// into a nonsense signer list.
+const SAS_CREDENTIAL_DISCRIMINATOR: u8 = 0;
+
+/// Decode the `authorized_signers` list from a raw SAS Credential account.
+///
+/// Only a key in this list may sign `CreateAttestation` or
+/// `CloseAttestation` against the credential, so it is the authority the
+/// executor must hold to issue attestations at all.
+///
+/// Layout (Solana Attestation Service `Credential`):
+///   1 byte:  discriminator (0)
+///  32 bytes: authority (Pubkey) — the key that may change this list
+///   4 bytes: name length (u32 LE) + N bytes: name (UTF-8)
+///   4 bytes: signer count (u32 LE) + 32 bytes per signer
+///
+/// The authority is deliberately not returned. It cannot be changed by any
+/// instruction the program exposes, so nothing at runtime can act on it.
+pub fn parse_credential_authorized_signers(data: &[u8]) -> Result<Vec<Pubkey>, String> {
+    if data.first() != Some(&SAS_CREDENTIAL_DISCRIMINATOR) {
+        return Err("SAS credential discriminator mismatch (not a Credential account)".to_string());
+    }
+
+    // Discriminator + authority, then the name's length prefix.
+    let mut offset = 1 + 32;
+    let name_len = read_u32_le(data, offset)? as usize;
+    offset = offset
+        .checked_add(4 + name_len)
+        .ok_or("SAS credential name length overflows the buffer")?;
+
+    let signer_count = read_u32_le(data, offset)? as usize;
+    offset = offset
+        .checked_add(4)
+        .ok_or("SAS credential signer count overflows the buffer")?;
+
+    // Reject an implausible count before allocating against it.
+    let available = data.len().saturating_sub(offset);
+    if signer_count.saturating_mul(32) > available {
+        return Err(format!(
+            "SAS credential declares {signer_count} signers but only {available} bytes remain"
+        ));
+    }
+
+    let mut signers = Vec::with_capacity(signer_count);
+    for _ in 0..signer_count {
+        let bytes: [u8; 32] = data
+            .get(offset..offset + 32)
+            .ok_or("SAS credential signer list is truncated")?
+            .try_into()
+            .map_err(|_| "SAS credential signer is not 32 bytes")?;
+        signers.push(Pubkey::from(bytes));
+        offset += 32;
+    }
+
+    Ok(signers)
+}
+
+/// Read a little-endian u32 at `offset`, or describe why it is unreadable.
+fn read_u32_le(data: &[u8], offset: usize) -> Result<u32, String> {
+    let bytes: [u8; 4] = data
+        .get(offset..offset.checked_add(4).ok_or("offset overflow")?)
+        .ok_or_else(|| format!("SAS credential truncated at offset {offset}"))?
+        .try_into()
+        .map_err(|_| "SAS credential length prefix is not 4 bytes")?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
 /// Deserialize trust_score and last_verification_timestamp from raw IdentityState account data.
 ///
 /// Layout (from protocol-core entros-anchor):
@@ -414,5 +483,99 @@ mod tests {
         // has timestamp 0. Age = now, far beyond the window → rejected.
         let now = 1_700_000_000;
         assert_eq!(check_attestation_freshness(0, now), Err("stale"));
+    }
+
+    // --- parse_credential_authorized_signers ---
+
+    /// Build a SAS Credential account body with the given name and signers.
+    fn credential_bytes(name: &str, signers: &[Pubkey]) -> Vec<u8> {
+        let mut data = vec![SAS_CREDENTIAL_DISCRIMINATOR];
+        data.extend_from_slice(Pubkey::new_unique().as_ref()); // authority
+        data.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        data.extend_from_slice(name.as_bytes());
+        data.extend_from_slice(&(signers.len() as u32).to_le_bytes());
+        for s in signers {
+            data.extend_from_slice(s.as_ref());
+        }
+        data
+    }
+
+    #[test]
+    fn credential_decodes_single_signer_and_matches_live_account_size() {
+        let signer = Pubkey::new_unique();
+        let data = credential_bytes("iam-protocol", &[signer]);
+
+        // The live devnet credential reports space = 85. A fixture built from
+        // this layout with the same name and one signer must land on the same
+        // size, which cross-checks the offsets against the real account
+        // without pinning a devnet snapshot that would go stale.
+        assert_eq!(data.len(), 85);
+
+        let signers = parse_credential_authorized_signers(&data).expect("valid credential");
+        assert_eq!(signers, vec![signer]);
+    }
+
+    #[test]
+    fn credential_decodes_two_signers() {
+        // The overlap state during a rotation: outgoing and incoming keys
+        // both authorized, so neither issuance nor closure breaks mid-swap.
+        let outgoing = Pubkey::new_unique();
+        let incoming = Pubkey::new_unique();
+        let data = credential_bytes("iam-protocol", &[outgoing, incoming]);
+
+        assert_eq!(data.len(), 85 + 32);
+
+        let signers = parse_credential_authorized_signers(&data).expect("valid credential");
+        assert_eq!(signers, vec![outgoing, incoming]);
+        assert!(signers.contains(&incoming));
+    }
+
+    #[test]
+    fn credential_rejects_wrong_discriminator() {
+        // Discriminator 1 is a Schema account. Pointing SAS_CREDENTIAL_PDA at
+        // the schema is an easy environment-variable slip, and decoding it as
+        // a credential would yield an arbitrary signer list.
+        let mut data = credential_bytes("iam-protocol", &[Pubkey::new_unique()]);
+        data[0] = 1;
+        assert!(parse_credential_authorized_signers(&data).is_err());
+    }
+
+    #[test]
+    fn credential_rejects_empty_buffer() {
+        assert!(parse_credential_authorized_signers(&[]).is_err());
+    }
+
+    #[test]
+    fn credential_rejects_truncated_signer_list() {
+        let mut data = credential_bytes("iam-protocol", &[Pubkey::new_unique()]);
+        data.truncate(data.len() - 1);
+        assert!(parse_credential_authorized_signers(&data).is_err());
+    }
+
+    #[test]
+    fn credential_rejects_signer_count_that_overruns_the_buffer() {
+        // A corrupt or hostile count must not drive a huge allocation before
+        // the read fails.
+        let mut data = credential_bytes("iam-protocol", &[Pubkey::new_unique()]);
+        let count_offset = 1 + 32 + 4 + "iam-protocol".len();
+        data[count_offset..count_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_credential_authorized_signers(&data).is_err());
+    }
+
+    #[test]
+    fn credential_rejects_name_length_that_overruns_the_buffer() {
+        let mut data = credential_bytes("iam-protocol", &[Pubkey::new_unique()]);
+        data[33..37].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(parse_credential_authorized_signers(&data).is_err());
+    }
+
+    #[test]
+    fn credential_with_no_signers_decodes_empty() {
+        // Structurally valid, operationally dead: nothing can issue against
+        // it. The decoder reports the truth and the startup preflight is what
+        // refuses the boot.
+        let data = credential_bytes("iam-protocol", &[]);
+        let signers = parse_credential_authorized_signers(&data).expect("valid credential");
+        assert!(signers.is_empty());
     }
 }
