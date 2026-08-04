@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "setup": "npx tsx sas-setup.ts",
-    "sign-url": "npx tsx sign-validator-url.ts"
+    "sign-url": "npx tsx sign-validator-url.ts",
+    "rotate-sas": "npx tsx rotate-sas-authority.ts"
   },
   "dependencies": {
     "sas-lib": "^1.0.10",
