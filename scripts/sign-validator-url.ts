@@ -13,7 +13,7 @@
  *   npx tsx sign-validator-url.ts <keypair-path> <url>
  *
  * Example:
- *   npx tsx sign-validator-url.ts /Users/johnny/IAM/.config/admin-devnet.json \
+ *   npx tsx sign-validator-url.ts ../../.config/admin-devnet.json \
  *     http://serene-possibility.railway.internal:8080
  */
 
