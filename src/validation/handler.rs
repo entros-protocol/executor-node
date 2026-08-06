@@ -823,7 +823,7 @@ mod tests {
     /// two copies would silently diverge the moment a field is added.
     pub(super) fn baseline_request(wallet_id: String) -> ValidateFeaturesRequest {
         ValidateFeaturesRequest {
-            features: vec![0.0; 134],
+            features: vec![0.0; 308],
             wallet_id,
             f0_contour: None,
             accel_magnitude: None,
