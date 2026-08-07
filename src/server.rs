@@ -193,7 +193,7 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 /// task and its partial buffer indefinitely.
 pub const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
+pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) -> Router {
     // Attest route with its own tighter rate limit (10/min)
     let attest_route = Router::new()
         .route("/attest", post(attest_handler))
@@ -274,16 +274,7 @@ pub fn create_router(state: AppState, cors_origins: &[String]) -> Router {
         // No origins configured — permissive for development
         CorsLayer::permissive()
     } else {
-        let parsed: Vec<axum::http::HeaderValue> = cors_origins
-            .iter()
-            .filter_map(|o| match o.parse() {
-                Ok(v) => Some(v),
-                Err(_) => {
-                    tracing::warn!(origin = %o, "Ignoring unparseable CORS origin");
-                    None
-                }
-            })
-            .collect();
+        let parsed = cors_origins.to_vec();
         tracing::info!(
             count = parsed.len(),
             "CORS restricted to configured origins"

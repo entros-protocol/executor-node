@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let config = Config::from_env()?;
-    let environment = std::env::var("ENVIRONMENT").unwrap_or_else(|_| "dev".into());
+    let environment = config.environment;
 
     // Capture relayer keypair bytes BEFORE moving the keypair into SolanaClient.
     // The bytes are only needed for the dev-mode SAS authority fallback below
@@ -93,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // prod, every key should have an explicit name + quota declared via
     // `INTEGRATORS`.
     let integrator_count = config.integrators.len();
-    if environment == "prod" && integrator_count == 0 {
+    if environment.is_prod() && integrator_count == 0 {
         return Err(
             "INTEGRATORS must be populated when ENVIRONMENT=prod (prod_mode_requires_integrators). \
              API_KEYS alone is not sufficient — keys would auto-register at the dev-mode free-tier \
@@ -125,7 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Challenge nonce registry initialized"
     );
 
-    let cross_wallet_cooldown = Arc::new(CrossWalletCooldownTracker::new(config.cross_wallet_cooldown_secs));
+    let cross_wallet_cooldown = Arc::new(CrossWalletCooldownTracker::new(
+        config.cross_wallet_cooldown_secs,
+    ));
     tracing::info!(
         cooldown_secs = config.cross_wallet_cooldown_secs,
         enforce = config.cross_wallet_cooldown_enforce,
@@ -155,10 +157,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // signing tool. Use `scripts/sign-validator-url.ts` to produce signatures.
     if let Some(url) = &config.validation_service_url {
         match (
-            environment.as_str(),
+            environment.is_prod(),
             &config.validation_service_url_signature,
         ) {
-            ("prod", None) => {
+            (true, None) => {
                 return Err(
                     "VALIDATION_SERVICE_URL_SIGNATURE is required when ENVIRONMENT=prod \
                      (refusing to launch with an unsigned validator URL — sign with \
@@ -170,20 +172,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config::verify_validation_url_signature(url, sig)?;
                 tracing::info!(url = %url, "Validation service configured (URL signature verified)");
             }
-            (_, None) => {
+            (false, None) => {
                 tracing::info!(url = %url, "Validation service configured (dev mode, no URL signature)");
             }
         }
-    } else if environment == "prod" {
+    } else if environment.is_prod() {
         // Fail closed: in prod an unset VALIDATION_SERVICE_URL would make the request
         // handler pass every submission through as valid without any validation running.
         // Refuse to launch rather than silently accept unvalidated traffic.
-        return Err(
-            "VALIDATION_SERVICE_URL is required when ENVIRONMENT=prod \
+        return Err("VALIDATION_SERVICE_URL is required when ENVIRONMENT=prod \
              (refusing to launch without a validator — unvalidated requests \
              would otherwise be accepted as valid)"
-                .into(),
-        );
+            .into());
     } else {
         tracing::info!("Validation service not configured (VALIDATION_SERVICE_URL not set)");
     }
@@ -198,13 +198,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let authority = match config.sas_authority_keypair {
                 Some(k) => k,
                 None => {
-                    if environment == "prod" {
+                    if environment.is_prod() {
                         return Err("SAS_AUTHORITY_KEYPAIR is required when ENVIRONMENT=prod \
                              (refusing to use relayer keypair as SAS authority in production)"
                             .into());
                     }
                     tracing::warn!(
-                        environment,
+                        environment = ?environment,
                         "SAS authority keypair not set, falling back to relayer keypair (non-prod)"
                     );
                     Keypair::try_from(relayer_keypair_bytes.as_slice())
@@ -241,28 +241,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cred,
                             signers.len()
                         );
-                        if environment == "prod" {
+                        if environment.is_prod() {
                             return Err(message.into());
                         }
-                        tracing::warn!(environment, "{message}");
+                        tracing::warn!(environment = ?environment, "{message}");
                     }
                     Err(e) => {
                         let message = format!(
                             "Could not decode SAS credential {cred} to verify the authority: {e}"
                         );
-                        if environment == "prod" {
+                        if environment.is_prod() {
                             return Err(message.into());
                         }
-                        tracing::warn!(environment, "{message}");
+                        tracing::warn!(environment = ?environment, "{message}");
                     }
                 },
                 Ok(None) => {
                     let message =
                         format!("SAS credential {cred} does not exist on the configured cluster");
-                    if environment == "prod" {
+                    if environment.is_prod() {
                         return Err(message.into());
                     }
-                    tracing::warn!(environment, "{message}");
+                    tracing::warn!(environment = ?environment, "{message}");
                 }
                 Err(e) => {
                     // RPC failure. Unknown, not wrong — start anyway.

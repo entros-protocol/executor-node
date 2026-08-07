@@ -1,3 +1,4 @@
+use axum::http::{HeaderValue, Uri};
 use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signature};
@@ -70,6 +71,55 @@ fn parse_bool(value: Option<&str>, default: bool) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Environment {
+    Dev,
+    Prod,
+}
+
+impl Environment {
+    fn parse(value: Option<&str>) -> Result<Self, String> {
+        match value.unwrap_or("dev") {
+            "dev" => Ok(Self::Dev),
+            "prod" => Ok(Self::Prod),
+            other => Err(format!(
+                "ENVIRONMENT must be either dev or prod, got {other:?}"
+            )),
+        }
+    }
+
+    pub fn is_prod(self) -> bool {
+        self == Self::Prod
+    }
+}
+
+fn parse_cors_origins(
+    values: Vec<String>,
+    environment: Environment,
+) -> Result<Vec<HeaderValue>, String> {
+    if environment.is_prod() && values.is_empty() {
+        return Err("CORS_ORIGINS must contain at least one origin when ENVIRONMENT=prod".into());
+    }
+
+    values
+        .into_iter()
+        .map(|value| {
+            let uri: Uri = value
+                .parse()
+                .map_err(|_| format!("CORS_ORIGINS contains an invalid origin: {value:?}"))?;
+            let valid_scheme = matches!(uri.scheme_str(), Some("http" | "https"));
+            let valid_path = uri.path() == "/" && uri.query().is_none();
+            if !valid_scheme || uri.authority().is_none() || !valid_path {
+                return Err(format!(
+                    "CORS_ORIGINS entries must be HTTP origins without paths: {value:?}"
+                ));
+            }
+            HeaderValue::from_str(&value)
+                .map_err(|_| format!("CORS_ORIGINS contains an invalid header value: {value:?}"))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,6 +137,38 @@ mod tests {
         assert!(!parse_bool(None, false));
         assert!(parse_bool(Some("garbage"), true));
         assert!(!parse_bool(Some("garbage"), false));
+    }
+
+    #[test]
+    fn environment_rejects_unknown_values() {
+        assert_eq!(Environment::parse(None).unwrap(), Environment::Dev);
+        assert_eq!(Environment::parse(Some("dev")).unwrap(), Environment::Dev);
+        assert_eq!(Environment::parse(Some("prod")).unwrap(), Environment::Prod);
+        assert!(Environment::parse(Some("production")).is_err());
+        assert!(Environment::parse(Some("Prod")).is_err());
+    }
+
+    #[test]
+    fn production_requires_valid_cors_origins() {
+        assert!(parse_cors_origins(Vec::new(), Environment::Prod).is_err());
+        assert!(parse_cors_origins(vec!["*".into()], Environment::Prod).is_err());
+        assert!(
+            parse_cors_origins(vec!["https://entros.io/path".into()], Environment::Prod).is_err()
+        );
+
+        let parsed = parse_cors_origins(
+            vec!["https://entros.io".into(), "http://localhost:3000".into()],
+            Environment::Prod,
+        )
+        .unwrap();
+        assert_eq!(parsed.len(), 2);
+    }
+
+    #[test]
+    fn development_can_use_permissive_cors() {
+        assert!(parse_cors_origins(Vec::new(), Environment::Dev)
+            .unwrap()
+            .is_empty());
     }
 
     fn sign(authority: &Keypair, url: &str) -> String {
@@ -165,6 +247,7 @@ pub struct IntegratorConfig {
 }
 
 pub struct Config {
+    pub environment: Environment,
     pub rpc_url: String,
     pub ws_url: String,
     pub relayer_keypair: Keypair,
@@ -182,7 +265,7 @@ pub struct Config {
     /// edge layer rewrites the header on every inbound request.
     pub per_ip_rate_limit_per_minute: u32,
     pub integrators: Vec<IntegratorConfig>,
-    pub cors_origins: Vec<String>,
+    pub cors_origins: Vec<HeaderValue>,
     pub sas_credential_pda: Option<Pubkey>,
     pub sas_schema_pda: Option<Pubkey>,
     pub sas_attestation_ttl_days: u64,
@@ -242,6 +325,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, Box<dyn std::error::Error>> {
+        let environment = Environment::parse(std::env::var("ENVIRONMENT").ok().as_deref())?;
         let rpc_url =
             std::env::var("RPC_URL").unwrap_or_else(|_| "https://api.devnet.solana.com".into());
 
@@ -301,11 +385,12 @@ impl Config {
             api_keys
         };
 
-        let cors_origins: Vec<String> = match std::env::var("CORS_ORIGINS") {
+        let cors_origin_values: Vec<String> = match std::env::var("CORS_ORIGINS") {
             Ok(s) => serde_json::from_str(&s)
                 .map_err(|e| format!("CORS_ORIGINS contains invalid JSON: {e}"))?,
             Err(_) => vec![],
         };
+        let cors_origins = parse_cors_origins(cors_origin_values, environment)?;
 
         let sas_authority_keypair = if let Ok(json) = std::env::var("SAS_AUTHORITY_KEYPAIR") {
             let bytes: Vec<u8> = serde_json::from_str(&json)
@@ -370,14 +455,17 @@ impl Config {
         let wallet_reputation_observe = parse_bool_env("EXECUTOR_WALLET_REPUTATION_OBSERVE", true);
         let curve_trace_observe = parse_bool_env("EXECUTOR_CURVE_TRACE_OBSERVE", true);
 
-        let cross_wallet_cooldown_secs: u64 = std::env::var("VALIDATION_CROSS_WALLET_COOLDOWN_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(86400);
+        let cross_wallet_cooldown_secs: u64 =
+            std::env::var("VALIDATION_CROSS_WALLET_COOLDOWN_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(86400);
 
-        let cross_wallet_cooldown_enforce = parse_bool_env("VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE", false);
+        let cross_wallet_cooldown_enforce =
+            parse_bool_env("VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE", false);
 
         Ok(Config {
+            environment,
             rpc_url,
             ws_url,
             relayer_keypair,
