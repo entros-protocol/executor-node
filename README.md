@@ -1,87 +1,107 @@
 # executor-node
 
-Entros Protocol executor node. Validation server and relayer service for the Entros Protocol. Generates signed challenges, validates behavioral features server-side using proprietary models, issues SAS attestations, and relays walletless verification transactions to Solana.
+Authenticated gateway, challenge service, risk composer, SAS issuer, and Solana relayer for Entros.
 
-## Architecture
+The executor does not contain proprietary behavioral models. It forwards validation requests to the separate private `entros-validation` HTTP service.
 
-The executor serves two roles:
+## Responsibilities
 
-1. **Validation server**—receives a length-agnostic `Vec<f64>` of statistical features from the Pulse SDK (308 dimensions under the v3 layout: 170 audio + 81 motion + 57 touch). Runs proprietary validation models (loaded from the private `entros-validation` crate), performs cross-wallet Sybil detection via the fingerprint registry, and issues signed challenges.
+- Authenticate integrators and enforce quotas.
+- Issue and consume challenge nonces.
+- Apply request, wallet, and IP rate limits.
+- Forward feature summaries and phrase audio to the private validator.
+- Combine returned risk signals under the configured policy.
+- Issue best-effort SAS attestations for eligible wallet flows.
+- Relay walletless proof transactions to Solana devnet.
+- Expose health and aggregate operational metrics.
 
-2. **Walletless relayer** — accepts ZK proofs and submits on-chain `create_challenge` + `verify_proof` for users without wallets (liveness-check tier). API key required. Walletless flows do not receive SAS attestations.
+The private validator performs feature checks, phrase transcription, acoustic analysis, and cross-wallet fingerprint comparison.
 
 ## API
 
-### POST /verify
+| Route | Auth | Purpose |
+|---|---|---|
+| `GET /challenge` | API key | Issue a server challenge and nonce |
+| `POST /validate-features` | API key | Forward capture evidence to the private validator |
+| `POST /verify` | API key | Relay a walletless Groth16 verification transaction |
+| `POST /attest` | API key and wallet proof | Issue a SAS attestation when configured |
+| `GET /health` | Public | Return service health |
+| `GET /status` | Optional API key | Return `status` publicly and detailed metrics to authenticated callers |
+| `GET /metrics` | Public | Return aggregate Prometheus counters |
 
-Accepts a Groth16 proof for walletless verification. Submits `create_challenge` + `verify_proof` on-chain.
+Walletless verification does not issue SAS attestations.
 
-```json
-Request:
-{
-  "proof_bytes": [0, 1, 2, ...],
-  "public_inputs": [[0, 1, ...], ...],
-  "commitment": [0, 1, ...]
-}
-
-Response:
-{
-  "success": true,
-  "tx_signature": "5abc..."
-}
-```
-
-Requires `X-API-Key` header (walletless tier only).
-
-### POST /attest
-
-Issues a Solana Attestation Service (SAS) attestation on a verified wallet. Requires the wallet to prove ownership via a signed message + server-issued nonce challenge — unauthenticated walletless flows do not reach this endpoint.
-
-### GET /status
-
-Returns service metrics (uptime, relayer balance, verifications processed).
-
-### GET /health
-
-Returns service status (no auth required).
-
-## Setup
+## Local development
 
 ```bash
-# Prerequisites: Rust, Solana CLI
-
-# Configure environment
 cp .env.example .env
-# Edit .env: set RPC_URL, RELAYER_KEYPAIR_PATH
-
-# Build
-cargo build --release
-
-# Run
-cargo run
-
-# Test
+cargo build
 cargo test
+cargo run
 ```
 
-## Environment Variables
+The example configuration uses `ENVIRONMENT=dev`. Without `VALIDATION_SERVICE_URL`, feature requests use an insecure local pass-through.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `RPC_URL` | `https://api.devnet.solana.com` | Solana RPC endpoint |
-| `WS_URL` | `wss://api.devnet.solana.com` | Solana WebSocket endpoint |
-| `RELAYER_KEYPAIR_PATH` | `./relayer-keypair.json` | Path to relayer keypair JSON |
-| `LISTEN_ADDR` | `0.0.0.0:3001` | Server bind address |
-| `API_KEYS` | `[]` | JSON array of valid API keys |
-| `RATE_LIMIT_PER_MINUTE` | `60` | Max requests per minute per API key |
-| `EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN` | `30` | Per-IP request cap, applied across all API keys and wallets |
-| `CORS_ORIGINS` | `[]` | JSON array of allowed origins (permissive if empty) |
-| `SAS_CREDENTIAL_PDA` | — | SAS credential PDA for attestation issuance |
-| `SAS_SCHEMA_PDA` | — | SAS schema PDA for attestation issuance |
-| `EXECUTOR_AUTOMATION_OBSERVE` | `true` | Log client automation signals for calibration. `0`/`false`/`no`/`off` to disable |
-| `EXECUTOR_WALLET_REPUTATION_OBSERVE` | `true` | Log a verifying wallet's public on-chain reputation for calibration. `0`/`false`/`no`/`off` to disable |
-| `EXECUTOR_CURVE_TRACE_OBSERVE` | `true` | Score the client's coarse curve-trace outline against the issued curve, detached off the request path. `0`/`false`/`no`/`off` to disable |
+That mode supports interface development only. It does not perform Entros behavioral validation.
+
+## Production startup boundary
+
+`ENVIRONMENT` accepts only `dev` or `prod`. Unknown values stop startup.
+
+Production requires:
+
+- At least one explicit `INTEGRATORS` entry.
+- A private `VALIDATION_SERVICE_URL`.
+- A valid `VALIDATION_SERVICE_URL_SIGNATURE`.
+- At least one valid `CORS_ORIGINS` entry.
+- A dedicated SAS authority when SAS credential fields are configured.
+
+Production refuses the dev validator pass-through and permissive CORS mode.
+
+## Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ENVIRONMENT` | `dev` | Exact runtime mode: `dev` or `prod` |
+| `RPC_URL` | Solana devnet | Solana RPC endpoint |
+| `WS_URL` | Solana devnet | Solana WebSocket endpoint |
+| `RELAYER_KEYPAIR` | unset | Relayer keypair JSON |
+| `RELAYER_KEYPAIR_PATH` | `./relayer-keypair.json` | Relayer keypair path |
+| `LISTEN_ADDR` | `0.0.0.0:3001` | Local bind address when `PORT` is absent |
+| `PORT` | unset | Platform-provided listen port |
+| `API_KEYS` | `[]` | Development API-key list |
+| `INTEGRATORS` | `[]` | Named API keys and explicit quotas |
+| `RATE_LIMIT_PER_MINUTE` | `60` | Per-key request limit |
+| `EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN` | `30` | Per-IP request limit |
+| `CORS_ORIGINS` | `[]` | Exact allowed HTTP origins |
+| `VALIDATION_SERVICE_URL` | unset | Private validator endpoint |
+| `VALIDATION_SERVICE_URL_SIGNATURE` | unset | Authority signature over the validator URL |
+| `VALIDATION_API_KEY` | unset | Credential sent to the private validator |
+| `CHALLENGE_TTL_SECS` | `60` | Challenge nonce lifetime |
+| `VALIDATION_WALLET_MAX_ATTEMPTS` | `5` | Failed attempts allowed per wallet window |
+| `VALIDATION_WALLET_WINDOW_SECS` | `3600` | Wallet attempt window |
+| `SAS_CREDENTIAL_PDA` | unset | SAS credential address |
+| `SAS_SCHEMA_PDA` | unset | SAS schema address |
+| `SAS_AUTHORITY_KEYPAIR` | unset | Dedicated SAS authority JSON |
+| `SAS_AUTHORITY_KEYPAIR_PATH` | unset | Dedicated SAS authority path |
+| `SAS_ATTESTATION_TTL_DAYS` | `30` | Attestation lifetime |
+| `EXECUTOR_AUTOMATION_OBSERVE` | `true` | Record bounded automation telemetry |
+| `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT` | `true` | Reject reported WebDriver sessions when validation runs |
+| `EXECUTOR_WALLET_REPUTATION_OBSERVE` | `true` | Record public wallet signals |
+| `EXECUTOR_CURVE_TRACE_OBSERVE` | `true` | Record bounded curve-trace telemetry |
+| `VALIDATION_CROSS_WALLET_COOLDOWN_SECS` | `86400` | Cross-wallet cooldown duration |
+| `VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE` | `false` | Enforce the cooldown when enabled |
+
+Do not place keypairs or API credentials in source control.
+
+## Verification
+
+```bash
+cargo fmt --all --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
 
 ## License
 
-MIT
+MIT.
