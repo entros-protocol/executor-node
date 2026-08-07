@@ -290,7 +290,7 @@ impl SolanaClient {
             commitment: Some(self.rpc.commitment()),
             ..Default::default()
         };
-        
+
         let sigs = match self
             .rpc
             .get_signatures_for_address_with_config(pubkey, config)

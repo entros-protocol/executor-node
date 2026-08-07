@@ -15,20 +15,8 @@ pub struct LissajousParams {
 impl LissajousParams {
     /// Generate random server-issued Lissajous parameters.
     pub fn generate() -> Self {
-        let ratios: [(u8, u8); 5] = [
-            (1, 2),
-            (2, 3),
-            (3, 4),
-            (3, 5),
-            (4, 5),
-        ];
-        let anchors: [(u16, u16); 5] = [
-            (0, 0),
-            (100, 0),
-            (0, 100),
-            (100, 100),
-            (50, 50),
-        ];
+        let ratios: [(u8, u8); 5] = [(1, 2), (2, 3), (3, 4), (3, 5), (4, 5)];
+        let anchors: [(u16, u16); 5] = [(0, 0), (100, 0), (0, 100), (100, 100), (50, 50)];
 
         let r_idx: usize = rand::random::<usize>() % ratios.len();
         let a_idx: usize = rand::random::<usize>() % anchors.len();

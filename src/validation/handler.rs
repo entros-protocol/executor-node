@@ -1,7 +1,7 @@
 use axum::extract::{ConnectInfo, State};
 use axum::http::HeaderMap;
-use axum::Json;
 use axum::Extension;
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 use std::net::SocketAddr;
@@ -195,7 +195,7 @@ pub struct ValidateFeaturesResponse {
     /// commitment for future rotation proofs. Present iff `signed_receipt` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salt_hex: Option<String>,
-    
+
     // Layer E Composite Risk Score
     pub composite_risk_score: f64,
 }
@@ -259,13 +259,19 @@ pub async fn validate_features_handler(
                 retry_after_secs,
                 "Probing blocklist active for client IP"
             );
-            return Err(AppError::IpRateLimited { retry_after_secs: retry_after_secs.max(1) });
+            return Err(AppError::IpRateLimited {
+                retry_after_secs: retry_after_secs.max(1),
+            });
         } else {
             state.probing_blocklist.remove(&ip);
         }
     }
 
-    if let Err(remaining_secs) = state.cross_wallet_cooldown.check_cooldown(ip, user_agent, &req.wallet_id) {
+    if let Err(remaining_secs) =
+        state
+            .cross_wallet_cooldown
+            .check_cooldown(ip, user_agent, &req.wallet_id)
+    {
         tracing::warn!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             ip = %crate::auth::redact::redact_ip(ip),
@@ -274,7 +280,9 @@ pub async fn validate_features_handler(
             "Cross-wallet verification cooldown active"
         );
         if state.cross_wallet_cooldown_enforce {
-            return Err(AppError::CrossWalletCooldownActive { retry_after_secs: remaining_secs });
+            return Err(AppError::CrossWalletCooldownActive {
+                retry_after_secs: remaining_secs,
+            });
         }
     }
 
@@ -431,7 +439,8 @@ pub async fn validate_features_handler(
     // hostile payload can neither burn CPU nor poison the calibration corpus. Runs
     // only when the client sent an outline and a curve is outstanding.
     if state.curve_trace_observe {
-        if let (Some(trace), Some((_, curve))) = (req.curve_trace.as_ref(), issued_challenge.as_ref())
+        if let (Some(trace), Some((_, curve))) =
+            (req.curve_trace.as_ref(), issued_challenge.as_ref())
         {
             let points = crate::challenge::curve_trace::sanitize_trace(&trace.points);
             let duration_ms = trace.duration_ms;
@@ -460,7 +469,12 @@ pub async fn validate_features_handler(
     // Fetch user's verification timestamps from on-chain IdentityState
     let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&wallet);
     let mut recent_timestamps = Vec::new();
-    if let Ok(Some(data)) = state.relayer_tx.client().get_account_data(&identity_pda).await {
+    if let Ok(Some(data)) = state
+        .relayer_tx
+        .client()
+        .get_account_data(&identity_pda)
+        .await
+    {
         const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
         if data.len() >= 8 && data[..8] == IDENTITY_DISCRIMINATOR {
             // Offset for recent_timestamps is 127
@@ -565,10 +579,7 @@ pub async fn validate_features_handler(
         }
     };
 
-    let (response_res, reputation_opt) = tokio::join!(
-        request.send(),
-        reputation_future
-    );
+    let (response_res, reputation_opt) = tokio::join!(request.send(), reputation_future);
 
     let response = match response_res {
         Ok(r) => r,
@@ -615,7 +626,8 @@ pub async fn validate_features_handler(
         // server-side from the raw audio the validator already receives; wiring
         // that into the composite (observe -> calibrate -> enforce) is tracked
         // in remaining-public-tasks.md Item #15.
-        let acoustic_eval = crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
+        let acoustic_eval =
+            crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
         if acoustic_eval.risk_score > 0.0 {
             tracing::info!(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -695,7 +707,7 @@ pub async fn validate_features_handler(
         // per-category hint. Other categories stay opaque end-to-end per
         // the 2026-04-29 directed-signal strip.
         const REASON_ALLOWLIST: &[&str] = &["phrase_content_mismatch"];
-        
+
         let err_body = response.json::<ValidatorErrorBody>().await.ok();
 
         // If probing was detected, insert into state.probing_blocklist
@@ -713,7 +725,12 @@ pub async fn validate_features_handler(
         let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
 
         let (biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match &err_body {
-            Some(body) => (body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
+            Some(body) => (
+                body.biometric_risk,
+                body.tts_risk,
+                body.temporal_risk,
+                body.audio_realism_risk,
+            ),
             None => (1.0, 0.0, 0.0, 0.0),
         };
 
@@ -750,8 +767,24 @@ pub async fn validate_features_handler(
     state.wallet_attempts.refund_on_success(&wallet);
 
     let parsed_body = response.json::<ValidatorSuccessBody>().await.ok();
-    let (signed_receipt, commitment_hex, salt_hex, biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match parsed_body {
-        Some(body) => (body.signed_receipt, body.commitment_hex, body.salt_hex, body.biometric_risk, body.tts_risk, body.temporal_risk, body.audio_realism_risk),
+    let (
+        signed_receipt,
+        commitment_hex,
+        salt_hex,
+        biometric_risk,
+        tts_risk,
+        temporal_risk,
+        audio_realism_risk,
+    ) = match parsed_body {
+        Some(body) => (
+            body.signed_receipt,
+            body.commitment_hex,
+            body.salt_hex,
+            body.biometric_risk,
+            body.tts_risk,
+            body.temporal_risk,
+            body.audio_realism_risk,
+        ),
         None => (None, None, None, 0.0, 0.0, 0.0, 0.0),
     };
 
@@ -815,8 +848,8 @@ pub async fn validate_features_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
     use crate::integrator::wallet_attempts::WalletAttemptTracker;
+    use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
 
     /// Shared by `validator_reached_tests` too. The literal names every field
     /// explicitly (no `..Default::default()`), so it must exist exactly once —
@@ -869,7 +902,9 @@ mod tests {
             "curve_trace": { "points": [[1.0, 2.0], [3.0, 4.0]], "duration_ms": 9000.0 },
         });
         let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
-        let ct = req.curve_trace.expect("well-formed curve_trace should parse");
+        let ct = req
+            .curve_trace
+            .expect("well-formed curve_trace should parse");
         assert_eq!(ct.points.len(), 2);
         assert_eq!(ct.duration_ms, 9000.0);
     }
@@ -1136,21 +1171,21 @@ mod tests {
         let tracker = WalletAttemptTracker::new(5, std::time::Duration::from_secs(3600));
         let wallet = Pubkey::new_unique();
         assert_eq!(tracker.get_attempts(&wallet), 0);
-        
+
         tracker.check_and_record_attempt(&wallet).unwrap();
         assert_eq!(tracker.get_attempts(&wallet), 1);
-        
+
         tracker.check_and_record_attempt(&wallet).unwrap();
         assert_eq!(tracker.get_attempts(&wallet), 2);
-        
+
         tracker.refund_on_success(&wallet);
         assert_eq!(tracker.get_attempts(&wallet), 1);
     }
 
     #[tokio::test]
     async fn test_probing_blocklist_handling() {
-        use axum::Extension;
         use axum::extract::ConnectInfo;
+        use axum::Extension;
         use std::net::{IpAddr, Ipv4Addr, SocketAddr};
         use std::time::{Duration, Instant};
 
@@ -1162,22 +1197,44 @@ mod tests {
         let headers = headers_with_key("test-key");
 
         // 1. Add IP to blocklist with future expiration
-        state.probing_blocklist.insert(client_ip, Instant::now() + Duration::from_secs(60));
+        state
+            .probing_blocklist
+            .insert(client_ip, Instant::now() + Duration::from_secs(60));
 
         let req1 = baseline_request(random_wallet_id());
-        let result1 = validate_features_handler(State(state.clone()), Some(peer), headers.clone(), Json(req1)).await;
-        
+        let result1 = validate_features_handler(
+            State(state.clone()),
+            Some(peer),
+            headers.clone(),
+            Json(req1),
+        )
+        .await;
+
         let is_ip_rate_limited = matches!(result1, Err(AppError::IpRateLimited { .. }));
-        assert!(is_ip_rate_limited, "Expected IpRateLimited due to active probing blocklist");
+        assert!(
+            is_ip_rate_limited,
+            "Expected IpRateLimited due to active probing blocklist"
+        );
 
         // 2. Modify blocklist entry to be expired
-        state.probing_blocklist.insert(client_ip, Instant::now() - Duration::from_secs(60));
+        state
+            .probing_blocklist
+            .insert(client_ip, Instant::now() - Duration::from_secs(60));
 
         let req2 = baseline_request(random_wallet_id());
-        let result2 = validate_features_handler(State(state.clone()), Some(peer), headers.clone(), Json(req2)).await;
-        
+        let result2 = validate_features_handler(
+            State(state.clone()),
+            Some(peer),
+            headers.clone(),
+            Json(req2),
+        )
+        .await;
+
         let is_ip_rate_limited = matches!(result2, Err(AppError::IpRateLimited { .. }));
-        assert!(!is_ip_rate_limited, "Expected request to bypass block list once expired");
+        assert!(
+            !is_ip_rate_limited,
+            "Expected request to bypass block list once expired"
+        );
         // It should have cleaned up the entry
         assert!(!state.probing_blocklist.contains_key(&client_ip));
     }

@@ -59,7 +59,9 @@ pub async fn fetch_wallet_reputation(
     if let Some(parent) = parent_opt {
         let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&parent);
         if let Ok(Some(identity_data)) = client.get_account_data(&identity_pda).await {
-            if let Ok(identity) = crate::attestation::sas::deserialize_identity_state(&identity_data) {
+            if let Ok(identity) =
+                crate::attestation::sas::deserialize_identity_state(&identity_data)
+            {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)

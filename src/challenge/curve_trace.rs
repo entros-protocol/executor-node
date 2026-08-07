@@ -317,8 +317,9 @@ fn score_region(trace: &[(f64, f64)], base: &[(f64, f64)], issued: (f64, f64)) -
         if anchor == issued {
             issued_scores = Some((fraction, med));
         }
-        let better =
-            !initialized || fraction > best_fraction || (fraction == best_fraction && med < best_median);
+        let better = !initialized
+            || fraction > best_fraction
+            || (fraction == best_fraction && med < best_median);
         if better {
             best_fraction = fraction;
             best_median = med;
@@ -582,7 +583,12 @@ mod tests {
     /// A trace that lies exactly on the issued curve, subsampled to `n` points
     /// (equal index spacing ~ equal time here). `fraction` in (0,1] traces only
     /// the leading part of the curve, modelling an incomplete trace.
-    fn faithful_trace(params: &LissajousParams, anchor: (f64, f64), n: usize, fraction: f64) -> Vec<(f64, f64)> {
+    fn faithful_trace(
+        params: &LissajousParams,
+        anchor: (f64, f64),
+        n: usize,
+        fraction: f64,
+    ) -> Vec<(f64, f64)> {
         let reference = reference_points(params, anchor);
         let span = ((reference.len() as f64) * fraction) as usize;
         let span = span.max(2).min(reference.len());
@@ -599,7 +605,11 @@ mod tests {
         let params = test_params((50, 50));
         let trace = faithful_trace(&params, (50.0, 50.0), 64, 1.0);
         let report = score_curve_trace(&trace, 9000.0, &params);
-        assert!(report.region_score > 0.95, "region_score = {}", report.region_score);
+        assert!(
+            report.region_score > 0.95,
+            "region_score = {}",
+            report.region_score
+        );
         assert!(report.median_deviation < PROXIMITY_BAND);
     }
 
@@ -610,7 +620,11 @@ mod tests {
         let params = test_params((0, 0));
         let trace = faithful_trace(&params, (0.0, 0.0), 48, 0.4);
         let report = score_curve_trace(&trace, 5000.0, &params);
-        assert!(report.region_score > 0.95, "region_score = {}", report.region_score);
+        assert!(
+            report.region_score > 0.95,
+            "region_score = {}",
+            report.region_score
+        );
     }
 
     #[test]
@@ -621,7 +635,11 @@ mod tests {
             .map(|i| (900.0 + i as f64, 900.0 + (i % 3) as f64))
             .collect();
         let report = score_curve_trace(&trace, 9000.0, &params);
-        assert!(report.region_score < 0.05, "region_score = {}", report.region_score);
+        assert!(
+            report.region_score < 0.05,
+            "region_score = {}",
+            report.region_score
+        );
     }
 
     #[test]
@@ -631,7 +649,11 @@ mod tests {
         let issued = test_params((0, 0));
         let trace = faithful_trace(&issued, (100.0, 100.0), 64, 1.0);
         let report = score_curve_trace(&trace, 9000.0, &issued);
-        assert!(report.region_score > 0.95, "region_score = {}", report.region_score);
+        assert!(
+            report.region_score > 0.95,
+            "region_score = {}",
+            report.region_score
+        );
     }
 
     #[test]
@@ -642,8 +664,16 @@ mod tests {
         let spot = reference[10];
         let trace: Vec<(f64, f64)> = vec![spot; 64];
         let report = score_curve_trace(&trace, 9000.0, &params);
-        assert!(report.region_score > 0.95, "region should be high, got {}", report.region_score);
-        assert!(report.kinematic_score < 0.05, "kinematic_score = {}", report.kinematic_score);
+        assert!(
+            report.region_score > 0.95,
+            "region should be high, got {}",
+            report.region_score
+        );
+        assert!(
+            report.kinematic_score < 0.05,
+            "kinematic_score = {}",
+            report.kinematic_score
+        );
         assert_eq!(report.path_length, 0.0);
     }
 
@@ -653,8 +683,16 @@ mod tests {
         // Perfectly even spacing along a straight line: no speed variation.
         let trace: Vec<(f64, f64)> = (0..64).map(|i| (50.0 + i as f64, 100.0)).collect();
         let report = score_curve_trace(&trace, 9000.0, &params);
-        assert!(report.speed_cov < MIN_SPEED_COV, "speed_cov = {}", report.speed_cov);
-        assert!(report.kinematic_score < 0.05, "kinematic_score = {}", report.kinematic_score);
+        assert!(
+            report.speed_cov < MIN_SPEED_COV,
+            "speed_cov = {}",
+            report.speed_cov
+        );
+        assert!(
+            report.kinematic_score < 0.05,
+            "kinematic_score = {}",
+            report.kinematic_score
+        );
     }
 
     #[test]
@@ -664,7 +702,11 @@ mod tests {
         let mut trace = faithful_trace(&params, (50.0, 50.0), 64, 1.0);
         trace[32] = (5.0, 195.0);
         let report = score_curve_trace(&trace, 9000.0, &params);
-        assert!(report.max_segment > TELEPORT_SEGMENT, "max_segment = {}", report.max_segment);
+        assert!(
+            report.max_segment > TELEPORT_SEGMENT,
+            "max_segment = {}",
+            report.max_segment
+        );
         assert!(report.kinematic_score < 1.0);
     }
 
@@ -682,8 +724,16 @@ mod tests {
             })
             .collect();
         let report = score_curve_trace(&trace, 9000.0, &params);
-        assert!(report.speed_cov > MIN_SPEED_COV, "speed_cov = {}", report.speed_cov);
-        assert!(report.region_score > 0.9, "region_score = {}", report.region_score);
+        assert!(
+            report.speed_cov > MIN_SPEED_COV,
+            "speed_cov = {}",
+            report.speed_cov
+        );
+        assert!(
+            report.region_score > 0.9,
+            "region_score = {}",
+            report.region_score
+        );
     }
 
     #[test]
@@ -741,7 +791,10 @@ mod tests {
             .map(|i| {
                 let idx = (i * (reference.len() - 1)) / 63;
                 let (x, y) = reference[idx];
-                (x + ((i as f64) * 0.7).sin() * 4.0, y - ((i as f64) * 1.1).cos() * 4.0)
+                (
+                    x + ((i as f64) * 0.7).sin() * 4.0,
+                    y - ((i as f64) * 1.1).cos() * 4.0,
+                )
             })
             .collect();
         // Deterministic pseudo-random cloud inside the curve's region.
@@ -749,7 +802,10 @@ mod tests {
             .map(|i| {
                 let a = ((i as f64) * 12.9898).sin() * 43758.5453;
                 let b = ((i as f64) * 78.233).sin() * 43758.5453;
-                (40.0 + (a - a.floor()) * 120.0, 40.0 + (b - b.floor()) * 120.0)
+                (
+                    40.0 + (a - a.floor()) * 120.0,
+                    40.0 + (b - b.floor()) * 120.0,
+                )
             })
             .collect();
         let off_box: Vec<(f64, f64)> = (0..64).map(|i| (900.0 + i as f64, 900.0)).collect();

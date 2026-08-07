@@ -324,7 +324,9 @@ pub fn deserialize_identity_state(data: &[u8]) -> Result<IdentityStateData, Stri
     // attestor enforces the same type check.
     const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
     if data[..8] != IDENTITY_DISCRIMINATOR {
-        return Err("IdentityState discriminator mismatch (not an IdentityState account)".to_string());
+        return Err(
+            "IdentityState discriminator mismatch (not an IdentityState account)".to_string(),
+        );
     }
 
     let last_verification_timestamp = i64::from_le_bytes(
