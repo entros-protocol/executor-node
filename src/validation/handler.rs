@@ -99,6 +99,40 @@ pub struct ValidateFeaturesRequest {
     /// validator however well-formed the request was.
     #[serde(default)]
     pub capture_timing: Option<serde_json::Value>,
+    /// Opaque, consented study context. The executor forwards this exact
+    /// allowlisted shape and never logs its token or record identifier.
+    #[serde(default)]
+    pub study: Option<StudyRequestContext>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct StudyRequestContext {
+    pub token: String,
+    pub record_id: String,
+    pub capture_class: StudyCaptureClass,
+    pub feature_schema_version: u16,
+    pub projection_version: u16,
+}
+
+impl StudyRequestContext {
+    fn validate(&self) -> bool {
+        self.token.len() == 43
+            && self
+                .token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            && self.record_id.len() == 32
+            && self.record_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StudyCaptureClass {
+    WebMobile,
+    WebDesktop,
+    NativeIos,
+    NativeAndroid,
 }
 
 /// Coarse curve-trace outline payload (touch-curve Stage 1). Equal-time
@@ -198,6 +232,8 @@ pub struct ValidateFeaturesResponse {
 
     // Layer E Composite Risk Score
     pub composite_risk_score: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub study_record_status: Option<String>,
 }
 
 /// Wire-format mirror of `entros_validation::SignedReceiptDto`. Defined
@@ -227,6 +263,11 @@ pub async fn validate_features_handler(
     // rejected before touching the rate limiter or validation service.
     let wallet = Pubkey::from_str(&req.wallet_id)
         .map_err(|_| AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id)))?;
+    if req.study.as_ref().is_some_and(|study| !study.validate()) {
+        return Err(AppError::InvalidRequest(
+            "invalid population-study context".into(),
+        ));
+    }
 
     // Extract client IP and User-Agent for cross-wallet cooldown check (master-list #142)
     let ip = crate::auth::client_ip::extract_client_ip(&headers, peer.map(|Extension(c)| c.0))
@@ -416,6 +457,7 @@ pub async fn validate_features_handler(
                 commitment_hex: None,
                 salt_hex: None,
                 composite_risk_score: 0.0,
+                study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
             }));
         }
     };
@@ -512,24 +554,29 @@ pub async fn validate_features_handler(
     // Build request to internal validation service. Forward time-series and
     // audio fields unchanged — the validation service handles absence of any
     // field (old SDK versions).
+    let mut validator_body = serde_json::json!({
+        "features": req.features,
+        "wallet_id": req.wallet_id,
+        "f0_contour": req.f0_contour,
+        "accel_magnitude": req.accel_magnitude,
+        "audio_samples_b64": req.audio_samples_b64,
+        "audio_sample_rate_hz": req.audio_sample_rate_hz,
+        "expected_phrase": expected_phrase,
+        "commitment_new_hex": req.commitment_new_hex,
+        "request_receipt": req.request_receipt,
+        "recent_timestamps": recent_timestamps,
+        "origin_ip": Some(ip.to_string()),
+        "origin_ua": Some(user_agent.to_string()),
+        "capture_timing": req.capture_timing,
+    });
+    if let Some(study) = req.study.as_ref() {
+        validator_body["study"] =
+            serde_json::to_value(study).map_err(|_| AppError::ValidationServiceUnavailable)?;
+    }
     let mut request = state
         .http_client
         .post(format!("{validation_url}/validate"))
-        .json(&serde_json::json!({
-            "features": req.features,
-            "wallet_id": req.wallet_id,
-            "f0_contour": req.f0_contour,
-            "accel_magnitude": req.accel_magnitude,
-            "audio_samples_b64": req.audio_samples_b64,
-            "audio_sample_rate_hz": req.audio_sample_rate_hz,
-            "expected_phrase": expected_phrase,
-            "commitment_new_hex": req.commitment_new_hex,
-            "request_receipt": req.request_receipt,
-            "recent_timestamps": recent_timestamps,
-            "origin_ip": Some(ip.to_string()),
-            "origin_ua": Some(user_agent.to_string()),
-            "capture_timing": req.capture_timing,
-        }))
+        .json(&validator_body)
         .timeout(VALIDATOR_REQUEST_TIMEOUT);
 
     // Add bearer token if configured
@@ -678,6 +725,8 @@ pub async fn validate_features_handler(
         audio_realism_risk: f64,
         #[serde(default)]
         probing_detected: Option<bool>,
+        #[serde(default)]
+        study_record_status: Option<String>,
     }
 
     #[derive(serde::Deserialize)]
@@ -695,6 +744,8 @@ pub async fn validate_features_handler(
         audio_realism_risk: f64,
         #[serde(default)]
         probing_detected: Option<bool>,
+        #[serde(default)]
+        study_record_status: Option<String>,
     }
 
     if !response.status().is_success() {
@@ -759,7 +810,14 @@ pub async fn validate_features_handler(
             composite_risk_score,
             "Feature validation rejected"
         );
-        return Err(AppError::ValidationFailed { reason });
+        let study_record_status = err_body.and_then(|body| body.study_record_status);
+        return match study_record_status {
+            Some(study_record_status) => Err(AppError::StudyValidationFailed {
+                reason,
+                study_record_status: Some(study_record_status),
+            }),
+            None => Err(AppError::ValidationFailed { reason }),
+        };
     }
 
     // Validation passed — refund the per-wallet attempt slot so a wallet
@@ -775,6 +833,7 @@ pub async fn validate_features_handler(
         tts_risk,
         temporal_risk,
         audio_realism_risk,
+        study_record_status,
     ) = match parsed_body {
         Some(body) => (
             body.signed_receipt,
@@ -784,8 +843,9 @@ pub async fn validate_features_handler(
             body.tts_risk,
             body.temporal_risk,
             body.audio_realism_risk,
+            body.study_record_status,
         ),
-        None => (None, None, None, 0.0, 0.0, 0.0, 0.0),
+        None => (None, None, None, 0.0, 0.0, 0.0, 0.0, None),
     };
 
     let composite_risk_score = RiskComponents {
@@ -818,7 +878,7 @@ pub async fn validate_features_handler(
             composite_risk_score,
             "Validation rejected: Composite risk score exceeds threshold"
         );
-        return Err(AppError::ValidationFailed { reason: None });
+        return Err(validation_failure(None, study_record_status.as_deref()));
     }
 
     // Suspicious range graduated friction (Layer C)
@@ -830,9 +890,10 @@ pub async fn validate_features_handler(
             attempts,
             "Validation flagged: Composite risk score in suspicious range on first attempt, requiring dynamic captcha"
         );
-        return Err(AppError::ValidationFailed {
-            reason: Some("captcha_required".to_string()),
-        });
+        return Err(validation_failure(
+            Some("captcha_required".to_string()),
+            study_record_status.as_deref(),
+        ));
     }
 
     Ok(PaddedJson(ValidateFeaturesResponse {
@@ -842,7 +903,18 @@ pub async fn validate_features_handler(
         commitment_hex,
         salt_hex,
         composite_risk_score,
+        study_record_status,
     }))
+}
+
+fn validation_failure(reason: Option<String>, study_record_status: Option<&str>) -> AppError {
+    match study_record_status {
+        Some(status) => AppError::StudyValidationFailed {
+            reason,
+            study_record_status: Some(status.to_owned()),
+        },
+        None => AppError::ValidationFailed { reason },
+    }
 }
 
 #[cfg(test)]
@@ -867,6 +939,7 @@ mod tests {
             client_signals: None,
             curve_trace: None,
             capture_timing: None,
+            study: None,
         }
     }
 
@@ -879,6 +952,30 @@ mod tests {
         });
         let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
         assert!(req.client_signals.is_none());
+    }
+
+    #[test]
+    fn study_context_rejects_unbounded_or_malformed_identifiers() {
+        let valid = StudyRequestContext {
+            token: "A".repeat(43),
+            record_id: "00".repeat(16),
+            capture_class: StudyCaptureClass::WebMobile,
+            feature_schema_version: 3,
+            projection_version: 0,
+        };
+        assert!(valid.validate());
+
+        let malformed_token = StudyRequestContext {
+            token: "short".into(),
+            ..valid.clone()
+        };
+        assert!(!malformed_token.validate());
+
+        let malformed_record = StudyRequestContext {
+            record_id: "zz".repeat(16),
+            ..valid
+        };
+        assert!(!malformed_record.validate());
     }
 
     #[test]
@@ -1273,8 +1370,8 @@ mod validator_reached_tests {
 
     /// Composite weights, restated so a change to the handler's table fails
     /// here rather than silently altering who gets verified.
-    fn expected_composite(biometric: f64, tts: f64, temporal: f64, automation: f64) -> f64 {
-        0.35 * biometric + 0.25 * tts + 0.15 * temporal + 0.15 * automation + REPUTATION_FLOOR
+    fn expected_composite(biometric: f64, tts: f64, _temporal: f64, automation: f64) -> f64 {
+        0.35 * biometric + 0.25 * tts + 0.15 * automation + REPUTATION_FLOOR
     }
 
     // ---- reachability, and the gate whose contract was previously inverted ----
@@ -1313,6 +1410,130 @@ mod validator_reached_tests {
             1,
             "metrics must count work that actually happened"
         );
+    }
+
+    #[tokio::test]
+    async fn normal_validation_omits_study_context_upstream() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await
+        .expect("normal validation must pass");
+
+        let sent = mock.received();
+        assert_eq!(sent.len(), 1);
+        assert!(
+            sent[0].get("study").is_none(),
+            "normal validation must not add a study field"
+        );
+    }
+
+    #[tokio::test]
+    async fn study_context_and_recorded_status_survive_the_executor_hop() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = success_body(0.0, 0.0, 0.0);
+        body["study_record_status"] = serde_json::json!("recorded");
+        let mock = MockValidator::spawn(StatusCode::OK, body).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let expected = serde_json::json!({
+            "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "record_id": "00112233445566778899aabbccddeeff",
+            "capture_class": "web-mobile",
+            "feature_schema_version": 3,
+            "projection_version": 2,
+        });
+        let mut request = baseline_request(random_wallet_id());
+        request.study =
+            Some(serde_json::from_value(expected.clone()).expect("valid study context fixture"));
+
+        let response = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .expect("study validation must pass")
+        .0;
+
+        assert_eq!(response.study_record_status.as_deref(), Some("recorded"));
+        let sent = mock.received();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].get("study"), Some(&expected));
+    }
+
+    #[tokio::test]
+    async fn executor_policy_rejection_preserves_a_recorded_study_status() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = success_body(1.0, 1.0, 1.0);
+        body["study_record_status"] = serde_json::json!("recorded");
+        let mock = MockValidator::spawn(StatusCode::OK, body).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.automation_webdriver_reject = false;
+
+        let mut request = baseline_request(random_wallet_id());
+        request.client_signals = Some(webdriver_signals());
+        request.study = Some(StudyRequestContext {
+            token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            record_id: "00112233445566778899aabbccddeeff".into(),
+            capture_class: StudyCaptureClass::WebMobile,
+            feature_schema_version: 3,
+            projection_version: 2,
+        });
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await;
+
+        match result.map(|_| ()) {
+            Err(AppError::StudyValidationFailed {
+                reason,
+                study_record_status,
+            }) => {
+                assert!(reason.is_none());
+                assert_eq!(study_record_status.as_deref(), Some("recorded"));
+            }
+            other => panic!("expected study-aware policy rejection, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejection_preserves_study_storage_status_without_widening_reason_disclosure() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = error_body("variance_floor");
+        body["study_record_status"] = serde_json::json!("technical_failure");
+        let mock = MockValidator::spawn(StatusCode::BAD_REQUEST, body).await;
+        let state = state_with_mock_validator(tracker, &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        match result.map(|_| ()) {
+            Err(AppError::StudyValidationFailed {
+                reason,
+                study_record_status,
+            }) => {
+                assert!(reason.is_none(), "private detector reason must stay hidden");
+                assert_eq!(study_record_status.as_deref(), Some("technical_failure"));
+            }
+            other => panic!("expected study-aware validation failure, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -1385,9 +1606,8 @@ mod validator_reached_tests {
 
     #[tokio::test]
     async fn composite_risk_weights_each_layer_as_specified() {
-        // Pins the weight table itself. Stage 1b will add a term to this
-        // region, and this is the test that makes a silent re-weighting of the
-        // existing five impossible.
+        // Pins the scored weight table. This test makes a silent re-weighting
+        // of the four decision signals fail.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.4, 0.2, 0.1)).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
@@ -1416,15 +1636,15 @@ mod validator_reached_tests {
         // naming the failing layer would tell an attacker which signal to tune.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 1.0)).await;
-        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.automation_webdriver_reject = false;
 
-        let result = validate_features_handler(
-            State(state),
-            None,
-            headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
-        )
-        .await;
+        let mut req = baseline_request(random_wallet_id());
+        req.client_signals = Some(webdriver_signals());
+
+        let result =
+            validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
+                .await;
 
         // `PaddedJson` is not `Debug`; discard the success payload so the
         // catch-all arm can report what came back instead.

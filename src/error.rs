@@ -105,6 +105,12 @@ pub enum AppError {
     #[error("Validation failed")]
     ValidationFailed { reason: Option<String> },
 
+    #[error("Validation failed")]
+    StudyValidationFailed {
+        reason: Option<String>,
+        study_record_status: Option<String>,
+    },
+
     /// The upstream validation service was unreachable (connect refused,
     /// DNS failure, timeout, etc.). Renders a generic user-facing body
     /// — `reqwest::Error` internals (hostnames, ports, connect-error
@@ -198,6 +204,9 @@ impl IntoResponse for AppError {
             AppError::ValidationFailed { .. } => {
                 (StatusCode::BAD_REQUEST, "Verification failed".into())
             }
+            AppError::StudyValidationFailed { .. } => {
+                (StatusCode::BAD_REQUEST, "Verification failed".into())
+            }
             AppError::ValidationServiceUnavailable => (
                 StatusCode::BAD_GATEWAY,
                 "Validation service temporarily unavailable. Please try again.".into(),
@@ -232,6 +241,19 @@ impl IntoResponse for AppError {
                     "error": message,
                     "reason": r,
                 })
+            }
+            AppError::StudyValidationFailed {
+                reason,
+                study_record_status,
+            } => {
+                let mut body = json!({ "error": message });
+                if let Some(reason) = reason {
+                    body["reason"] = json!(reason);
+                }
+                if let Some(status) = study_record_status {
+                    body["study_record_status"] = json!(status);
+                }
+                body
             }
             AppError::PayloadTooLarge => {
                 json!({

@@ -11,6 +11,7 @@ mod reputation;
 mod server;
 mod solana;
 mod status;
+mod study;
 mod timing;
 mod validation;
 

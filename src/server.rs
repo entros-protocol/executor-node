@@ -28,6 +28,7 @@ use crate::relayer::transaction::RelayerTransaction;
 use crate::status::handler::status_handler;
 use crate::status::metrics_handler::metrics_handler;
 use crate::status::status_metrics::StatusMetrics;
+use crate::study::{study_definition_handler, study_enrol_handler};
 use crate::validation::handler::validate_features_handler;
 
 #[derive(Clone)]
@@ -247,6 +248,8 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
     // (Arc) backs both, so counters merge across the route groups.
     let untimed_routes = Router::new()
         .route("/challenge", get(challenge_handler))
+        .route("/study/definition", post(study_definition_handler))
+        .route("/study/enrol", post(study_enrol_handler))
         .merge(attest_route)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
