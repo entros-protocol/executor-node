@@ -10,21 +10,25 @@
 
 const W_BIOMETRIC: f64 = 0.35;
 const W_TTS: f64 = 0.25;
-const W_TEMPORAL: f64 = 0.15;
+/// Reserved while temporal coupling remains research telemetry.
+///
+/// Keeping this share unallocated removes the signal without increasing any
+/// other detector's authority or moving the two policy thresholds.
+const _W_UNALLOCATED: f64 = 0.15;
 const W_AUTOMATION: f64 = 0.15;
 const W_REPUTATION: f64 = 0.10;
 
-/// The weights sum to 1.0, so a new term must take weight from the existing ones
-/// rather than extend the range. Checked during compilation, because a violation
-/// would otherwise move both thresholds without touching either constant.
+/// The active and reserved shares sum to a 1.0 budget. A new term must use that
+/// budget rather than extend the range. Checked during compilation, because a
+/// violation would otherwise move both thresholds without changing either one.
 ///
 /// `f64::abs` is not const, so the tolerance is bounded from both sides; the sum
 /// does not land on exactly 1.0 in binary floating point.
 const _: () = {
-    let sum = W_BIOMETRIC + W_TTS + W_TEMPORAL + W_AUTOMATION + W_REPUTATION;
+    let sum = W_BIOMETRIC + W_TTS + _W_UNALLOCATED + W_AUTOMATION + W_REPUTATION;
     assert!(
         sum > 1.0 - 1e-9 && sum < 1.0 + 1e-9,
-        "composite weights must sum to 1.0"
+        "composite weight budget must sum to 1.0"
     );
 };
 
@@ -38,7 +42,7 @@ pub const CAPTCHA_THRESHOLD: f64 = 0.45;
 /// the reject tier is evaluated first.
 const _: () = assert!(CAPTCHA_THRESHOLD < REJECT_THRESHOLD);
 
-/// The five scored signals for one verification attempt.
+/// Four scored signals and one research signal for a verification attempt.
 ///
 /// Named fields rather than positional arguments: every component is an `f64`
 /// over the same range, so a transposed pair would compile cleanly and misvalue
@@ -49,7 +53,7 @@ pub struct RiskComponents {
     pub biometric: f64,
     /// Validator's synthetic-speech risk.
     pub tts: f64,
-    /// Validator's temporal-coupling risk.
+    /// Validator's temporal-coupling telemetry. This value is not scored.
     pub temporal: f64,
     /// Locally computed automation risk from client-reported signals.
     pub automation: f64,
@@ -67,7 +71,6 @@ impl RiskComponents {
     pub fn composite(&self) -> f64 {
         W_BIOMETRIC * bounded(self.biometric)
             + W_TTS * bounded(self.tts)
-            + W_TEMPORAL * bounded(self.temporal)
             + W_AUTOMATION * bounded(self.automation)
             + W_REPUTATION * bounded(self.reputation)
     }
@@ -127,10 +130,9 @@ mod tests {
         // green. The values themselves are pinned independently by
         // `expected_composite` in the handler's `validator_reached_tests`, which
         // restates the table as literals for exactly that reason.
-        let cases: [WeightCase; 5] = [
+        let cases: [WeightCase; 4] = [
             ("biometric", |c| c.biometric = 1.0, W_BIOMETRIC),
             ("tts", |c| c.tts = 1.0, W_TTS),
-            ("temporal", |c| c.temporal = 1.0, W_TEMPORAL),
             ("automation", |c| c.automation = 1.0, W_AUTOMATION),
             ("reputation", |c| c.reputation = 1.0, W_REPUTATION),
         ];
@@ -155,7 +157,22 @@ mod tests {
     }
 
     #[test]
-    fn all_components_at_maximum_score_exactly_one() {
+    fn temporal_telemetry_does_not_change_the_decision_score() {
+        let baseline = silent().composite();
+        let temporal_only = RiskComponents {
+            temporal: 1.0,
+            ..silent()
+        }
+        .composite();
+
+        assert_eq!(
+            temporal_only, baseline,
+            "observe-only temporal telemetry must not affect a verdict"
+        );
+    }
+
+    #[test]
+    fn all_scored_components_at_maximum_leave_the_temporal_share_unallocated() {
         let got = RiskComponents {
             biometric: 1.0,
             tts: 1.0,
@@ -164,7 +181,7 @@ mod tests {
             reputation: 1.0,
         }
         .composite();
-        assert!((got - 1.0).abs() < 1e-9, "expected 1.0, got {got}");
+        assert!((got - 0.85).abs() < 1e-9, "expected 0.85, got {got}");
     }
 
     #[test]
