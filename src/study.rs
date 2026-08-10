@@ -19,6 +19,7 @@ pub struct StudyEnrolRequest {
     invitation: String,
     consent_version: String,
     consent_hash_hex: String,
+    enrolment_id: String,
     accepted: bool,
 }
 
@@ -51,6 +52,11 @@ pub async fn study_enrol_handler(
             .consent_hash_hex
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit())
+        || request.enrolment_id.len() != 32
+        || !request
+            .enrolment_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
         || !request.accepted
     {
         return Err(AppError::InvalidRequest(
@@ -64,6 +70,7 @@ pub async fn study_enrol_handler(
             "invitation": request.invitation,
             "consent_version": request.consent_version,
             "consent_hash_hex": request.consent_hash_hex,
+            "enrolment_id": request.enrolment_id,
             "accepted": request.accepted,
         }),
     )
@@ -105,4 +112,75 @@ async fn proxy_study_request(
         |_| serde_json::json!({ "error": "Study service returned an invalid response" }),
     );
     Ok((status, Json(response_body)).into_response())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    use serde_json::Value;
+
+    use super::*;
+    use crate::server::{build_test_state, tracker_with_quota};
+
+    #[tokio::test]
+    async fn enrolment_proxy_preserves_the_idempotency_identifier() {
+        let received = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured = Arc::clone(&received);
+        let app = Router::new()
+            .route(
+                "/study/enrol",
+                post(move |State(()): State<()>, Json(body): Json<Value>| {
+                    let captured = Arc::clone(&captured);
+                    async move {
+                        captured.lock().expect("request log lock").push(body);
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "token": "A".repeat(43),
+                                "session_id": "b".repeat(32),
+                                "trial_index": 1,
+                                "trial_limit": 3,
+                                "expires_in": 3600
+                            })),
+                        )
+                    }
+                }),
+            )
+            .with_state(());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let state = build_test_state(
+            tracker_with_quota("study-proxy", 10),
+            Some(format!("http://{address}")),
+        );
+
+        let response = study_enrol_handler(
+            State(state),
+            Json(StudyEnrolRequest {
+                invitation: "valid-study-invitation".into(),
+                consent_version: "2026-08-10".into(),
+                consent_hash_hex: "a".repeat(64),
+                enrolment_id: "0123456789abcdef0123456789abcdef".into(),
+                accepted: true,
+            }),
+        )
+        .await
+        .expect("proxy response");
+        server.abort();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = received.lock().expect("request log lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0]["enrolment_id"],
+            "0123456789abcdef0123456789abcdef"
+        );
+    }
 }
