@@ -26,6 +26,7 @@ const IP_ENTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes
 pub struct RateLimiter {
     limiters: DashMap<String, (Arc<Limiter>, Instant)>,
     quota: Quota,
+    retry_after_secs: u64,
 }
 
 impl RateLimiter {
@@ -40,6 +41,7 @@ impl RateLimiter {
         Self {
             limiters: DashMap::new(),
             quota,
+            retry_after_secs: (60u64.div_ceil(clamped as u64)).max(1),
         }
     }
 
@@ -68,6 +70,10 @@ impl RateLimiter {
         drop(limiter);
 
         lim.check().map_err(|_| ())
+    }
+
+    pub fn check_with_retry(&self, key: &str) -> Result<(), u64> {
+        self.check(key).map_err(|()| self.retry_after_secs)
     }
 
     /// Evict entries that haven't been seen for `ENTRY_TTL`. Called from

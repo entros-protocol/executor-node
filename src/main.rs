@@ -65,12 +65,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.rate_limit_per_minute,
     ));
     let attest_rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(10));
+    let study_service_rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(
+        config.study_rate_limit_per_minute,
+    ));
+    let study_concurrency = Arc::new(tokio::sync::Semaphore::new(config.study_max_in_flight));
     let per_ip_rate_limiter = Arc::new(auth::rate_limit::PerIpRateLimiter::new(
         config.per_ip_rate_limit_per_minute,
     ));
     tracing::info!(
         requests_per_minute = config.rate_limit_per_minute,
         attest_per_minute = 10,
+        study_per_minute = config.study_rate_limit_per_minute,
+        study_max_in_flight = config.study_max_in_flight,
         per_ip_per_minute = config.per_ip_rate_limit_per_minute,
         "Rate limiters initialized"
     );
@@ -319,6 +325,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, limiter_ref) in [
         ("rate_limiter", Arc::clone(&rate_limiter)),
         ("attest_rate_limiter", Arc::clone(&attest_rate_limiter)),
+        (
+            "study_service_rate_limiter",
+            Arc::clone(&study_service_rate_limiter),
+        ),
     ] {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -398,6 +408,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_keys: Arc::new(config.api_keys),
         rate_limiter,
         attest_rate_limiter,
+        study_service_rate_limiter,
+        study_concurrency,
         per_ip_rate_limiter,
         tracker,
         wallet_attempts,

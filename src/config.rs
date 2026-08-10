@@ -255,7 +255,9 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub api_keys: Vec<String>,
     pub rate_limit_per_minute: u32,
-    /// Per-IP request cap (master-list #155). Bounds the throughput a
+    pub study_rate_limit_per_minute: u32,
+    pub study_max_in_flight: usize,
+    /// Per-IP request cap. Bounds the throughput a
     /// single client IP can sustain across rotated wallets / API keys
     /// before the per-API-key and per-wallet limiters fire. Configurable
     /// via `EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN`. Default 30 — covers
@@ -276,7 +278,7 @@ pub struct Config {
     pub validation_service_url_signature: Option<String>,
     pub validation_api_key: Option<String>,
     pub challenge_ttl_secs: u64,
-    /// Per-wallet validation-attempt cap (master-list #94 C4). Soft cap on
+    /// Per-wallet validation-attempt cap. Soft cap on
     /// the number of attempts a single wallet can make in the configured
     /// window before being rate-limited. Successful attempts refund their
     /// slot; only failures persist against the cap. Configurable via
@@ -287,13 +289,13 @@ pub struct Config {
     /// Sliding-window length for `wallet_max_attempts`. Configurable via
     /// `VALIDATION_WALLET_WINDOW_SECS`. Default 3600 (1 hour).
     pub wallet_window_secs: u64,
-    /// Observe-only automation-detection logging (master-list #196, Layer A1).
+    /// Observe-only automation-detection logging.
     /// When true, the `/validate-features` handler logs the client-collected
     /// automation signal for calibration — it never affects the verification
     /// decision either way. Configurable via `EXECUTOR_AUTOMATION_OBSERVE`.
     /// Default true (observe-first).
     pub automation_observe: bool,
-    /// Layer A1 automation hard gate. When true, a request reporting
+    /// Automation hard gate. When true, a request reporting
     /// navigator.webdriver === true is rejected outright (prod only — no effect
     /// on the dev pass-through with no validator configured). Disable for the
     /// team's own E2E automation via `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT`.
@@ -301,7 +303,7 @@ pub struct Config {
     /// determined attacker who hides the flag — the biometric pipeline is the
     /// backstop.
     pub automation_webdriver_reject: bool,
-    /// Observe-only wallet-reputation logging (master-list #196, Layer D1).
+    /// Observe-only wallet-reputation logging.
     /// When true, the `/validate-features` handler reads the verifying wallet's
     /// public on-chain reputation (balance + recent activity) in a detached task
     /// and logs it for calibration — it never affects the verification decision,
@@ -314,7 +316,7 @@ pub struct Config {
     /// and logs it for calibration — it never affects the verification decision.
     /// Configurable via `EXECUTOR_CURVE_TRACE_OBSERVE`. Default true (observe-first).
     pub curve_trace_observe: bool,
-    /// Cross-wallet verification cooldown duration in seconds (master-list #142).
+    /// Cross-wallet verification cooldown duration in seconds.
     /// Configurable via `VALIDATION_CROSS_WALLET_COOLDOWN_SECS`. Default 86400 (24h).
     pub cross_wallet_cooldown_secs: u64,
     /// Enforces cross-wallet cooldown blocks when true. When false, overlaps are
@@ -364,6 +366,26 @@ impl Config {
                 .map_err(|e| format!("RATE_LIMIT_PER_MINUTE is not a valid u32: {e}"))?,
             Err(_) => 60,
         };
+
+        let study_rate_limit_per_minute: u32 = match std::env::var("STUDY_RATE_LIMIT_PER_MINUTE") {
+            Ok(s) => s
+                .parse()
+                .map_err(|e| format!("STUDY_RATE_LIMIT_PER_MINUTE is not a valid u32: {e}"))?,
+            Err(_) => 600,
+        };
+        if !(1..=10_000).contains(&study_rate_limit_per_minute) {
+            return Err("STUDY_RATE_LIMIT_PER_MINUTE must be between 1 and 10000".into());
+        }
+
+        let study_max_in_flight: usize = match std::env::var("STUDY_MAX_IN_FLIGHT") {
+            Ok(s) => s
+                .parse()
+                .map_err(|e| format!("STUDY_MAX_IN_FLIGHT is not a valid usize: {e}"))?,
+            Err(_) => 32,
+        };
+        if !(1..=256).contains(&study_max_in_flight) {
+            return Err("STUDY_MAX_IN_FLIGHT must be between 1 and 256".into());
+        }
 
         let per_ip_rate_limit_per_minute: u32 =
             match std::env::var("EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN") {
@@ -473,6 +495,8 @@ impl Config {
             listen_addr,
             api_keys,
             rate_limit_per_minute,
+            study_rate_limit_per_minute,
+            study_max_in_flight,
             per_ip_rate_limit_per_minute,
             integrators,
             cors_origins,

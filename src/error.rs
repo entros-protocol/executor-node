@@ -39,7 +39,10 @@ pub enum AppError {
     #[error("Rate limited")]
     RateLimited,
 
-    /// Per-IP rate-limit cap exceeded (master-list #155). The middleware
+    #[error("Study service busy")]
+    StudyRouteLimited { retry_after_secs: u64 },
+
+    /// Per-IP rate-limit cap exceeded. The middleware
     /// short-circuits before auth/quota deduction so an attacker rotating
     /// wallets behind a single IP can't sustain throughput by burning the
     /// other limiters' state. Surfaces as `429 Too Many Requests` with a
@@ -48,7 +51,7 @@ pub enum AppError {
     #[error("IP rate limited")]
     IpRateLimited { retry_after_secs: u64 },
 
-    /// Per-wallet validation-rejection cap exceeded (master-list #94 C4).
+    /// Per-wallet validation-rejection cap exceeded.
     /// `retry_after_secs` echoed in the response body so the client can
     /// surface a cooldown countdown instead of a blind retry.
     #[error("Too many attempts for this wallet")]
@@ -119,7 +122,10 @@ pub enum AppError {
     #[error("Validation service temporarily unavailable")]
     ValidationServiceUnavailable,
 
-    /// Cross-wallet verification cooldown active (master-list #142).
+    #[error("Projection update required")]
+    ProjectionUpdateRequired,
+
+    /// Cross-wallet verification cooldown active.
     /// Surfaces as `429 Too Many Requests` with a `Retry-After` header.
     #[error("Cross-wallet cooldown active")]
     CrossWalletCooldownActive { retry_after_secs: u64 },
@@ -139,6 +145,20 @@ impl IntoResponse for AppError {
                 .unwrap_or_else(|_| unreachable!("u64 stringification is valid header bytes"));
             resp.headers_mut().insert("retry-after", header);
             return resp;
+        }
+
+        if let AppError::StudyRouteLimited { retry_after_secs } = &self {
+            let body = json!({
+                "error": "The study service is busy. Please wait before trying again.",
+                "reason": "study_service_busy",
+                "retry_after": retry_after_secs,
+            });
+            let mut response =
+                (StatusCode::TOO_MANY_REQUESTS, axum::Json(Padded::new(body))).into_response();
+            if let Ok(header) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                response.headers_mut().insert("retry-after", header);
+            }
+            return response;
         }
 
         // IpRateLimited needs a `Retry-After` header alongside the JSON body.
@@ -178,6 +198,7 @@ impl IntoResponse for AppError {
             ),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "Unauthorized".into()),
             AppError::RateLimited => (StatusCode::TOO_MANY_REQUESTS, "Rate limited".into()),
+            AppError::StudyRouteLimited { .. } => unreachable!("handled above"),
             AppError::IpRateLimited { .. } => unreachable!("handled above"),
             AppError::CrossWalletCooldownActive { .. } => unreachable!("handled above"),
             AppError::WalletRateLimited { .. } => (
@@ -211,6 +232,10 @@ impl IntoResponse for AppError {
                 StatusCode::BAD_GATEWAY,
                 "Validation service temporarily unavailable. Please try again.".into(),
             ),
+            AppError::ProjectionUpdateRequired => (
+                StatusCode::CONFLICT,
+                "This verification client must update before continuing.".into(),
+            ),
         };
 
         // WalletRateLimited surfaces `reason + retry_after` so the client
@@ -240,6 +265,12 @@ impl IntoResponse for AppError {
                 json!({
                     "error": message,
                     "reason": r,
+                })
+            }
+            AppError::ProjectionUpdateRequired => {
+                json!({
+                    "error": message,
+                    "reason": "projection_update_required",
                 })
             }
             AppError::StudyValidationFailed {

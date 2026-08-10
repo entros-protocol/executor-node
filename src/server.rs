@@ -37,6 +37,8 @@ pub struct AppState {
     pub api_keys: Arc<Vec<String>>,
     pub rate_limiter: Arc<RateLimiter>,
     pub attest_rate_limiter: Arc<RateLimiter>,
+    pub study_service_rate_limiter: Arc<RateLimiter>,
+    pub study_concurrency: Arc<tokio::sync::Semaphore>,
     pub per_ip_rate_limiter: Arc<PerIpRateLimiter>,
     pub tracker: Arc<IntegratorTracker>,
     pub wallet_attempts: Arc<WalletAttemptTracker>,
@@ -48,7 +50,7 @@ pub struct AppState {
     pub validation_api_key: Option<String>,
     pub challenge_registry: Arc<ChallengeNonceRegistry>,
     pub challenge_ttl_secs: u64,
-    /// Observe-only automation-detection logging (master-list #196, Layer A1).
+    /// Observe-only automation-detection logging.
     /// Gates the calibration log in `validate_features_handler`; never affects
     /// the verification decision.
     pub automation_observe: bool,
@@ -56,7 +58,7 @@ pub struct AppState {
     /// navigator.webdriver === true (prod only). Disable for E2E via
     /// `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT`.
     pub automation_webdriver_reject: bool,
-    /// Observe-only wallet-reputation logging (master-list #196, Layer D1).
+    /// Observe-only wallet-reputation logging.
     /// Gates the detached on-chain reputation read in `validate_features_handler`;
     /// never affects the verification decision, quota, or latency.
     pub wallet_reputation_observe: bool,
@@ -64,7 +66,7 @@ pub struct AppState {
     /// Gates the curve-trace scoring log in `validate_features_handler`; never
     /// affects the verification decision.
     pub curve_trace_observe: bool,
-    /// Cross-wallet verification cooldown tracker (master-list #142).
+    /// Cross-wallet verification cooldown tracker.
     pub cross_wallet_cooldown: Arc<CrossWalletCooldownTracker>,
     /// Enforces cross-wallet cooldown blocks when true.
     pub cross_wallet_cooldown_enforce: bool,
@@ -99,7 +101,7 @@ async fn rate_limit_middleware(
     Ok(next.run(request).await)
 }
 
-/// Per-IP rate-limit gate (master-list #155). Sits OUTSIDE the
+/// Per-IP rate-limit gate. Sits outside the
 /// min-duration timing equalizer so over-cap IPs fail fast — there's no
 /// privacy benefit to padding here (the same IP already knows from its
 /// own request count whether it's rate-limited), and short-circuiting
@@ -168,6 +170,27 @@ async fn attest_rate_limit_middleware(
 
     Ok(next.run(request).await)
 }
+
+async fn study_load_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let permit = Arc::clone(&state.study_concurrency)
+        .try_acquire_owned()
+        .map_err(|_| AppError::StudyRouteLimited {
+            retry_after_secs: 1,
+        })?;
+    state
+        .study_service_rate_limiter
+        .check_with_retry("study-service")
+        .map_err(|retry_after_secs| AppError::StudyRouteLimited { retry_after_secs })?;
+    let response = next.run(request).await;
+    drop(permit);
+    Ok(response)
+}
+
+const STUDY_REQUEST_BODY_BYTES: usize = 4 * 1024;
 
 /// Largest request body the executor accepts, in bytes.
 ///
@@ -246,10 +269,21 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
     // pre-handler short-circuits also clamp to the timing budget. Each
     // Router carries its own layer stack but the same `state.rate_limiter`
     // (Arc) backs both, so counters merge across the route groups.
-    let untimed_routes = Router::new()
-        .route("/challenge", get(challenge_handler))
+    let study_routes = Router::new()
         .route("/study/definition", post(study_definition_handler))
         .route("/study/enrol", post(study_enrol_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            study_load_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
+        .route_layer(RequestBodyLimitLayer::new(STUDY_REQUEST_BODY_BYTES));
+
+    let untimed_routes = Router::new()
+        .route("/challenge", get(challenge_handler))
         .merge(attest_route)
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -265,13 +299,13 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
     // so hostile traffic is rejected before consuming server resources.
     // Excluded: /health, /status, /metrics — Railway healthchecks and
     // Prometheus scrapers are expected to hit at high cadence.
-    let verify_routes =
-        timed_routes
-            .merge(untimed_routes)
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                per_ip_rate_limit_middleware,
-            ));
+    let verify_routes = timed_routes
+        .merge(untimed_routes)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            per_ip_rate_limit_middleware,
+        ))
+        .merge(study_routes);
 
     let cors = if cors_origins.is_empty() {
         // No origins configured — permissive for development
@@ -344,6 +378,8 @@ pub fn build_test_state(
         api_keys: Arc::new(vec![]),
         rate_limiter: Arc::new(RateLimiter::new(60)),
         attest_rate_limiter: Arc::new(RateLimiter::new(10)),
+        study_service_rate_limiter: Arc::new(RateLimiter::new(600)),
+        study_concurrency: Arc::new(tokio::sync::Semaphore::new(32)),
         per_ip_rate_limiter: Arc::new(PerIpRateLimiter::new(30)),
         tracker,
         wallet_attempts: Arc::new(WalletAttemptTracker::new(5, Duration::from_secs(3600))),
@@ -396,7 +432,7 @@ pub fn random_wallet_id() -> String {
 
 #[cfg(test)]
 mod per_ip_middleware_tests {
-    //! Per-IP rate-limit middleware tests (master-list #155). Exercise
+    //! Per-IP rate-limit middleware tests. Exercise
     //! the middleware via `tower::ServiceExt::oneshot` against a minimal
     //! Router so we get true middleware semantics (extension extraction,
     //! header pass-through, AppError::IntoResponse) instead of mocking
@@ -407,7 +443,72 @@ mod per_ip_middleware_tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
     use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::util::ServiceExt;
+
+    async fn study_definition_upstream() -> impl axum::response::IntoResponse {
+        axum::Json(serde_json::json!({
+            "study_id": "population-v1",
+            "consent_version": "2026-08-10",
+            "consent_hash_hex": "a".repeat(64),
+            "retention_days": 14,
+            "trial_limit": 5,
+            "visit_gap_secs": 14_400,
+            "feature_schema_version": 4,
+            "projection_version": 1
+        }))
+    }
+
+    async fn mock_study_service() -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/study/definition",
+            axum::routing::post(study_definition_upstream),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind study mock");
+        let address = listener.local_addr().expect("study mock address");
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve study mock");
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn study_definition_request() -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/study/definition")
+            .header("content-type", "application/json")
+            .header("x-api-key", "study-key")
+            .header("x-forwarded-for", "203.0.113.44")
+            .body(Body::from(r#"{"invitation":"individual-invitation-0001"}"#))
+            .expect("study request")
+    }
+
+    #[tokio::test]
+    async fn study_participants_do_not_share_proxy_rate_buckets() {
+        let (validation_url, server) = mock_study_service().await;
+        let tracker = tracker_with_quota("study-key", 100);
+        let mut state = build_test_state(tracker, Some(validation_url));
+        state.api_keys = Arc::new(vec!["study-key".into()]);
+        state.rate_limiter = Arc::new(RateLimiter::new(1));
+        state.per_ip_rate_limiter = Arc::new(PerIpRateLimiter::new(1));
+        let app = create_router(state, &[]);
+
+        let first = app
+            .clone()
+            .oneshot(study_definition_request())
+            .await
+            .expect("first study response");
+        let second = app
+            .oneshot(study_definition_request())
+            .await
+            .expect("second study response");
+        server.abort();
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::OK);
+    }
 
     /// Tiny router that pipes every request through the per-IP rate
     /// limiter and short-circuits to a 200 if the middleware allows.
@@ -425,6 +526,173 @@ mod per_ip_middleware_tests {
                 per_ip_rate_limit_middleware,
             ))
             .with_state(state)
+    }
+
+    fn study_load_app(rate: u32, permits: usize) -> Router {
+        let tracker = tracker_with_quota("dummy", 100);
+        let mut state = build_test_state(tracker, None);
+        state.study_service_rate_limiter = Arc::new(RateLimiter::new(rate));
+        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(permits));
+        Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                study_load_middleware,
+            ))
+            .with_state(state)
+    }
+
+    #[tokio::test]
+    async fn study_service_bucket_returns_retry_after() {
+        let app = study_load_app(1, 1);
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("first response");
+        let second = app
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("second response");
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(second.headers().contains_key("retry-after"));
+    }
+
+    #[tokio::test]
+    async fn study_concurrency_guard_rejects_without_waiting() {
+        let tracker = tracker_with_quota("dummy", 100);
+        let mut state = build_test_state(tracker, None);
+        let limiter = Arc::new(RateLimiter::new(1));
+        state.study_service_rate_limiter = Arc::clone(&limiter);
+        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(0));
+        let app = Router::new()
+            .route("/probe", get(|| async { "ok" }))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                study_load_middleware,
+            ))
+            .with_state(state);
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.headers().get("retry-after").unwrap(), "1");
+        assert!(limiter.check("study-service").is_ok());
+    }
+
+    #[tokio::test]
+    async fn study_concurrency_guard_bounds_parallel_work() {
+        const PERMITS: usize = 8;
+        const REQUESTS: usize = 64;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let handler_active = Arc::clone(&active);
+        let handler_maximum = Arc::clone(&maximum);
+        let tracker = tracker_with_quota("dummy", 100);
+        let mut state = build_test_state(tracker, None);
+        state.study_service_rate_limiter = Arc::new(RateLimiter::new(10_000));
+        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(PERMITS));
+        let app = Router::new()
+            .route(
+                "/probe",
+                get(move || {
+                    let active = Arc::clone(&handler_active);
+                    let maximum = Arc::clone(&handler_maximum);
+                    async move {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(25)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        "ok"
+                    }
+                }),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                study_load_middleware,
+            ))
+            .with_state(state);
+
+        let mut tasks = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let request_app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                request_app
+                    .oneshot(
+                        Request::builder()
+                            .uri("/probe")
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response")
+                    .status()
+            }));
+        }
+
+        let mut admitted = 0;
+        let mut rejected = 0;
+        for task in tasks {
+            match task.await.expect("request task") {
+                StatusCode::OK => admitted += 1,
+                StatusCode::TOO_MANY_REQUESTS => rejected += 1,
+                status => panic!("unexpected status {status}"),
+            }
+        }
+
+        assert!(admitted > 0);
+        assert!(rejected > 0);
+        assert!(maximum.load(Ordering::SeqCst) <= PERMITS);
+    }
+
+    #[tokio::test]
+    async fn study_routes_reject_oversized_bodies_before_proxying() {
+        let tracker = tracker_with_quota("study-key", 100);
+        let mut state = build_test_state(tracker, Some("http://127.0.0.1:9".into()));
+        state.api_keys = Arc::new(vec!["study-key".into()]);
+        let app = create_router(state, &[]);
+        let body = serde_json::json!({
+            "invitation": "A".repeat(STUDY_REQUEST_BODY_BYTES)
+        })
+        .to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/study/definition")
+                    .header("content-type", "application/json")
+                    .header("content-length", body.len().to_string())
+                    .header("x-api-key", "study-key")
+                    .body(Body::from(body))
+                    .expect("study request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     fn req_with_xff(xff: &str) -> Request<Body> {
