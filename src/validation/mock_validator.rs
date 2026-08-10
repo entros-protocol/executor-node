@@ -61,6 +61,7 @@ impl MockValidator {
 
         let app = Router::new()
             .route("/validate", post(handle))
+            .route("/", post(handle_rpc))
             .with_state(state);
 
         // Port 0 lets the OS pick a free port, so parallel tests never collide.
@@ -122,6 +123,22 @@ async fn handle(
     (state.status, Json(state.body.clone()))
 }
 
+async fn handle_rpc(Json(body): Json<Value>) -> Json<Value> {
+    let value = if body.get("method").and_then(Value::as_str) == Some("getMultipleAccounts") {
+        serde_json::json!([null])
+    } else {
+        Value::Null
+    };
+    Json(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": body.get("id").cloned().unwrap_or(Value::Null),
+        "result": {
+            "context": { "slot": 1 },
+            "value": value
+        }
+    }))
+}
+
 /// An `AppState` wired to `mock`, with every nondeterministic input disabled.
 ///
 /// Three hazards are neutralized here rather than left for each test:
@@ -132,11 +149,8 @@ async fn handle(
 ///   test and above 8 concurrent tests `try_acquire` fails nondeterministically,
 ///   flipping `reputation_risk` between a computed value and its `0.5` default.
 ///   Disabling it pins that term, and with it the composite.
-/// * `relayer_tx` — the identity-PDA read is unconditional and carries no
-///   per-call timeout (the `RpcClient` default is 30s). `build_test_state`
-///   points at `127.0.0.1:8899`, so a developer running `solana-test-validator`
-///   would get real chain data or a long stall. Port 1 is guaranteed closed, so
-///   the read fails instantly and `recent_timestamps` stays empty.
+/// * `relayer_tx` uses the mock server's JSON-RPC route. It returns a successful
+///   account-absence response without reading a developer's local validator.
 /// * `curve_trace_observe` — silences the detached scoring task, which is
 ///   irrelevant to these assertions.
 ///
@@ -157,7 +171,7 @@ pub fn state_with_mock_validator(
     state.curve_trace_observe = false;
     state.relayer_tx = Arc::new(crate::relayer::transaction::RelayerTransaction::new(
         Arc::new(crate::solana::client::SolanaClient::new(
-            "http://127.0.0.1:1",
+            &mock.url(),
             Keypair::new(),
         )),
     ));

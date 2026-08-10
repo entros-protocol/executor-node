@@ -63,27 +63,23 @@ impl SolanaClient {
     }
 
     pub async fn get_account_data(&self, pubkey: &Pubkey) -> Result<Option<Vec<u8>>, AppError> {
-        match self.rpc.get_account(pubkey).await {
-            Ok(account) => Ok(Some(account.data)),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("AccountNotFound") || err_str.contains("could not find account")
-                {
-                    Ok(None)
-                } else {
-                    tracing::error!(
-                        error = %err_str,
-                        pubkey = %pubkey,
-                        "get_account_data RPC call failed"
-                    );
-                    Err(AppError::SolanaRpcUnavailable)
-                }
-            }
-        }
+        let mut accounts = self
+            .rpc
+            .get_multiple_accounts(&[*pubkey])
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    pubkey = %pubkey,
+                    "get_account_data RPC call failed"
+                );
+                AppError::SolanaRpcUnavailable
+            })?;
+        Ok(accounts.pop().flatten().map(|account| account.data))
     }
 
     /// Native SOL balance (lamports) of an arbitrary wallet. Used by the
-    /// observe-only wallet-reputation read (#196, D1) — public on-chain data,
+    /// observe-only wallet-reputation read. It uses public on-chain data,
     /// never a gate. Failures log at `debug` (not `error` like the decision-path
     /// reads): a miss on this non-blocking calibration read is non-actionable.
     pub async fn get_balance_of(&self, pubkey: &Pubkey) -> Result<u64, AppError> {

@@ -26,22 +26,85 @@ use crate::validation::composite::{RiskComponents, CAPTCHA_THRESHOLD, REJECT_THR
 /// variable that can be turned back on for a calibration window, and this
 /// timeout must not become the thing that breaks when it is.
 const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
+const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectionIntent {
+    Mint,
+    Update,
+    Rebaseline,
+    Reset,
+}
+
+impl ProjectionIntent {
+    fn receipt_purpose(self, projection_version: u16) -> Option<&'static str> {
+        match self {
+            Self::Mint => Some("mint"),
+            Self::Rebaseline => Some("rebaseline"),
+            Self::Reset if projection_version > 0 => Some("reset"),
+            Self::Reset | Self::Update => None,
+        }
+    }
+}
+
+fn derive_projection_intent(
+    identity_data: Option<&[u8]>,
+    requested_version: u16,
+    reset_requested: bool,
+) -> Result<ProjectionIntent, AppError> {
+    let Some(data) = identity_data else {
+        if reset_requested {
+            return Err(AppError::InvalidRequest(
+                "A baseline reset requires an existing identity".into(),
+            ));
+        }
+        return Ok(ProjectionIntent::Mint);
+    };
+    if data.len() < IDENTITY_DISCRIMINATOR.len()
+        || data[..IDENTITY_DISCRIMINATOR.len()] != IDENTITY_DISCRIMINATOR
+    {
+        return Err(AppError::SolanaRpcUnavailable);
+    }
+    let stored_version = if data.len() >= IDENTITY_PROJECTION_VERSION_OFFSET + 2 {
+        u16::from_le_bytes([
+            data[IDENTITY_PROJECTION_VERSION_OFFSET],
+            data[IDENTITY_PROJECTION_VERSION_OFFSET + 1],
+        ])
+    } else {
+        0
+    };
+    match (requested_version.cmp(&stored_version), reset_requested) {
+        (std::cmp::Ordering::Less, _) => Err(AppError::ProjectionUpdateRequired),
+        (std::cmp::Ordering::Equal, true) => Ok(ProjectionIntent::Reset),
+        (std::cmp::Ordering::Equal, false) => Ok(ProjectionIntent::Update),
+        (std::cmp::Ordering::Greater, true) => Err(AppError::InvalidRequest(
+            "A projection upgrade must use the rebaseline path".into(),
+        )),
+        (std::cmp::Ordering::Greater, false) => Ok(ProjectionIntent::Rebaseline),
+    }
+}
 
 #[derive(Deserialize)]
 pub struct ValidateFeaturesRequest {
     pub features: Vec<f64>,
     pub wallet_id: String,
-    /// F0 contour per audio frame. Forwarded to the validation service for
-    /// Tier 2 cross-modal temporal analysis. Absent for older SDK versions.
+    #[serde(default)]
+    pub projection_version: Option<u16>,
+    /// Requests a reset-scoped validator receipt for an existing identity.
+    /// The executor still derives the identity and projection state from chain.
+    #[serde(default)]
+    pub baseline_reset: bool,
+    /// F0 contour per audio frame. Forwarded for temporal analysis.
+    /// Absent for older SDK versions.
     #[serde(default)]
     pub f0_contour: Option<Vec<f64>>,
     /// Acceleration magnitude time-series, resampled to match `f0_contour` length.
     /// Paired with `f0_contour` for lagged cross-correlation.
     #[serde(default)]
     pub accel_magnitude: Option<Vec<f64>>,
-    /// Base64-encoded 16-bit PCM audio samples (mono). Forwarded unchanged
-    /// to the validation service for phrase content binding (master-list
-    /// #89). Absent for older SDK versions.
+    /// Base64-encoded 16-bit mono PCM audio samples. Forwarded unchanged
+    /// for phrase content binding. Absent for older SDK versions.
     #[serde(default)]
     pub audio_samples_b64: Option<String>,
     /// Native sample rate of the transmitted audio. Forwarded unchanged to
@@ -50,30 +113,21 @@ pub struct ValidateFeaturesRequest {
     /// with Bluetooth codec negotiation).
     #[serde(default)]
     pub audio_sample_rate_hz: Option<u32>,
-    /// Legacy mint-intent signal. Forwarded unchanged to the validation
-    /// service, whose receipt is signed over a SERVER-DERIVED commitment — the
-    /// bytes here are no longer trusted, only their presence triggers signing
-    /// for SDKs predating `request_receipt`. Absent for re-verification
-    /// (`update_anchor`) flows and pre-receipt SDK versions.
+    /// Deprecated client field retained for request compatibility.
+    /// The executor derives protocol intent from chain state.
     #[serde(default)]
-    pub commitment_new_hex: Option<String>,
-    /// Explicit mint-intent flag (current SDKs). Forwarded unchanged; the
-    /// validation service signs a receipt over the commitment it derives from
-    /// `features` when this is set and validation passes. Absent for
-    /// re-verification and pre-`request_receipt` SDKs.
+    #[serde(rename = "commitment_new_hex")]
+    pub _commitment_new_hex: Option<String>,
+    /// Deprecated client field retained for request compatibility.
+    /// The executor derives receipt purpose from chain state.
     #[serde(default)]
-    pub request_receipt: Option<bool>,
-    /// Client-reported browser signals (master-list #196), evaluated in the
-    /// executor and NOT forwarded to the validation service. Two groups with
-    /// DIFFERENT decision roles: the `automation` group (WebDriver flag +
-    /// framework tells, Layer A1) currently contributes to `automation_risk`
-    /// and thus the composite; the `capture` group (acoustic realism, Layer B1)
-    /// is observe/telemetry only and does not affect the outcome — its
-    /// authoritative counterpart is computed server-side (Item #15, which also
-    /// tracks whether A1 should revert to observe-only). All signals are
-    /// client-reported and therefore spoofable — risk nudges, not gates.
-    /// Privacy-first — only automation artifacts + coarse acoustic stats, never
-    /// fingerprints or user data. Absent for older SDKs (logged as such).
+    #[serde(rename = "request_receipt")]
+    pub _request_receipt: Option<bool>,
+    /// Client-reported browser signals. The executor evaluates them without
+    /// forwarding them. Automation signals can affect `automation_risk`.
+    /// Capture realism signals remain observation-only. All signals are
+    /// client-controlled. They supplement server-side checks and cannot prove
+    /// sensor provenance. They contain no fingerprints or direct user data.
     #[serde(default)]
     pub client_signals: Option<ClientSignals>,
     /// Coarse curve-trace outline (touch-curve Stage 1). Equal-time resampled
@@ -269,7 +323,7 @@ pub async fn validate_features_handler(
         ));
     }
 
-    // Extract client IP and User-Agent for cross-wallet cooldown check (master-list #142)
+    // Extract the client IP and user agent for the cross-wallet cooldown check.
     let ip = crate::auth::client_ip::extract_client_ip(&headers, peer.map(|Extension(c)| c.0))
         .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
 
@@ -290,7 +344,7 @@ pub async fn validate_features_handler(
         None => user_agent_raw,
     };
 
-    // Check probing blocklist (Item #135)
+    // Reject an active probing block before allocating validation resources.
     if let Some(expire_time) = state.probing_blocklist.get(&ip).map(|r| *r) {
         let now = std::time::Instant::now();
         if expire_time > now {
@@ -327,13 +381,12 @@ pub async fn validate_features_handler(
         }
     }
 
-    // Layer A1 automation gate. A browser reporting navigator.webdriver === true
+    // A browser reporting navigator.webdriver === true
     // is refused ahead of the validation round-trip, skipping the upstream call.
     // The dev pass-through with no validator configured is unaffected. Framework
     // `tells` are handled separately below. Disable for the team's own E2E
     // automation via EXECUTOR_AUTOMATION_WEBDRIVER_REJECT=false.
     //
-    // Scope and limits: docs/reference/EXECUTOR-SCORING-INTERNALS.md
     if state.automation_webdriver_reject
         && state.validation_url.is_some()
         && req
@@ -396,7 +449,7 @@ pub async fn validate_features_handler(
         }
     }
 
-    // Per-wallet attempt cap (master-list #94). Atomic check-and-record
+    // Record each admitted wallet attempt atomically
     // under a single DashMap entry write lock — concurrent requests for
     // the same wallet can never collectively bypass the cap. Slot is
     // refunded on successful validation below; failures leave it
@@ -427,7 +480,7 @@ pub async fn validate_features_handler(
         }
     };
 
-    // Observe-only wallet reputation (master-list #196, Layer D1). Reads the
+    // Observe-only wallet reputation reads the
     // verifying wallet's PUBLIC on-chain reputation (balance + recent activity)
     // as a risk prior and logs it for calibration. Placed AFTER the per-wallet
     // cap and integrator-quota gates so rate-limited / quota-exhausted traffic
@@ -463,7 +516,7 @@ pub async fn validate_features_handler(
     };
 
     // Look up the challenge phrase for this wallet so the validation service
-    // can match transcription against it (master-list #89). If no challenge
+    // can match transcription against it. If no challenge
     // was issued (old SDK path) or it has aged out, forward `None` — the
     // validation service treats missing phrase as skip, preserving backward
     // compatibility for pre-0.10.0 SDK clients.
@@ -475,8 +528,8 @@ pub async fn validate_features_handler(
         .peek_challenge(&wallet, state.challenge_ttl_secs);
     let expected_phrase = issued_challenge.as_ref().map(|(phrase, _)| phrase.clone());
 
-    // Touch-curve Stage 1 (observe-only): score the coarse outline against the
-    // issued curve OFF the request path. Detached (like `wallet_reputation_observe`)
+    // Score the coarse outline against the issued curve for observation only.
+    // Run this outside the request path. Detached like `wallet_reputation_observe`,
     // so it can never add latency or perturb the outcome; sanitized + capped so a
     // hostile payload can neither burn CPU nor poison the calibration corpus. Runs
     // only when the client sent an outline and a curve is outstanding.
@@ -510,14 +563,29 @@ pub async fn validate_features_handler(
 
     // Fetch user's verification timestamps from on-chain IdentityState
     let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&wallet);
-    let mut recent_timestamps = Vec::new();
-    if let Ok(Some(data)) = state
+    let projection_version = req.projection_version.unwrap_or(0);
+    if req
+        .study
+        .as_ref()
+        .is_some_and(|study| study.projection_version != projection_version)
+    {
+        return Err(AppError::InvalidRequest(
+            "Study projection version does not match the validation request".into(),
+        ));
+    }
+    let identity_result = state
         .relayer_tx
         .client()
         .get_account_data(&identity_pda)
-        .await
-    {
-        const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
+        .await;
+    let identity_data = identity_result?;
+    let projection_intent = derive_projection_intent(
+        identity_data.as_deref(),
+        projection_version,
+        req.baseline_reset,
+    )?;
+    let mut recent_timestamps = Vec::new();
+    if let Some(data) = identity_data {
         if data.len() >= 8 && data[..8] == IDENTITY_DISCRIMINATOR {
             // Offset for recent_timestamps is 127
             // Struct layout: recent_timestamps is [i64; 52] = 416 bytes
@@ -562,8 +630,9 @@ pub async fn validate_features_handler(
         "audio_samples_b64": req.audio_samples_b64,
         "audio_sample_rate_hz": req.audio_sample_rate_hz,
         "expected_phrase": expected_phrase,
-        "commitment_new_hex": req.commitment_new_hex,
-        "request_receipt": req.request_receipt,
+        "projection_version": projection_version,
+        "receipt_purpose": projection_intent.receipt_purpose(projection_version),
+        "request_receipt": projection_intent == ProjectionIntent::Mint,
         "recent_timestamps": recent_timestamps,
         "origin_ip": Some(ip.to_string()),
         "origin_ua": Some(user_agent.to_string()),
@@ -653,10 +722,7 @@ pub async fn validate_features_handler(
 
     state.metrics.increment_validations();
 
-    // 1. Automation Risk (Layer A1). NOTE: automation tells (webdriver +
-    // framework labels) currently feed automation_risk and thus the composite.
-    // Whether Layer A1 should be observe-only (its original master-list #196
-    // framing) or decision-affecting is an open question — see Item #15.
+    // WebDriver and framework labels currently feed automation risk.
     let mut automation_risk = 0.0;
     if let Some(signals) = req.client_signals.as_ref() {
         if let Some(a) = signals.automation.as_ref() {
@@ -666,13 +732,12 @@ pub async fn validate_features_handler(
                 automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
             }
         }
-        // Acoustic realism (Layer B1) from client-reported CaptureSignals is
+        // Client-reported acoustic realism is
         // OBSERVE / TELEMETRY ONLY — spoofable (computed in the browser), so it
         // MUST NOT feed the pass/fail decision. Log for calibration; do NOT add
         // it to automation_risk. The un-forgeable acoustic check is computed
         // server-side from the raw audio the validator already receives; wiring
-        // that into the composite (observe -> calibrate -> enforce) is tracked
-        // in remaining-public-tasks.md Item #15.
+        // that into the composite requires separate calibration.
         let acoustic_eval =
             crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
         if acoustic_eval.risk_score > 0.0 {
@@ -687,7 +752,7 @@ pub async fn validate_features_handler(
         }
     }
 
-    // 2. Reputation Risk (Layer D1)
+    // Reputation risk
     let reputation_risk = if let Some(rep) = &reputation_opt {
         let sol_score = (rep.sol_lamports as f64 / 100_000_000.0).min(1.0);
         let activity_score = (rep.signature_count as f64 / 10.0).min(1.0);
@@ -760,6 +825,12 @@ pub async fn validate_features_handler(
         const REASON_ALLOWLIST: &[&str] = &["phrase_content_mismatch"];
 
         let err_body = response.json::<ValidatorErrorBody>().await.ok();
+
+        if err_body.as_ref().and_then(|body| body.reason.as_deref())
+            == Some("projection_update_required")
+        {
+            return Err(AppError::ProjectionUpdateRequired);
+        }
 
         // If probing was detected, insert into state.probing_blocklist
         if let Some(true) = err_body.as_ref().and_then(|body| body.probing_detected) {
@@ -920,6 +991,53 @@ fn validation_failure(reason: Option<String>, study_record_status: Option<&str>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity_data_with_projection(version: u16) -> Vec<u8> {
+        let mut data = vec![0_u8; IDENTITY_PROJECTION_VERSION_OFFSET + 2];
+        data[..8].copy_from_slice(&IDENTITY_DISCRIMINATOR);
+        data[IDENTITY_PROJECTION_VERSION_OFFSET..IDENTITY_PROJECTION_VERSION_OFFSET + 2]
+            .copy_from_slice(&version.to_le_bytes());
+        data
+    }
+
+    #[test]
+    fn projection_intent_comes_from_chain_state() {
+        assert_eq!(
+            derive_projection_intent(None, 1, false).unwrap(),
+            ProjectionIntent::Mint
+        );
+        assert_eq!(
+            derive_projection_intent(Some(&identity_data_with_projection(1)), 1, false).unwrap(),
+            ProjectionIntent::Update
+        );
+        assert_eq!(
+            derive_projection_intent(Some(&identity_data_with_projection(0)), 1, false).unwrap(),
+            ProjectionIntent::Rebaseline
+        );
+        assert_eq!(
+            derive_projection_intent(Some(&identity_data_with_projection(1)), 1, true).unwrap(),
+            ProjectionIntent::Reset
+        );
+    }
+
+    #[test]
+    fn projection_zero_reset_keeps_the_legacy_no_receipt_path() {
+        assert_eq!(ProjectionIntent::Reset.receipt_purpose(0), None);
+        assert_eq!(ProjectionIntent::Reset.receipt_purpose(1), Some("reset"));
+        assert_eq!(ProjectionIntent::Mint.receipt_purpose(0), Some("mint"));
+    }
+
+    #[test]
+    fn projection_intent_rejects_downgrades_and_invalid_accounts() {
+        assert!(
+            derive_projection_intent(Some(&identity_data_with_projection(2)), 1, false).is_err()
+        );
+        assert!(derive_projection_intent(Some(&[0_u8; 32]), 1, false).is_err());
+        assert!(derive_projection_intent(None, 1, true).is_err());
+        assert!(
+            derive_projection_intent(Some(&identity_data_with_projection(0)), 1, true).is_err()
+        );
+    }
     use crate::integrator::wallet_attempts::WalletAttemptTracker;
     use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
 
@@ -930,12 +1048,14 @@ mod tests {
         ValidateFeaturesRequest {
             features: vec![0.0; 308],
             wallet_id,
+            projection_version: None,
+            baseline_reset: false,
             f0_contour: None,
             accel_magnitude: None,
             audio_samples_b64: None,
             audio_sample_rate_hz: None,
-            commitment_new_hex: None,
-            request_receipt: None,
+            _commitment_new_hex: None,
+            _request_receipt: None,
             client_signals: None,
             curve_trace: None,
             capture_timing: None,
@@ -1410,6 +1530,46 @@ mod validator_reached_tests {
             1,
             "metrics must count work that actually happened"
         );
+        let sent = mock.received();
+        assert_eq!(sent[0]["receipt_purpose"], "mint");
+        assert_eq!(sent[0]["request_receipt"], true);
+    }
+
+    #[tokio::test]
+    async fn identity_rpc_failure_stops_before_validation() {
+        use solana_sdk::signature::Keypair;
+
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.relayer_tx = std::sync::Arc::new(
+            crate::relayer::transaction::RelayerTransaction::new(std::sync::Arc::new(
+                crate::solana::client::SolanaClient::new("http://127.0.0.1:1", Keypair::new()),
+            )),
+        );
+        let rpc_probe = state
+            .relayer_tx
+            .client()
+            .get_account_data(&Pubkey::new_unique())
+            .await;
+        assert!(
+            matches!(rpc_probe, Err(AppError::SolanaRpcUnavailable)),
+            "closed RPC port returned {rpc_probe:?}"
+        );
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        match result.map(|_| ()) {
+            Err(AppError::SolanaRpcUnavailable) => {}
+            other => panic!("expected Solana RPC failure, got {other:?}"),
+        }
+        assert!(mock.received().is_empty());
     }
 
     #[tokio::test]
@@ -1447,7 +1607,7 @@ mod validator_reached_tests {
             "record_id": "00112233445566778899aabbccddeeff",
             "capture_class": "web-mobile",
             "feature_schema_version": 3,
-            "projection_version": 2,
+            "projection_version": 0,
         });
         let mut request = baseline_request(random_wallet_id());
         request.study =
@@ -1485,7 +1645,7 @@ mod validator_reached_tests {
             record_id: "00112233445566778899aabbccddeeff".into(),
             capture_class: StudyCaptureClass::WebMobile,
             feature_schema_version: 3,
-            projection_version: 2,
+            projection_version: 0,
         });
 
         let result = validate_features_handler(
@@ -1506,6 +1666,38 @@ mod validator_reached_tests {
             }
             other => panic!("expected study-aware policy rejection, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn study_projection_must_match_the_validation_request() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let mut request = baseline_request(random_wallet_id());
+        request.study = Some(StudyRequestContext {
+            token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            record_id: "00112233445566778899aabbccddeeff".into(),
+            capture_class: StudyCaptureClass::WebDesktop,
+            feature_schema_version: 4,
+            projection_version: 1,
+        });
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await;
+
+        match result.map(|_| ()) {
+            Err(AppError::InvalidRequest(message)) => assert_eq!(
+                message,
+                "Study projection version does not match the validation request"
+            ),
+            other => panic!("expected projection mismatch rejection, got {other:?}"),
+        }
+        assert!(mock.received().is_empty());
     }
 
     #[tokio::test]
@@ -1534,6 +1726,27 @@ mod validator_reached_tests {
             }
             other => panic!("expected study-aware validation failure, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn projection_update_reason_maps_to_the_client_update_path() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(
+            StatusCode::CONFLICT,
+            error_body("projection_update_required"),
+        )
+        .await;
+        let state = state_with_mock_validator(tracker, &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::ProjectionUpdateRequired)));
     }
 
     #[tokio::test]
@@ -1579,7 +1792,7 @@ mod validator_reached_tests {
         // the composite at weight 0.15. Pinning both halves means this suite
         // describes what the flag does in either position without asserting
         // which default is correct; that policy question is open (see the note
-        // at the automation_risk computation and remaining-public-tasks #15).
+        // at the automation-risk computation above).
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let mut state = state_with_mock_validator(tracker.clone(), &mock);
