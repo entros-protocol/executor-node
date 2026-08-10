@@ -3,15 +3,18 @@
  * for the Solana Attestation Service (SAS) integration.
  *
  * Run: cd executor-node/scripts && npm install
+ *      AUTHORITY_KEYPAIR_PATH=<path> EXPECTED_AUTHORITY=<pubkey> \
  *      CREDENTIAL_NAME=<name> SCHEMA_NAME=<name> npm run setup
+ *
+ * Add `-- --apply` only after reviewing the derived addresses.
  *
  * Both names are REQUIRED and both are permanent once created. A credential
  * PDA derives from authority plus name, so a different name means a different
  * account, not an edit to an existing one.
  *
  * Prerequisites:
- *   - Relayer keypair at ../relayer-keypair.json (or RELAYER_KEYPAIR_PATH env var)
- *   - Devnet SOL in the relayer account (use `solana airdrop 2`)
+ *   - Explicit authority keypair path and expected public key
+ *   - Devnet SOL in the authority account
  *
  * Output: Credential PDA and Schema PDA to add to executor .env
  */
@@ -32,12 +35,15 @@ import {
   createKeyPairFromBytes,
   pipe,
   createTransactionMessage,
+  address,
   setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash,
   appendTransactionMessageInstructions,
   signTransactionMessageWithSigners,
   sendAndConfirmTransactionFactory,
   getSignatureFromTransaction,
+  assertIsTransactionWithBlockhashLifetime,
+  type Instruction,
   type KeyPairSigner,
 } from "@solana/kit";
 
@@ -45,80 +51,110 @@ const DEVNET_RPC = "https://api.devnet.solana.com";
 const DEVNET_WS = "wss://api.devnet.solana.com";
 
 async function loadKeypairSigner(): Promise<KeyPairSigner> {
-  const keypairPath = process.env.RELAYER_KEYPAIR_PATH ||
-    resolve(import.meta.dirname, "..", "relayer-keypair.json");
+  const configuredPath = process.env.AUTHORITY_KEYPAIR_PATH;
+  if (!configuredPath) {
+    throw new Error("AUTHORITY_KEYPAIR_PATH is required");
+  }
+  const keypairPath = resolve(configuredPath);
 
   const raw = readFileSync(keypairPath, "utf-8");
-  const secretKey = new Uint8Array(JSON.parse(raw));
+  const parsed: unknown = JSON.parse(raw);
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 64 ||
+    !parsed.every((value) => Number.isInteger(value) && value >= 0 && value <= 255)
+  ) {
+    throw new Error(`Expected a 64-byte Solana keypair at ${keypairPath}`);
+  }
+  const secretKey = new Uint8Array(parsed);
 
   const keypair = await createKeyPairFromBytes(secretKey);
-  return await createSignerFromKeyPair(keypair);
+  const signer = await createSignerFromKeyPair(keypair);
+  const expectedAuthority = process.env.EXPECTED_AUTHORITY;
+  if (!expectedAuthority) {
+    throw new Error("EXPECTED_AUTHORITY is required");
+  }
+  if (signer.address !== expectedAuthority) {
+    throw new Error(
+      `Loaded authority ${signer.address} does not match EXPECTED_AUTHORITY ${expectedAuthority}`,
+    );
+  }
+  return signer;
 }
 
 async function main() {
-  console.log("Loading relayer keypair...");
-  const authority = await loadKeypairSigner();
-  console.log(`Authority: ${authority.address}`);
+  const apply = process.argv.slice(2).includes("--apply");
+  const expectedAuthority = process.env.EXPECTED_AUTHORITY;
+  if (!expectedAuthority) {
+    throw new Error("EXPECTED_AUTHORITY is required");
+  }
+  const authorityAddress = address(expectedAuthority);
+  console.log(`Authority: ${authorityAddress}`);
 
+  // 1. Create Entros Credential
+  console.log("\n--- Creating Entros Credential ---");
+
+  // A credential name is permanent and changes the derived account address.
+  const credentialName = process.env.CREDENTIAL_NAME;
+  if (!credentialName) {
+    console.error("CREDENTIAL_NAME is required");
+    process.exit(1);
+  }
+
+  const [credentialPda] = await deriveCredentialPda({
+    authority: authorityAddress,
+    name: credentialName,
+  });
+  console.log(`Credential name: ${credentialName}`);
+  console.log(`Credential PDA: ${credentialPda}`);
+
+  const schemaName = process.env.SCHEMA_NAME;
+  if (!schemaName) {
+    console.error("SCHEMA_NAME is required");
+    process.exit(1);
+  }
+  const schemaVersion = 1;
+  const [schemaPda] = await deriveSchemaPda({
+    credential: credentialPda,
+    name: schemaName,
+    version: schemaVersion,
+  });
+  console.log(`Schema name: ${schemaName}`);
+  console.log(`Schema PDA: ${schemaPda}`);
+
+  if (!apply) {
+    console.log("Dry run complete. Re-run with --apply after reviewing these addresses.");
+    return;
+  }
+
+  console.log("Loading the explicit credential authority...");
+  const authority = await loadKeypairSigner();
   const rpc = createSolanaRpc(DEVNET_RPC);
   const rpcSubscriptions = createSolanaRpcSubscriptions(DEVNET_WS);
   const sendAndConfirm = sendAndConfirmTransactionFactory({ rpc, rpcSubscriptions });
 
-  // Check balance
   const balance = await rpc.getBalance(authority.address).send();
   console.log(`Balance: ${Number(balance.value) / 1e9} SOL`);
-
   if (Number(balance.value) < 0.05e9) {
-    console.error("Insufficient balance. Run: solana airdrop 2");
+    console.error("The authority balance is too low for account creation");
     process.exit(1);
   }
 
-  // Helper: build, sign, send, confirm a transaction
   async function submitTx(
-    instructions: ReturnType<typeof getCreateCredentialInstruction>[],
+    instructions: readonly Instruction[],
   ): Promise<string> {
     const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-
     const txMessage = pipe(
       createTransactionMessage({ version: 0 }),
       (msg) => setTransactionMessageFeePayerSigner(authority, msg),
       (msg) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, msg),
       (msg) => appendTransactionMessageInstructions(instructions, msg),
     );
-
     const signedTx = await signTransactionMessageWithSigners(txMessage);
+    assertIsTransactionWithBlockhashLifetime(signedTx);
     await sendAndConfirm(signedTx, { commitment: "confirmed" });
     return getSignatureFromTransaction(signedTx);
   }
-
-  // 1. Create Entros Credential
-  console.log("\n--- Creating Entros Credential ---");
-
-  // Required, with no default. A credential PDA derives from authority plus
-  // name, so changing the name silently targets a different account. This
-  // script once defaulted to "entros-protocol" while the live devnet
-  // credential is named "iam-protocol", which meant running it created a
-  // second credential rather than reporting the first. Neither a credential
-  // name nor a schema name can be changed after creation, so the value is
-  // permanent and must be chosen deliberately.
-  const credentialName = process.env.CREDENTIAL_NAME;
-  if (!credentialName) {
-    console.error(
-      "CREDENTIAL_NAME is required.\n" +
-        "  Live devnet credential: iam-protocol " +
-        "(GaPTkZC6JEGds1G5h645qyUrogx7NWghR2JgjvKQwTDo)\n" +
-        "  For a new mainnet credential, choose the name you want to keep forever.\n" +
-        "  For a throwaway test credential, use something obviously disposable.",
-    );
-    process.exit(1);
-  }
-
-  const [credentialPda] = await deriveCredentialPda({
-    authority: authority.address,
-    name: credentialName,
-  });
-  console.log(`Credential name: ${credentialName}`);
-  console.log(`Credential PDA: ${credentialPda}`);
 
   const credentialAccount = await rpc.getAccountInfo(credentialPda, { encoding: "base64" }).send();
   if (credentialAccount.value) {
@@ -139,27 +175,7 @@ async function main() {
   // 2. Create Entros Schema
   console.log("\n--- Creating Entros Schema ---");
 
-  // Same rule as the credential name. The live devnet schema is
-  // "iam-humanity-v2" at EPkajiGQjycPwcc3pupqExVdAmSfxWd31tRYZezd8c5g, with
-  // the description "IAM Protocol Proof-of-Humanity attestation". The
-  // description below no longer matches it. Descriptions are mutable through
-  // ChangeSchemaDescription, names are not.
-  const schemaName = process.env.SCHEMA_NAME;
-  if (!schemaName) {
-    console.error(
-      "SCHEMA_NAME is required. Live devnet schema: iam-humanity-v2 " +
-        "(EPkajiGQjycPwcc3pupqExVdAmSfxWd31tRYZezd8c5g)",
-    );
-    process.exit(1);
-  }
-  const schemaVersion = 1;
-  const [schemaPda] = await deriveSchemaPda({
-    credential: credentialPda,
-    name: schemaName,
-    version: schemaVersion,
-  });
-  console.log(`Schema PDA: ${schemaPda}`);
-
+  // A schema name is permanent and changes the derived account address.
   const schemaAccount = await rpc.getAccountInfo(schemaPda, { encoding: "base64" }).send();
   if (schemaAccount.value) {
     console.log("Schema already exists, skipping creation.");

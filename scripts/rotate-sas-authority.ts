@@ -7,8 +7,7 @@
  *
  * `ChangeAuthorizedSigners` replaces the whole list rather than adding to it,
  * so a zero-downtime rotation passes both keys first and drops the old one in a
- * second run. Full procedure, including the rollback at each phase:
- * `docs/master/BLUEPRINT-sas-authority-rotation.md`.
+ * second run. Verify the current signer list before each change.
  *
  * Only the credential's authority can sign this instruction, and no instruction
  * exists to change that authority. Whoever created the credential controls its
@@ -24,12 +23,12 @@
  *
  *   # Show the change that would be made.
  *   npx tsx rotate-sas-authority.ts --credential <PDA> \
- *     --authority-keypair ../../.config/relayer-devnet.json \
  *     --signers <PUBKEY_A>,<PUBKEY_B>
  *
  *   # Send it.
  *   npx tsx rotate-sas-authority.ts --credential <PDA> \
- *     --authority-keypair ../../.config/relayer-devnet.json \
+ *     --expected-authority <PUBKEY> \
+ *     --authority-keypair ../../.config/admin-devnet.json \
  *     --signers <PUBKEY_A>,<PUBKEY_B> --apply
  */
 
@@ -53,6 +52,7 @@ import {
   signTransactionMessageWithSigners,
   sendAndConfirmTransactionFactory,
   getSignatureFromTransaction,
+  assertIsTransactionWithBlockhashLifetime,
   getBase58Encoder,
   getBase58Decoder,
   type Address,
@@ -135,10 +135,15 @@ function parseArgs(argv: string[]): Record<string, string | boolean> {
 }
 
 async function loadSigner(path: string): Promise<KeyPairSigner> {
-  const secretKey = new Uint8Array(JSON.parse(readFileSync(path, "utf-8")));
-  if (secretKey.length !== 64) {
-    throw new Error(`Expected a 64-byte Solana keypair at ${path}, got ${secretKey.length}`);
+  const parsed: unknown = JSON.parse(readFileSync(path, "utf-8"));
+  if (
+    !Array.isArray(parsed) ||
+    parsed.length !== 64 ||
+    !parsed.every((value) => Number.isInteger(value) && value >= 0 && value <= 255)
+  ) {
+    throw new Error(`Expected a 64-byte Solana keypair at ${path}`);
   }
+  const secretKey = new Uint8Array(parsed);
   return createSignerFromKeyPair(await createKeyPairFromBytes(secretKey));
 }
 
@@ -148,7 +153,7 @@ async function readCredential(
 ): Promise<CredentialState> {
   const account = await rpc.getAccountInfo(credential, { encoding: "base64" }).send();
   if (!account.value) {
-    throw new Error(`Credential ${credential} does not exist on ${RPC_URL}`);
+    throw new Error(`Credential ${credential} does not exist`);
   }
   if (account.value.owner !== SOLANA_ATTESTATION_SERVICE_PROGRAM_ADDRESS) {
     throw new Error(
@@ -220,24 +225,27 @@ async function main(): Promise<void> {
     }
   }
 
+  if (args.apply !== true) {
+    console.log("\nDry run complete. No authority key was read and nothing was sent.");
+    return;
+  }
+
+  const expectedAuthorityArg = args["expected-authority"];
+  if (typeof expectedAuthorityArg !== "string") {
+    throw new Error("--expected-authority <PUBKEY> is required with --apply");
+  }
+  const expectedAuthority = address(expectedAuthorityArg);
+  if (current.authority !== expectedAuthority) {
+    throw new Error("The credential authority does not match --expected-authority");
+  }
+
   const keypairArg = args["authority-keypair"];
   if (typeof keypairArg !== "string") {
-    console.log("\nNo --authority-keypair given. Dry run complete, nothing sent.");
-    return;
+    throw new Error("--authority-keypair <PATH> is required with --apply");
   }
-
   const authority = await loadSigner(keypairArg);
-  if (authority.address !== current.authority) {
-    console.error(
-      `\nLoaded key ${authority.address} is not the credential authority ${current.authority}.` +
-        `\nOnly the authority can change the signer list, so this transaction would fail.`,
-    );
-    process.exit(1);
-  }
-
-  if (args.apply !== true) {
-    console.log("\nDry run complete. Re-run with --apply to send the transaction.");
-    return;
+  if (authority.address !== expectedAuthority) {
+    throw new Error("The loaded authority key does not match --expected-authority");
   }
 
   console.log("\nSending ChangeAuthorizedSigners...");
@@ -260,6 +268,7 @@ async function main(): Promise<void> {
   );
 
   const signedTx = await signTransactionMessageWithSigners(txMessage);
+  assertIsTransactionWithBlockhashLifetime(signedTx);
   await sendAndConfirm(signedTx, { commitment: "confirmed" });
   console.log(`Signature: ${getSignatureFromTransaction(signedTx)}`);
 
