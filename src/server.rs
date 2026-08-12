@@ -217,6 +217,16 @@ pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
 /// task and its partial buffer indefinitely.
 pub const REQUEST_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
+fn make_http_request_span<B>(request: &axum::http::Request<B>) -> tracing::Span {
+    tracing::debug_span!(
+        target: "tower_http::trace",
+        "request",
+        method = %request.method(),
+        path = %request.uri().path(),
+        version = ?request.version()
+    )
+}
+
 pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) -> Router {
     // Attest route with its own tighter rate limit (10/min)
     let attest_route = Router::new()
@@ -353,7 +363,7 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
         // body-buffering inside `min_duration_middleware`.
         .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(make_http_request_span))
         .with_state(state)
 }
 
@@ -420,6 +430,65 @@ pub fn headers_with_key(api_key: &str) -> axum::http::HeaderMap {
     let mut headers = axum::http::HeaderMap::new();
     headers.insert("x-api-key", api_key.parse().unwrap());
     headers
+}
+
+#[cfg(test)]
+mod request_trace_tests {
+    use super::*;
+    use axum::http::Request;
+    use std::io::{self, Write};
+    use std::sync::Mutex;
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn request_trace_excludes_query_values() {
+        const SECRET_QUERY_VALUE: &str = "wallet-query-must-not-appear";
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer_logs = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "executor_node=info,tower_http=debug",
+            ))
+            .with_span_events(FmtSpan::NEW)
+            .with_writer(move || LogWriter(Arc::clone(&writer_logs)))
+            .finish();
+        let request = Request::builder()
+            .uri(format!("/health?wallet={SECRET_QUERY_VALUE}"))
+            .body(())
+            .expect("request");
+        tracing::subscriber::with_default(subscriber, || {
+            let span = make_http_request_span(&request);
+            span.in_scope(|| tracing::debug!("request accepted"));
+        });
+
+        let bytes = logs.lock().expect("log buffer lock").clone();
+        let output = String::from_utf8(bytes).expect("trace output must be UTF-8");
+        assert!(output.contains("/health"), "trace output: {output}");
+        assert!(
+            !output.contains(SECRET_QUERY_VALUE),
+            "trace output exposed a query value: {output}"
+        );
+    }
 }
 
 /// Generate a fresh, valid Solana wallet id (base58 pubkey) for tests
