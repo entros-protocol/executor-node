@@ -14,14 +14,17 @@ const STUDY_PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 const STUDY_RESPONSE_BODY_BYTES: usize = 16 * 1024;
 const MAX_RETRY_AFTER_SECS: u64 = 300;
 
-#[derive(Deserialize)]
-pub struct StudyDefinitionRequest {
-    invitation: String,
-}
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StudyDefinitionRequest {}
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StudyEnrolRequest {
-    invitation: String,
+    wallet_id: String,
+    signature_hex: String,
+    authorization_id: String,
+    signed_at: i64,
     consent_version: String,
     consent_hash_hex: String,
     enrolment_id: String,
@@ -30,24 +33,29 @@ pub struct StudyEnrolRequest {
 
 pub async fn study_definition_handler(
     State(state): State<AppState>,
-    Json(request): Json<StudyDefinitionRequest>,
+    Json(_request): Json<StudyDefinitionRequest>,
 ) -> Result<Response, AppError> {
-    validate_invitation(&request.invitation)?;
     let _permit = acquire_study_capacity(&state)?;
-    proxy_study_request(
-        &state,
-        "/study/definition",
-        serde_json::json!({ "invitation": request.invitation }),
-    )
-    .await
+    proxy_study_request(&state, "/study/definition", serde_json::json!({})).await
 }
 
 pub async fn study_enrol_handler(
     State(state): State<AppState>,
     Json(request): Json<StudyEnrolRequest>,
 ) -> Result<Response, AppError> {
-    validate_invitation(&request.invitation)?;
-    if request.consent_version.is_empty()
+    if !valid_wallet_id(&request.wallet_id)
+        || request.signature_hex.len() != 128
+        || !request
+            .signature_hex
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || request.authorization_id.len() != 32
+        || !request
+            .authorization_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || request.signed_at <= 0
+        || request.consent_version.is_empty()
         || request.consent_version.len() > 64
         || !request
             .consent_version
@@ -65,16 +73,17 @@ pub async fn study_enrol_handler(
             .all(|byte| byte.is_ascii_hexdigit())
         || !request.accepted
     {
-        return Err(AppError::InvalidRequest(
-            "invalid study consent version or hash".into(),
-        ));
+        return Err(AppError::InvalidRequest("invalid study enrolment".into()));
     }
     let _permit = acquire_study_capacity(&state)?;
     proxy_study_request(
         &state,
         "/study/enrol",
         serde_json::json!({
-            "invitation": request.invitation,
+            "wallet_id": request.wallet_id,
+            "signature_hex": request.signature_hex,
+            "authorization_id": request.authorization_id,
+            "signed_at": request.signed_at,
             "consent_version": request.consent_version,
             "consent_hash_hex": request.consent_hash_hex,
             "enrolment_id": request.enrolment_id,
@@ -84,12 +93,11 @@ pub async fn study_enrol_handler(
     .await
 }
 
-fn validate_invitation(invitation: &str) -> Result<(), AppError> {
-    if (16..=256).contains(&invitation.len()) && invitation.is_ascii() {
-        Ok(())
-    } else {
-        Err(AppError::InvalidRequest("invalid study invitation".into()))
-    }
+fn valid_wallet_id(wallet_id: &str) -> bool {
+    (32..=44).contains(&wallet_id.len())
+        && bs58::decode(wallet_id)
+            .into_vec()
+            .is_ok_and(|bytes| bytes.len() == 32)
 }
 
 fn acquire_study_capacity(state: &AppState) -> Result<OwnedSemaphorePermit, AppError> {
@@ -184,17 +192,51 @@ mod tests {
     use crate::auth::rate_limit::RateLimiter;
     use crate::server::{build_test_state, tracker_with_quota};
 
+    #[test]
+    fn study_requests_reject_unknown_fields() {
+        let definition = serde_json::from_value::<StudyDefinitionRequest>(serde_json::json!({
+            "invitation": "legacy-participant-capability"
+        }));
+        assert!(definition
+            .expect_err("unknown definition field")
+            .to_string()
+            .contains("unknown field"));
+
+        let enrolment = serde_json::from_value::<StudyEnrolRequest>(serde_json::json!({
+            "wallet_id": bs58::encode([7_u8; 32]).into_string(),
+            "signature_hex": "ab".repeat(64),
+            "authorization_id": "cd".repeat(16),
+            "signed_at": 1_775_000_000,
+            "consent_version": "2026-08-13",
+            "consent_hash_hex": "a".repeat(64),
+            "enrolment_id": "0123456789abcdef0123456789abcdef",
+            "accepted": true,
+            "invitation": "legacy-participant-capability"
+        }));
+        assert!(enrolment
+            .expect_err("unknown enrolment field")
+            .to_string()
+            .contains("unknown field"));
+    }
+
     #[tokio::test]
-    async fn invalid_request_does_not_consume_study_capacity() {
+    async fn invalid_enrolment_does_not_consume_study_capacity() {
         let tracker = tracker_with_quota("study-proxy", 10);
         let mut state = build_test_state(tracker, None);
         let limiter = Arc::new(RateLimiter::new(1));
         state.study_service_rate_limiter = Arc::clone(&limiter);
 
-        let result = study_definition_handler(
+        let result = study_enrol_handler(
             State(state),
-            Json(StudyDefinitionRequest {
-                invitation: "short".into(),
+            Json(StudyEnrolRequest {
+                wallet_id: "invalid".into(),
+                signature_hex: "00".repeat(64),
+                authorization_id: "11".repeat(16),
+                signed_at: 1_775_000_000,
+                consent_version: "2026-08-13".into(),
+                consent_hash_hex: "aa".repeat(32),
+                enrolment_id: "22".repeat(16),
+                accepted: true,
             }),
         )
         .await;
@@ -283,13 +325,8 @@ mod tests {
             let request_barrier = Arc::clone(&barrier);
             tasks.push(tokio::spawn(async move {
                 request_barrier.wait().await;
-                study_definition_handler(
-                    State(request_state),
-                    Json(StudyDefinitionRequest {
-                        invitation: "valid-study-invitation".into(),
-                    }),
-                )
-                .await
+                study_definition_handler(State(request_state), Json(StudyDefinitionRequest {}))
+                    .await
             }));
         }
 
@@ -349,7 +386,10 @@ mod tests {
         let response = study_enrol_handler(
             State(state),
             Json(StudyEnrolRequest {
-                invitation: "valid-study-invitation".into(),
+                wallet_id: bs58::encode([7_u8; 32]).into_string(),
+                signature_hex: "ab".repeat(64),
+                authorization_id: "cd".repeat(16),
+                signed_at: 1_775_000_000,
                 consent_version: "2026-08-10".into(),
                 consent_hash_hex: "a".repeat(64),
                 enrolment_id: "0123456789abcdef0123456789abcdef".into(),
@@ -367,6 +407,13 @@ mod tests {
             requests[0]["enrolment_id"],
             "0123456789abcdef0123456789abcdef"
         );
+        assert_eq!(
+            requests[0]["wallet_id"],
+            bs58::encode([7_u8; 32]).into_string()
+        );
+        assert_eq!(requests[0]["signature_hex"], "ab".repeat(64));
+        assert_eq!(requests[0]["authorization_id"], "cd".repeat(16));
+        assert_eq!(requests[0]["signed_at"], 1_775_000_000);
     }
 
     #[tokio::test]
@@ -397,14 +444,9 @@ mod tests {
             Some(format!("http://{address}")),
         );
 
-        let response = study_definition_handler(
-            State(state),
-            Json(StudyDefinitionRequest {
-                invitation: "valid-study-invitation".into(),
-            }),
-        )
-        .await
-        .expect("proxy response");
+        let response = study_definition_handler(State(state), Json(StudyDefinitionRequest {}))
+            .await
+            .expect("proxy response");
         server.abort();
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
@@ -441,14 +483,9 @@ mod tests {
             Some(format!("http://{address}")),
         );
 
-        let response = study_definition_handler(
-            State(state),
-            Json(StudyDefinitionRequest {
-                invitation: "valid-study-invitation".into(),
-            }),
-        )
-        .await
-        .expect("proxy response");
+        let response = study_definition_handler(State(state), Json(StudyDefinitionRequest {}))
+            .await
+            .expect("proxy response");
         server.abort();
 
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
