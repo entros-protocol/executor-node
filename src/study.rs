@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use axum::extract::State;
 use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
+use tokio::sync::OwnedSemaphorePermit;
 
 use crate::error::AppError;
 use crate::server::AppState;
@@ -30,6 +33,7 @@ pub async fn study_definition_handler(
     Json(request): Json<StudyDefinitionRequest>,
 ) -> Result<Response, AppError> {
     validate_invitation(&request.invitation)?;
+    let _permit = acquire_study_capacity(&state)?;
     proxy_study_request(
         &state,
         "/study/definition",
@@ -65,6 +69,7 @@ pub async fn study_enrol_handler(
             "invalid study consent version or hash".into(),
         ));
     }
+    let _permit = acquire_study_capacity(&state)?;
     proxy_study_request(
         &state,
         "/study/enrol",
@@ -85,6 +90,19 @@ fn validate_invitation(invitation: &str) -> Result<(), AppError> {
     } else {
         Err(AppError::InvalidRequest("invalid study invitation".into()))
     }
+}
+
+fn acquire_study_capacity(state: &AppState) -> Result<OwnedSemaphorePermit, AppError> {
+    let permit = Arc::clone(&state.study_concurrency)
+        .try_acquire_owned()
+        .map_err(|_| AppError::StudyRouteLimited {
+            retry_after_secs: 1,
+        })?;
+    state
+        .study_service_rate_limiter
+        .check_with_retry("study-service")
+        .map_err(|retry_after_secs| AppError::StudyRouteLimited { retry_after_secs })?;
+    Ok(permit)
 }
 
 async fn proxy_study_request(
@@ -156,13 +174,140 @@ async fn read_bounded_json(response: &mut reqwest::Response) -> Option<serde_jso
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use serde_json::Value;
 
     use super::*;
+    use crate::auth::rate_limit::RateLimiter;
     use crate::server::{build_test_state, tracker_with_quota};
+
+    #[tokio::test]
+    async fn invalid_request_does_not_consume_study_capacity() {
+        let tracker = tracker_with_quota("study-proxy", 10);
+        let mut state = build_test_state(tracker, None);
+        let limiter = Arc::new(RateLimiter::new(1));
+        state.study_service_rate_limiter = Arc::clone(&limiter);
+
+        let result = study_definition_handler(
+            State(state),
+            Json(StudyDefinitionRequest {
+                invitation: "short".into(),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        assert!(limiter.check("study-service").is_ok());
+    }
+
+    #[test]
+    fn concurrency_rejection_does_not_consume_the_rate_bucket() {
+        let tracker = tracker_with_quota("study-proxy", 10);
+        let mut state = build_test_state(tracker, None);
+        let limiter = Arc::new(RateLimiter::new(1));
+        state.study_service_rate_limiter = Arc::clone(&limiter);
+        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(0));
+
+        assert!(matches!(
+            acquire_study_capacity(&state),
+            Err(AppError::StudyRouteLimited {
+                retry_after_secs: 1
+            })
+        ));
+        assert!(limiter.check("study-service").is_ok());
+    }
+
+    #[test]
+    fn concurrency_permit_is_held_until_the_proxy_finishes() {
+        let tracker = tracker_with_quota("study-proxy", 10);
+        let mut state = build_test_state(tracker, None);
+        state.study_service_rate_limiter = Arc::new(RateLimiter::new(10));
+        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(1));
+
+        let permit = acquire_study_capacity(&state).expect("first request acquires capacity");
+        assert!(matches!(
+            acquire_study_capacity(&state),
+            Err(AppError::StudyRouteLimited {
+                retry_after_secs: 1
+            })
+        ));
+        drop(permit);
+        assert!(acquire_study_capacity(&state).is_ok());
+    }
+
+    #[tokio::test]
+    async fn study_concurrency_stays_bounded_under_pressure() {
+        const PERMITS: usize = 8;
+        const REQUESTS: usize = 64;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let handler_active = Arc::clone(&active);
+        let handler_maximum = Arc::clone(&maximum);
+        let app = Router::new().route(
+            "/study/definition",
+            post(move || {
+                let active = Arc::clone(&handler_active);
+                let maximum = Arc::clone(&handler_maximum);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Json(serde_json::json!({ "active": current }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let mut state = build_test_state(
+            tracker_with_quota("study-proxy", REQUESTS as u64),
+            Some(format!("http://{address}")),
+        );
+        state.study_service_rate_limiter = Arc::new(RateLimiter::new(10_000));
+        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(PERMITS));
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(REQUESTS));
+        let mut tasks = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let request_state = state.clone();
+            let request_barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                request_barrier.wait().await;
+                study_definition_handler(
+                    State(request_state),
+                    Json(StudyDefinitionRequest {
+                        invitation: "valid-study-invitation".into(),
+                    }),
+                )
+                .await
+            }));
+        }
+
+        let mut accepted = 0;
+        let mut limited = 0;
+        for task in tasks {
+            match task.await.expect("study task") {
+                Ok(response) if response.status() == StatusCode::OK => accepted += 1,
+                Err(AppError::StudyRouteLimited { .. }) => limited += 1,
+                other => panic!("unexpected study response: {other:?}"),
+            }
+        }
+        server.abort();
+
+        assert_eq!(accepted, PERMITS);
+        assert_eq!(limited, REQUESTS - PERMITS);
+        assert!(maximum.load(Ordering::SeqCst) <= PERMITS);
+    }
 
     #[tokio::test]
     async fn enrolment_proxy_preserves_the_idempotency_identifier() {

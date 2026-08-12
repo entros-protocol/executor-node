@@ -323,6 +323,16 @@ pub async fn validate_features_handler(
         ));
     }
 
+    let issued_challenge = state
+        .challenge_registry
+        .peek_challenge(&wallet, state.challenge_ttl_secs);
+    if state.challenge_required && issued_challenge.is_none() {
+        return Err(AppError::InvalidRequest(
+            "Verification challenge expired. Start verification again.".into(),
+        ));
+    }
+    let expected_phrase = issued_challenge.as_ref().map(|(phrase, _)| phrase.clone());
+
     // Extract the client IP and user agent for the cross-wallet cooldown check.
     let ip = crate::auth::client_ip::extract_client_ip(&headers, peer.map(|Extension(c)| c.0))
         .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
@@ -514,19 +524,6 @@ pub async fn validate_features_handler(
             }));
         }
     };
-
-    // Look up the challenge phrase for this wallet so the validation service
-    // can match transcription against it. If no challenge
-    // was issued (old SDK path) or it has aged out, forward `None` — the
-    // validation service treats missing phrase as skip, preserving backward
-    // compatibility for pre-0.10.0 SDK clients.
-    // One atomic challenge lookup serves both the phrase content-binding forwarded
-    // to the validator AND the observe-only curve-trace scoring, so the two can
-    // never read different issued challenges and it is a single DashMap get.
-    let issued_challenge = state
-        .challenge_registry
-        .peek_challenge(&wallet, state.challenge_ttl_secs);
-    let expected_phrase = issued_challenge.as_ref().map(|(phrase, _)| phrase.clone());
 
     // Score the coarse outline against the issued curve for observation only.
     // Run this outside the request path. Detached like `wallet_reputation_observe`,
@@ -774,6 +771,7 @@ pub async fn validate_features_handler(
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
     struct ValidatorSuccessBody {
+        valid: bool,
         #[serde(default)]
         signed_receipt: Option<SignedReceiptDto>,
         #[serde(default)]
@@ -891,11 +889,32 @@ pub async fn validate_features_handler(
         };
     }
 
-    // Validation passed — refund the per-wallet attempt slot so a wallet
-    // with all-successful verifications never accumulates against the cap.
-    state.wallet_attempts.refund_on_success(&wallet);
+    let parsed_body = response.json::<ValidatorSuccessBody>().await;
+    let body = match parsed_body {
+        Ok(body) if body.valid => body,
+        Ok(_) => {
+            tracing::error!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                "Validation upstream returned a contradictory success response"
+            );
+            state.tracker.refund(&api_key);
+            state.wallet_attempts.refund_on_success(&wallet);
+            return Err(AppError::ValidationServiceUnavailable);
+        }
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                "Validation upstream returned an invalid success response"
+            );
+            state.tracker.refund(&api_key);
+            state.wallet_attempts.refund_on_success(&wallet);
+            return Err(AppError::ValidationServiceUnavailable);
+        }
+    };
 
-    let parsed_body = response.json::<ValidatorSuccessBody>().await.ok();
+    // Validation passed. Restore the wallet attempt slot before policy gates.
+    state.wallet_attempts.refund_on_success(&wallet);
     let (
         signed_receipt,
         commitment_hex,
@@ -905,19 +924,16 @@ pub async fn validate_features_handler(
         temporal_risk,
         audio_realism_risk,
         study_record_status,
-    ) = match parsed_body {
-        Some(body) => (
-            body.signed_receipt,
-            body.commitment_hex,
-            body.salt_hex,
-            body.biometric_risk,
-            body.tts_risk,
-            body.temporal_risk,
-            body.audio_realism_risk,
-            body.study_record_status,
-        ),
-        None => (None, None, None, 0.0, 0.0, 0.0, 0.0, None),
-    };
+    ) = (
+        body.signed_receipt,
+        body.commitment_hex,
+        body.salt_hex,
+        body.biometric_risk,
+        body.tts_risk,
+        body.temporal_risk,
+        body.audio_realism_risk,
+        body.study_record_status,
+    );
 
     let composite_risk_score = RiskComponents {
         biometric: biometric_risk,
@@ -2152,8 +2168,7 @@ mod validator_reached_tests {
         .await;
 
         assert!(result.is_err(), "a probing verdict is a rejection");
-        // Handler tests pass no peer and no X-Forwarded-For, so the client IP
-        // resolves to the documented 127.0.0.1 fallback.
+        // Handler tests pass no peer, so the client IP resolves to localhost.
         let fallback_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
         assert!(
             state.probing_blocklist.contains_key(&fallback_ip),
@@ -2162,31 +2177,55 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn a_success_body_omitting_optional_fields_parses_cleanly() {
-        // The real validator omits its optional fields rather than nulling them
-        // (`skip_serializing_if`), and every executor-side field carries
-        // `#[serde(default)]` to absorb that. An empty object is the extreme
-        // case: it must parse, not fall into the fallback arm.
+    async fn a_success_body_must_include_an_affirmative_verdict() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
 
-        let response = validate_features_handler(
-            State(state),
+        let result = validate_features_handler(
+            State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(baseline_request(wallet_id)),
         )
-        .await
-        .expect("an all-defaults body must pass")
-        .0;
+        .await;
 
-        assert!(response.signed_receipt.is_none());
-        assert!(
-            (response.composite_risk_score - REPUTATION_FLOOR).abs() < 1e-9,
-            "absent risks must default to zero, leaving only the reputation floor; got {}",
-            response.composite_risk_score
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationServiceUnavailable)
+        ));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(
+            state.wallet_attempts.get_attempts(&wallet),
+            0,
+            "an upstream contract failure must not spend a wallet attempt"
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_success_json_fails_closed_and_refunds_budgets() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn_raw(StatusCode::OK, b"not-json".to_vec()).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationServiceUnavailable)
+        ));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
     }
 
     #[tokio::test]
@@ -2229,7 +2268,8 @@ mod validator_reached_tests {
         // generated per issue, so it is read back rather than hardcoded.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
-        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.challenge_required = true;
 
         let wallet_id = random_wallet_id();
         let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
@@ -2258,65 +2298,47 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn no_issued_challenge_forwards_a_null_phrase() {
-        // Backward compatibility for pre-challenge SDKs: the validator treats a
-        // missing phrase as "skip the content check" rather than a failure, so
-        // the absence must be forwarded rather than fabricated.
+    async fn production_validation_requires_a_fresh_challenge() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
-        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.challenge_required = true;
 
-        validate_features_handler(
+        let result = validate_features_handler(
             State(state),
             None,
             headers_with_key("test-key"),
             Json(baseline_request(random_wallet_id())),
         )
-        .await
-        .expect("a request without an issued challenge must still pass");
+        .await;
 
-        let sent = mock.received();
-        // Guard the index: `received()` is a Vec, so an empty log would panic
-        // here with an opaque out-of-bounds instead of naming the real failure.
-        assert_eq!(sent.len(), 1, "the validator must have been called");
         assert!(
-            sent[0]["expected_phrase"].is_null(),
-            "no challenge means no phrase, got {}",
-            sent[0]["expected_phrase"]
+            matches!(result, Err(AppError::InvalidRequest(message)) if message.contains("challenge expired"))
         );
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
     }
 
     #[tokio::test]
-    async fn a_two_hundred_carrying_valid_false_is_still_treated_as_a_pass() {
-        // Characterization of a latent coupling, not an endorsement. The
-        // executor decides pass/fail purely from the HTTP status and never
-        // deserializes the `valid` field that `entros-validation` sends, so a
-        // 200 body asserting its own failure is admitted. Benign today because
-        // the real validator only ever pairs `valid: true` with 200 and uses
-        // 400 to reject — but the two structs are hand-maintained in separate
-        // repos with no shared fixture, so nothing enforces that pairing.
-        //
-        // If this test ever starts failing, the executor grew a `valid` check,
-        // which is a hardening worth keeping — update the test, don't revert it.
+    async fn a_two_hundred_carrying_valid_false_fails_closed() {
         let tracker = tracker_with_quota("test-key", 10);
         let mut body = success_body(0.0, 0.0, 0.0);
         body["valid"] = serde_json::json!(false);
         let mock = MockValidator::spawn(StatusCode::OK, body).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
 
-        let response = validate_features_handler(
+        let result = validate_features_handler(
             State(state),
             None,
             headers_with_key("test-key"),
             Json(baseline_request(random_wallet_id())),
         )
-        .await
-        .expect("status, not the body's `valid` field, decides the outcome today")
-        .0;
+        .await;
 
-        assert!(
-            response.valid,
-            "the executor reports success purely on the upstream 200"
-        );
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationServiceUnavailable)
+        ));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
     }
 }

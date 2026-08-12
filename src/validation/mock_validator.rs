@@ -22,7 +22,13 @@
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
 use serde_json::Value;
 
 /// A running mock validator bound to an ephemeral loopback port.
@@ -44,14 +50,29 @@ impl Drop for MockValidator {
 #[derive(Clone)]
 struct MockState {
     status: StatusCode,
-    body: Value,
+    body: MockBody,
     received: Arc<Mutex<Vec<Value>>>,
+}
+
+#[derive(Clone)]
+enum MockBody {
+    Json(Value),
+    Raw(Vec<u8>),
 }
 
 impl MockValidator {
     /// Bind a mock validator that answers every `POST /validate` with
     /// `status` and `body`, recording each request body it was sent.
     pub async fn spawn(status: StatusCode, body: Value) -> Self {
+        Self::spawn_with_body(status, MockBody::Json(body)).await
+    }
+
+    /// Bind a mock validator that returns bytes which are not valid JSON.
+    pub async fn spawn_raw(status: StatusCode, body: impl Into<Vec<u8>>) -> Self {
+        Self::spawn_with_body(status, MockBody::Raw(body.into())).await
+    }
+
+    async fn spawn_with_body(status: StatusCode, body: MockBody) -> Self {
         let received = Arc::new(Mutex::new(Vec::new()));
         let state = MockState {
             status,
@@ -111,16 +132,16 @@ impl MockValidator {
     }
 }
 
-async fn handle(
-    State(state): State<MockState>,
-    Json(body): Json<Value>,
-) -> (StatusCode, Json<Value>) {
+async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
     state
         .received
         .lock()
         .expect("mock request log is never held across a panic")
         .push(body);
-    (state.status, Json(state.body.clone()))
+    match state.body {
+        MockBody::Json(body) => (state.status, Json(body)).into_response(),
+        MockBody::Raw(body) => (state.status, body).into_response(),
+    }
 }
 
 async fn handle_rpc(Json(body): Json<Value>) -> Json<Value> {

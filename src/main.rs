@@ -421,6 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         validation_api_key: config.validation_api_key,
         challenge_registry,
         challenge_ttl_secs: config.challenge_ttl_secs,
+        challenge_required: config.environment.is_prod(),
         automation_observe: config.automation_observe,
         automation_webdriver_reject: config.automation_webdriver_reject,
         wallet_reputation_observe: config.wallet_reputation_observe,
@@ -443,10 +444,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "Executor node started");
 
-    // `into_make_service_with_connect_info::<SocketAddr>()` exposes the
-    // peer socket address to middleware via `ConnectInfo` extension —
-    // required by the per-IP rate-limiter fallback path when no
-    // `X-Forwarded-For` header is present (local dev, direct curl).
+    // The socket peer proves whether a client-IP header came from a proxy.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),

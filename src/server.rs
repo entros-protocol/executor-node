@@ -50,6 +50,7 @@ pub struct AppState {
     pub validation_api_key: Option<String>,
     pub challenge_registry: Arc<ChallengeNonceRegistry>,
     pub challenge_ttl_secs: u64,
+    pub challenge_required: bool,
     /// Observe-only automation-detection logging.
     /// Gates the calibration log in `validate_features_handler`; never affects
     /// the verification decision.
@@ -115,10 +116,8 @@ async fn per_ip_rate_limit_middleware(
     request: Request,
     next: Next,
 ) -> Result<Response, AppError> {
-    // ConnectInfo is populated by `into_make_service_with_connect_info`
-    // in main.rs. Tests that exercise the middleware directly (without
-    // the full server stack) are expected to either set this extension
-    // or rely on the X-Forwarded-For path.
+    // ConnectInfo identifies the immediate peer. The client-IP extractor
+    // trusts proxy headers only when this peer is private.
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -136,13 +135,7 @@ async fn per_ip_rate_limit_middleware(
             return Err(AppError::IpRateLimited { retry_after_secs });
         }
     } else {
-        // No IP source available — log and allow. Reaching this branch
-        // in production would mean axum lost the peer address AND the
-        // request had no X-Forwarded-For, which is unreachable on
-        // Railway. In dev (e.g. unit tests bypassing the server), allow
-        // the request to flow through rather than failing closed —
-        // failing closed would break tests that don't care about IP
-        // gating.
+        // Axum supplies a peer in production. Direct handler tests do not.
         tracing::debug!("per-IP rate limit middleware: no IP source available, allowing");
     }
 
@@ -169,25 +162,6 @@ async fn attest_rate_limit_middleware(
     }
 
     Ok(next.run(request).await)
-}
-
-async fn study_load_middleware(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> Result<Response, AppError> {
-    let permit = Arc::clone(&state.study_concurrency)
-        .try_acquire_owned()
-        .map_err(|_| AppError::StudyRouteLimited {
-            retry_after_secs: 1,
-        })?;
-    state
-        .study_service_rate_limiter
-        .check_with_retry("study-service")
-        .map_err(|retry_after_secs| AppError::StudyRouteLimited { retry_after_secs })?;
-    let response = next.run(request).await;
-    drop(permit);
-    Ok(response)
 }
 
 const STUDY_REQUEST_BODY_BYTES: usize = 4 * 1024;
@@ -282,10 +256,6 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
     let study_routes = Router::new()
         .route("/study/definition", post(study_definition_handler))
         .route("/study/enrol", post(study_enrol_handler))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            study_load_middleware,
-        ))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -401,6 +371,7 @@ pub fn build_test_state(
         validation_api_key: None,
         challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
         challenge_ttl_secs: 300,
+        challenge_required: false,
         automation_observe: true,
         automation_webdriver_reject: false,
         wallet_reputation_observe: true,
@@ -512,7 +483,6 @@ mod per_ip_middleware_tests {
     use axum::http::{Request, StatusCode};
     use axum::routing::get;
     use std::net::SocketAddr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::util::ServiceExt;
 
     async fn study_definition_upstream() -> impl axum::response::IntoResponse {
@@ -549,7 +519,7 @@ mod per_ip_middleware_tests {
             .uri("/study/definition")
             .header("content-type", "application/json")
             .header("x-api-key", "study-key")
-            .header("x-forwarded-for", "203.0.113.44")
+            .header("x-real-ip", "203.0.113.44")
             .body(Body::from(r#"{"invitation":"individual-invitation-0001"}"#))
             .expect("study request")
     }
@@ -597,145 +567,6 @@ mod per_ip_middleware_tests {
             .with_state(state)
     }
 
-    fn study_load_app(rate: u32, permits: usize) -> Router {
-        let tracker = tracker_with_quota("dummy", 100);
-        let mut state = build_test_state(tracker, None);
-        state.study_service_rate_limiter = Arc::new(RateLimiter::new(rate));
-        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(permits));
-        Router::new()
-            .route("/probe", get(|| async { "ok" }))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                study_load_middleware,
-            ))
-            .with_state(state)
-    }
-
-    #[tokio::test]
-    async fn study_service_bucket_returns_retry_after() {
-        let app = study_load_app(1, 1);
-        let first = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("first response");
-        let second = app
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("second response");
-
-        assert_eq!(first.status(), StatusCode::OK);
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert!(second.headers().contains_key("retry-after"));
-    }
-
-    #[tokio::test]
-    async fn study_concurrency_guard_rejects_without_waiting() {
-        let tracker = tracker_with_quota("dummy", 100);
-        let mut state = build_test_state(tracker, None);
-        let limiter = Arc::new(RateLimiter::new(1));
-        state.study_service_rate_limiter = Arc::clone(&limiter);
-        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(0));
-        let app = Router::new()
-            .route("/probe", get(|| async { "ok" }))
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                study_load_middleware,
-            ))
-            .with_state(state);
-
-        let rejected = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/probe")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(rejected.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(rejected.headers().get("retry-after").unwrap(), "1");
-        assert!(limiter.check("study-service").is_ok());
-    }
-
-    #[tokio::test]
-    async fn study_concurrency_guard_bounds_parallel_work() {
-        const PERMITS: usize = 8;
-        const REQUESTS: usize = 64;
-
-        let active = Arc::new(AtomicUsize::new(0));
-        let maximum = Arc::new(AtomicUsize::new(0));
-        let handler_active = Arc::clone(&active);
-        let handler_maximum = Arc::clone(&maximum);
-        let tracker = tracker_with_quota("dummy", 100);
-        let mut state = build_test_state(tracker, None);
-        state.study_service_rate_limiter = Arc::new(RateLimiter::new(10_000));
-        state.study_concurrency = Arc::new(tokio::sync::Semaphore::new(PERMITS));
-        let app = Router::new()
-            .route(
-                "/probe",
-                get(move || {
-                    let active = Arc::clone(&handler_active);
-                    let maximum = Arc::clone(&handler_maximum);
-                    async move {
-                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        maximum.fetch_max(current, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        "ok"
-                    }
-                }),
-            )
-            .route_layer(middleware::from_fn_with_state(
-                state.clone(),
-                study_load_middleware,
-            ))
-            .with_state(state);
-
-        let mut tasks = Vec::with_capacity(REQUESTS);
-        for _ in 0..REQUESTS {
-            let request_app = app.clone();
-            tasks.push(tokio::spawn(async move {
-                request_app
-                    .oneshot(
-                        Request::builder()
-                            .uri("/probe")
-                            .body(Body::empty())
-                            .expect("request"),
-                    )
-                    .await
-                    .expect("response")
-                    .status()
-            }));
-        }
-
-        let mut admitted = 0;
-        let mut rejected = 0;
-        for task in tasks {
-            match task.await.expect("request task") {
-                StatusCode::OK => admitted += 1,
-                StatusCode::TOO_MANY_REQUESTS => rejected += 1,
-                status => panic!("unexpected status {status}"),
-            }
-        }
-
-        assert!(admitted > 0);
-        assert!(rejected > 0);
-        assert!(maximum.load(Ordering::SeqCst) <= PERMITS);
-    }
-
     #[tokio::test]
     async fn study_routes_reject_oversized_bodies_before_proxying() {
         let tracker = tracker_with_quota("study-key", 100);
@@ -764,12 +595,16 @@ mod per_ip_middleware_tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    fn req_with_xff(xff: &str) -> Request<Body> {
-        Request::builder()
+    fn req_with_proxy_ip(real_ip: &str) -> Request<Body> {
+        let mut request = Request::builder()
             .uri("/probe")
-            .header("x-forwarded-for", xff)
+            .header("x-real-ip", real_ip)
             .body(Body::empty())
-            .unwrap()
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo("10.0.0.8:8080".parse::<SocketAddr>().unwrap()));
+        request
     }
 
     fn req_with_peer(peer: SocketAddr) -> Request<Body> {
@@ -785,7 +620,7 @@ mod per_ip_middleware_tests {
     async fn allows_first_request_under_limit() {
         let limiter = Arc::new(PerIpRateLimiter::new(30));
         let app = app(limiter);
-        let resp = app.oneshot(req_with_xff("203.0.113.1")).await.unwrap();
+        let resp = app.oneshot(req_with_proxy_ip("203.0.113.1")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
@@ -797,12 +632,12 @@ mod per_ip_middleware_tests {
         for _ in 0..2 {
             let resp = app
                 .clone()
-                .oneshot(req_with_xff("203.0.113.5"))
+                .oneshot(req_with_proxy_ip("203.0.113.5"))
                 .await
                 .unwrap();
             assert_eq!(resp.status(), StatusCode::OK);
         }
-        let resp = app.oneshot(req_with_xff("203.0.113.5")).await.unwrap();
+        let resp = app.oneshot(req_with_proxy_ip("203.0.113.5")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
         let retry_after = resp
             .headers()
@@ -823,18 +658,21 @@ mod per_ip_middleware_tests {
         // IP A: burn the budget, then verify it's rejected.
         let r1 = app
             .clone()
-            .oneshot(req_with_xff("203.0.113.10"))
+            .oneshot(req_with_proxy_ip("203.0.113.10"))
             .await
             .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
         let r2 = app
             .clone()
-            .oneshot(req_with_xff("203.0.113.10"))
+            .oneshot(req_with_proxy_ip("203.0.113.10"))
             .await
             .unwrap();
         assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
         // IP B: should still pass first request.
-        let r3 = app.oneshot(req_with_xff("203.0.113.11")).await.unwrap();
+        let r3 = app
+            .oneshot(req_with_proxy_ip("203.0.113.11"))
+            .await
+            .unwrap();
         assert_eq!(
             r3.status(),
             StatusCode::OK,
@@ -843,32 +681,24 @@ mod per_ip_middleware_tests {
     }
 
     #[tokio::test]
-    async fn forwarded_for_takes_precedence_over_peer() {
-        // Limiter caps the X-Forwarded-For IP after one request. If the
-        // middleware were keying on peer instead, the second request would
-        // pass — proving precedence is the easiest way to verify which
-        // source the middleware actually uses.
+    async fn real_ip_from_a_private_proxy_takes_precedence() {
         let limiter = Arc::new(PerIpRateLimiter::new(1));
         let app = app(limiter);
-        let peer: SocketAddr = "10.0.0.99:5000".parse().unwrap();
-
-        let mut req1 = req_with_xff("203.0.113.42");
-        req1.extensions_mut().insert(ConnectInfo(peer));
+        let req1 = req_with_proxy_ip("203.0.113.42");
         let r1 = app.clone().oneshot(req1).await.unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
 
-        let mut req2 = req_with_xff("203.0.113.42");
-        req2.extensions_mut().insert(ConnectInfo(peer));
+        let req2 = req_with_proxy_ip("203.0.113.42");
         let r2 = app.oneshot(req2).await.unwrap();
         assert_eq!(
             r2.status(),
             StatusCode::TOO_MANY_REQUESTS,
-            "limiter must key on X-Forwarded-For, not peer"
+            "limiter must key on Railway's client address"
         );
     }
 
     #[tokio::test]
-    async fn falls_back_to_peer_address_when_no_forwarded_for() {
+    async fn falls_back_to_peer_address_without_real_ip() {
         let limiter = Arc::new(PerIpRateLimiter::new(1));
         let app = app(limiter);
         let peer: SocketAddr = "192.0.2.50:8080".parse().unwrap();
@@ -918,11 +748,14 @@ mod per_ip_middleware_tests {
         // 1 r/m budget — first request OK, second rejected.
         let r1 = app
             .clone()
-            .oneshot(req_with_xff("203.0.113.99"))
+            .oneshot(req_with_proxy_ip("203.0.113.99"))
             .await
             .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
-        let r2 = app.oneshot(req_with_xff("203.0.113.99")).await.unwrap();
+        let r2 = app
+            .oneshot(req_with_proxy_ip("203.0.113.99"))
+            .await
+            .unwrap();
         assert_eq!(r2.status(), StatusCode::TOO_MANY_REQUESTS);
 
         // Quota should be untouched — the middleware short-circuits
@@ -956,7 +789,7 @@ mod per_ip_middleware_tests {
         // First request: under cap → no counter increment.
         let r1 = app
             .clone()
-            .oneshot(req_with_xff("203.0.113.123"))
+            .oneshot(req_with_proxy_ip("203.0.113.123"))
             .await
             .unwrap();
         assert_eq!(r1.status(), StatusCode::OK);
@@ -966,7 +799,7 @@ mod per_ip_middleware_tests {
         for _ in 0..2 {
             let r = app
                 .clone()
-                .oneshot(req_with_xff("203.0.113.123"))
+                .oneshot(req_with_proxy_ip("203.0.113.123"))
                 .await
                 .unwrap();
             assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);

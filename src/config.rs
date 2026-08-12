@@ -257,14 +257,8 @@ pub struct Config {
     pub rate_limit_per_minute: u32,
     pub study_rate_limit_per_minute: u32,
     pub study_max_in_flight: usize,
-    /// Per-IP request cap. Bounds the throughput a
-    /// single client IP can sustain across rotated wallets / API keys
-    /// before the per-API-key and per-wallet limiters fire. Configurable
-    /// via `EXECUTOR_PER_IP_RATE_LIMIT_PER_MIN`. Default 30 — covers
-    /// legitimate verification flows + dashboard reads while bounding
-    /// damage from a single hostile IP. On Railway, the leftmost
-    /// `X-Forwarded-For` entry is trusted as the client IP because the
-    /// edge layer rewrites the header on every inbound request.
+    /// Per-IP request cap across wallets and API keys.
+    /// Railway supplies the client address through `X-Real-IP`.
     pub per_ip_rate_limit_per_minute: u32,
     pub integrators: Vec<IntegratorConfig>,
     pub cors_origins: Vec<HeaderValue>,
