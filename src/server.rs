@@ -520,7 +520,7 @@ mod per_ip_middleware_tests {
             .header("content-type", "application/json")
             .header("x-api-key", "study-key")
             .header("x-real-ip", "203.0.113.44")
-            .body(Body::from(r#"{"invitation":"individual-invitation-0001"}"#))
+            .body(Body::from("{}"))
             .expect("study request")
     }
 
@@ -573,10 +573,8 @@ mod per_ip_middleware_tests {
         let mut state = build_test_state(tracker, Some("http://127.0.0.1:9".into()));
         state.api_keys = Arc::new(vec!["study-key".into()]);
         let app = create_router(state, &[]);
-        let body = serde_json::json!({
-            "invitation": "A".repeat(STUDY_REQUEST_BODY_BYTES)
-        })
-        .to_string();
+        let body =
+            serde_json::json!({ "padding": "A".repeat(STUDY_REQUEST_BODY_BYTES) }).to_string();
 
         let response = app
             .oneshot(
