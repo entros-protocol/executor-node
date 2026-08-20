@@ -283,9 +283,6 @@ pub struct ValidateFeaturesResponse {
     /// commitment for future rotation proofs. Present iff `signed_receipt` is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub salt_hex: Option<String>,
-
-    // Layer E Composite Risk Score
-    pub composite_risk_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub study_record_status: Option<String>,
 }
@@ -519,7 +516,6 @@ pub async fn validate_features_handler(
                 signed_receipt: None,
                 commitment_hex: None,
                 salt_hex: None,
-                composite_risk_score: 0.0,
                 study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
             }));
         }
@@ -968,7 +964,7 @@ pub async fn validate_features_handler(
         return Err(validation_failure(None, study_record_status.as_deref()));
     }
 
-    // Suspicious range graduated friction (Layer C)
+    // Apply graduated friction to the suspicious score range.
     let attempts = state.wallet_attempts.get_attempts(&wallet);
     if composite_risk_score >= CAPTCHA_THRESHOLD && attempts <= 1 {
         tracing::warn!(
@@ -989,7 +985,6 @@ pub async fn validate_features_handler(
         signed_receipt,
         commitment_hex,
         salt_hex,
-        composite_risk_score,
         study_record_status,
     }))
 }
@@ -1477,7 +1472,7 @@ mod tests {
 ///
 /// Everything above exits at the dev-skip (`validation_url: None`), so until
 /// this module existed nothing exercised the validator round-trip, the
-/// composite risk score, the reject tier, the captcha tier, the safe-reveal
+/// composite risk score, both decision thresholds, the safe-reveal
 /// reason filter, or the probing-blocklist write. The composite could have been
 /// inverted to refuse every honest user with the whole suite still green.
 #[cfg(test)]
@@ -1487,10 +1482,12 @@ mod validator_reached_tests {
     use crate::validation::mock_validator::{
         error_body, state_with_mock_validator, success_body, MockValidator, REPUTATION_FLOOR,
     };
-    use axum::http::StatusCode;
+    use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
     // Reused rather than re-declared: the request literal names every field, so
     // a second copy would drift the moment `ValidateFeaturesRequest` changes.
     use super::tests::baseline_request;
+
+    const DEFAULT_REPUTATION_RISK: f64 = 0.5;
 
     fn webdriver_signals() -> ClientSignals {
         ClientSignals {
@@ -1549,6 +1546,38 @@ mod validator_reached_tests {
         let sent = mock.received();
         assert_eq!(sent[0]["receipt_purpose"], "mint");
         assert_eq!(sent[0]["request_receipt"], true);
+    }
+
+    #[tokio::test]
+    async fn a_successful_wire_response_does_not_expose_the_composite_score() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+
+        let response = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(random_wallet_id())),
+        )
+        .await
+        .expect("a clean request must pass")
+        .into_response();
+        let body = to_bytes(
+            response.into_body(),
+            crate::padding::RESPONSE_PADDING_TARGET + 1,
+        )
+        .await
+        .expect("the response body must be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("the response body must be valid JSON");
+
+        assert_eq!(body.len(), crate::padding::RESPONSE_PADDING_TARGET);
+        assert_eq!(json.get("valid"), Some(&serde_json::Value::Bool(true)));
+        assert!(
+            json.get("composite_risk_score").is_none(),
+            "the successful response must not expose internal risk scores"
+        );
     }
 
     #[tokio::test]
@@ -1817,45 +1846,42 @@ mod validator_reached_tests {
         let mut req = baseline_request(random_wallet_id());
         req.client_signals = Some(webdriver_signals());
 
-        let response =
-            validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
-                .await
-                .expect("automation risk alone stays under the reject threshold")
-                .0;
+        validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
+            .await
+            .expect("automation risk alone stays under the reject threshold");
 
         assert_eq!(mock.request_count(), 1);
+        let expected = expected_composite(0.0, 0.0, 0.0, 1.0);
+        let actual = RiskComponents {
+            biometric: 0.0,
+            tts: 0.0,
+            temporal: 0.0,
+            automation: 1.0,
+            reputation: DEFAULT_REPUTATION_RISK,
+        }
+        .composite();
         assert!(
-            (response.composite_risk_score - expected_composite(0.0, 0.0, 0.0, 1.0)).abs() < 1e-9,
-            "webdriver must contribute automation_risk = 1.0; got {}",
-            response.composite_risk_score
+            (actual - expected).abs() < 1e-9,
+            "expected automation score {expected}, got {actual}"
         );
     }
 
-    // ---- the composite and its two policy tiers ----
+    // ---- composite scoring and decision thresholds ----
 
-    #[tokio::test]
-    async fn composite_risk_weights_each_layer_as_specified() {
-        // Pins the scored weight table. This test makes a silent re-weighting
-        // of the four decision signals fail.
-        let tracker = tracker_with_quota("test-key", 10);
-        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.4, 0.2, 0.1)).await;
-        let state = state_with_mock_validator(tracker.clone(), &mock);
-
-        let response = validate_features_handler(
-            State(state),
-            None,
-            headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
-        )
-        .await
-        .expect("a low-risk capture must pass")
-        .0;
-
+    #[test]
+    fn composite_risk_weights_each_layer_as_specified() {
         let expected = expected_composite(0.4, 0.2, 0.1, 0.0);
+        let actual = RiskComponents {
+            biometric: 0.4,
+            tts: 0.2,
+            temporal: 0.1,
+            automation: 0.0,
+            reputation: DEFAULT_REPUTATION_RISK,
+        }
+        .composite();
         assert!(
-            (response.composite_risk_score - expected).abs() < 1e-9,
-            "expected composite {expected}, got {}",
-            response.composite_risk_score
+            (actual - expected).abs() < 1e-9,
+            "expected composite {expected}, got {actual}"
         );
     }
 
@@ -1880,7 +1906,7 @@ mod validator_reached_tests {
         match result.map(|_| ()) {
             Err(AppError::ValidationFailed { reason }) => assert!(
                 reason.is_none(),
-                "the reject tier must not name the failing layer, got {reason:?}"
+                "the rejection must not name the failing signal, got {reason:?}"
             ),
             other => panic!("expected ValidationFailed, got {other:?}"),
         }
@@ -1893,7 +1919,6 @@ mod validator_reached_tests {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
-
         let composite = expected_composite(1.0, 1.0, 0.0, 0.0);
         assert!(
             (CAPTCHA_THRESHOLD..=REJECT_THRESHOLD).contains(&composite),
@@ -1922,7 +1947,7 @@ mod validator_reached_tests {
 
     #[tokio::test]
     async fn the_same_suspicious_score_is_admitted_once_attempts_exceed_one() {
-        // Characterization, not endorsement. The captcha tier is conditioned on
+        // Characterization, not endorsement. The captcha check is conditioned on
         // `attempts <= 1`, and that count is read *after* the success path has
         // already refunded this request's own slot — so a fresh wallet reads 0
         // and always qualifies on a first request. Pre-seeding two attempts
@@ -1935,6 +1960,11 @@ mod validator_reached_tests {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
+        let composite = expected_composite(1.0, 1.0, 0.0, 0.0);
+        assert!(
+            (CAPTCHA_THRESHOLD..=REJECT_THRESHOLD).contains(&composite),
+            "fixture must land in the captcha band, computed {composite}"
+        );
 
         let wallet_id = random_wallet_id();
         let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
@@ -1948,21 +1978,14 @@ mod validator_reached_tests {
             .check_and_record_attempt(&wallet)
             .expect("second pre-seed is under the cap");
 
-        let response = validate_features_handler(
+        validate_features_handler(
             State(state),
             None,
             headers_with_key("test-key"),
             Json(baseline_request(wallet_id)),
         )
         .await
-        .expect("the captcha tier no longer applies once attempts exceed one")
-        .0;
-
-        assert!(
-            response.composite_risk_score >= CAPTCHA_THRESHOLD,
-            "the score must still be in the suspicious band, got {}",
-            response.composite_risk_score
-        );
+        .expect("the captcha check no longer applies once attempts exceed one");
     }
 
     // ---- the safe-reveal reason filter ----
