@@ -1,28 +1,15 @@
-# Builder stage: compile the Rust binary.
-#
-# Explicit Dockerfile instead of relying on Railway's Railpack autodetect.
-# Railpack's Rust plan caches aggressively on content hashes that were
-# silently reusing the pre-feature-branch binary even after source changes
-# landed in HEAD (`railway up` 4.36.0 + Railpack 0.23.0 behavior, April 2026).
-# With a first-party Dockerfile Railway uses BuildKit directly and the COPY
-# layer's content hash invalidates on real source changes.
-FROM rust:1.88 AS builder
+# BuildKit invalidates the binary when copied source files change.
+FROM rust:1.88.0-bookworm@sha256:af306cfa71d987911a781c37b59d7d67d934f49684058f96cf72079c3626bfe0 AS builder
 
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
-RUN cargo build --release
+RUN cargo build --locked --release
 
-# Runtime stage: debian-slim with CA certs + binary.
-#
-# `ca-certificates` is needed for outbound HTTPS (Solana devnet RPC, the
-# internal validation service, the SAS attestation service). `libssl3`
-# covers OpenSSL deps pulled in transitively by solana-client and related
-# crates. Everything else (glibc, libgcc, libstdc++) comes from the base
-# image.
-FROM debian:bookworm-slim
+# The runtime needs CA certificates and OpenSSL for outbound HTTPS.
+FROM debian:bookworm-slim@sha256:abd67ffcfa541b485a3dff59865ab629aa048a6c613e639d36e7456b0b229241
 
 RUN apt-get update \
     && apt-get install -y ca-certificates libssl3 \
@@ -33,9 +20,7 @@ COPY --from=builder /app/target/release/executor-node /usr/local/bin/executor-no
 
 USER iam
 
-# Railway injects PORT (typically 8080); executor-node's config.rs reads it
-# and falls back to LISTEN_ADDR for local dev. EXPOSE here is documentation
-# only — Railway ignores it.
+# The service reads PORT first and uses LISTEN_ADDR for local development.
 EXPOSE 8080
 
 CMD ["executor-node"]
