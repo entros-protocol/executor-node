@@ -27,24 +27,18 @@ Run the checks for the language you touched.
 **Rust**
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo fmt --all --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo build --locked --release
 ```
 
-**TypeScript**
+**Scoring signer**
 
 ```bash
-npx eslint .
-npx tsc --noEmit
-npm test
-```
-
-**Anchor programs**
-
-```bash
-anchor build
-anchor test
+cd scripts
+npm ci
+npm run test:sign-scoring
 ```
 
 A pull request that fails any of these will not be merged.

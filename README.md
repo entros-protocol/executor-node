@@ -107,8 +107,12 @@ Do not place keypairs or API credentials in source control.
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-features
+cargo build --locked --release
+cd scripts
+npm ci
+npm run test:sign-scoring
 ```
 
 ## License
