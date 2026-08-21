@@ -121,24 +121,13 @@ impl WalletAttemptTracker {
         }
     }
 
-    /// Drop entries whose window has fully elapsed AND counter is zero.
-    /// Called periodically from a background task in `main.rs` to bound
-    /// memory growth. Returns the approximate count of evicted entries
-    /// (`saturating_sub` because DashMap's `len()` is not atomic with
-    /// `retain()` under concurrent inserts — a precise count would
-    /// require an atomic counter inside the retain closure, which isn't
-    /// worth the cost for a debug signal).
-    ///
-    /// Eviction-while-zero is the safe condition: a wallet at 0 attempts
-    /// with an expired window contributes no rate-limit info, so dropping
-    /// it just reclaims the entry — the next attempt re-creates it from
-    /// fresh state (which is what would happen anyway via the
-    /// window-reset branch in `check_and_record_attempt`).
-    /// Get the current attempt count of a wallet.
+    #[cfg(test)]
     pub fn get_attempts(&self, wallet: &Pubkey) -> u8 {
         self.state.get(wallet).map(|e| e.attempts).unwrap_or(0)
     }
 
+    /// Remove expired entries with no consumed attempts.
+    /// The approximate count avoids synchronization on this maintenance path.
     pub fn evict_expired(&self) -> usize {
         let now = Instant::now();
         let before = self.state.len();

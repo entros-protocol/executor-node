@@ -5,6 +5,8 @@
   "scripts": {
     "setup": "npx tsx sas-setup.ts",
     "sign-url": "npx tsx sign-validator-url.ts",
+    "sign-scoring": "tsx sign-scoring-config.ts",
+    "test:sign-scoring": "tsx --test sign-scoring-config.test.ts",
     "rotate-sas": "npx tsx rotate-sas-authority.ts"
   },
   "dependencies": {

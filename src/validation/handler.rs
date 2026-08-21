@@ -1,5 +1,5 @@
 use axum::extract::{ConnectInfo, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::Extension;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::str::FromStr;
 use crate::error::AppError;
 use crate::padding::PaddedJson;
 use crate::server::AppState;
-use crate::validation::composite::{RiskComponents, CAPTCHA_THRESHOLD, REJECT_THRESHOLD};
+use crate::validation::composite::RiskComponents;
 
 /// How long to wait on the internal validation service before giving up.
 ///
@@ -707,8 +707,7 @@ pub async fn validate_features_handler(
             // per-wallet attempt slot. The wallet did nothing wrong; if
             // the validator was unreachable the user shouldn't pay against
             // their per-wallet budget.
-            state.tracker.refund(&api_key);
-            state.wallet_attempts.refund_on_success(&wallet);
+            refund_infrastructure_failure(&state, &api_key, &wallet);
             return Err(AppError::ValidationServiceUnavailable);
         }
     };
@@ -774,13 +773,13 @@ pub async fn validate_features_handler(
         commitment_hex: Option<String>,
         #[serde(default)]
         salt_hex: Option<String>,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         biometric_risk: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         tts_risk: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         temporal_risk: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         audio_realism_risk: f64,
         #[serde(default)]
         probing_detected: Option<bool>,
@@ -793,13 +792,13 @@ pub async fn validate_features_handler(
     struct ValidatorErrorBody {
         #[serde(default)]
         reason: Option<String>,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         biometric_risk: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         tts_risk: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         temporal_risk: f64,
-        #[serde(default)]
+        #[serde(deserialize_with = "deserialize_risk_score")]
         audio_realism_risk: f64,
         #[serde(default)]
         probing_detected: Option<bool>,
@@ -807,27 +806,57 @@ pub async fn validate_features_handler(
         study_record_status: Option<String>,
     }
 
-    if !response.status().is_success() {
+    fn deserialize_risk_score<'de, D>(deserializer: D) -> Result<f64, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+        if value.is_finite() && (0.0..=1.0).contains(&value) {
+            Ok(value)
+        } else {
+            Err(serde::de::Error::custom(
+                "risk score must be finite and between zero and one",
+            ))
+        }
+    }
+
+    let upstream_status = response.status();
+    if !upstream_status.is_success() {
+        if upstream_status != StatusCode::BAD_REQUEST && upstream_status != StatusCode::CONFLICT {
+            tracing::error!(
+                status = %upstream_status,
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                "Validation upstream returned an infrastructure status"
+            );
+            refund_infrastructure_failure(&state, &api_key, &wallet);
+            return Err(AppError::ValidationServiceUnavailable);
+        }
+
         // Validator surfaces a whitelisted `reason` for `phrase_content_mismatch`
-        // only (the user already knows whether they said the assigned phrase,
-        // so this category carries no attacker-calibration value); all other
-        // rejection categories return an opaque body and `reason` stays
-        // `None`. The executor passes the reason through to the SDK +
-        // entros.io frontend so the soft-reject retry UX can route on the
-        // per-category hint. Other categories stay opaque end-to-end per
-        // the 2026-04-29 directed-signal strip.
+        // only. Other rejection categories stay opaque to clients.
         const REASON_ALLOWLIST: &[&str] = &["phrase_content_mismatch"];
 
-        let err_body = response.json::<ValidatorErrorBody>().await.ok();
+        let err_body = match response.json::<ValidatorErrorBody>().await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    status = %upstream_status,
+                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                    "Validation upstream returned an invalid rejection response"
+                );
+                refund_infrastructure_failure(&state, &api_key, &wallet);
+                return Err(AppError::ValidationServiceUnavailable);
+            }
+        };
 
-        if err_body.as_ref().and_then(|body| body.reason.as_deref())
-            == Some("projection_update_required")
-        {
+        if err_body.reason.as_deref() == Some("projection_update_required") {
+            refund_infrastructure_failure(&state, &api_key, &wallet);
             return Err(AppError::ProjectionUpdateRequired);
         }
 
         // If probing was detected, insert into state.probing_blocklist
-        if let Some(true) = err_body.as_ref().and_then(|body| body.probing_detected) {
+        if err_body.probing_detected == Some(true) {
             tracing::warn!(
                 ip = %crate::auth::redact::redact_ip(ip),
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -837,45 +866,22 @@ pub async fn validate_features_handler(
             state.probing_blocklist.insert(ip, expire_time);
         }
 
-        let raw_reason = err_body.as_ref().and_then(|body| body.reason.clone());
+        let raw_reason = err_body.reason.clone();
         let reason = raw_reason.filter(|r| REASON_ALLOWLIST.contains(&r.as_str()));
-
-        let (biometric_risk, tts_risk, temporal_risk, audio_realism_risk) = match &err_body {
-            Some(body) => (
-                body.biometric_risk,
-                body.tts_risk,
-                body.temporal_risk,
-                body.audio_realism_risk,
-            ),
-            None => (1.0, 0.0, 0.0, 0.0),
-        };
-
-        // Computed even though this branch always returns Err: the log line
-        // below is the only record of how risky the captures the validator
-        // itself rejected were, and calibration reads it.
-        let composite_risk_score = RiskComponents {
-            biometric: biometric_risk,
-            tts: tts_risk,
-            temporal: temporal_risk,
-            automation: automation_risk,
-            reputation: reputation_risk,
-        }
-        .composite();
 
         tracing::info!(
             api_key = %crate::auth::redact::redact_api_key(&api_key),
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
             reason = ?reason,
-            biometric_risk,
-            tts_risk,
-            temporal_risk,
+            biometric_risk = err_body.biometric_risk,
+            tts_risk = err_body.tts_risk,
+            temporal_risk = err_body.temporal_risk,
             automation_risk,
             reputation_risk,
-            audio_realism_risk,
-            composite_risk_score,
+            audio_realism_risk = err_body.audio_realism_risk,
             "Feature validation rejected"
         );
-        let study_record_status = err_body.and_then(|body| body.study_record_status);
+        let study_record_status = err_body.study_record_status;
         return match study_record_status {
             Some(study_record_status) => Err(AppError::StudyValidationFailed {
                 reason,
@@ -893,8 +899,7 @@ pub async fn validate_features_handler(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream returned a contradictory success response"
             );
-            state.tracker.refund(&api_key);
-            state.wallet_attempts.refund_on_success(&wallet);
+            refund_infrastructure_failure(&state, &api_key, &wallet);
             return Err(AppError::ValidationServiceUnavailable);
         }
         Err(error) => {
@@ -903,14 +908,11 @@ pub async fn validate_features_handler(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream returned an invalid success response"
             );
-            state.tracker.refund(&api_key);
-            state.wallet_attempts.refund_on_success(&wallet);
+            refund_infrastructure_failure(&state, &api_key, &wallet);
             return Err(AppError::ValidationServiceUnavailable);
         }
     };
 
-    // Validation passed. Restore the wallet attempt slot before policy gates.
-    state.wallet_attempts.refund_on_success(&wallet);
     let (
         signed_receipt,
         commitment_hex,
@@ -931,14 +933,13 @@ pub async fn validate_features_handler(
         body.study_record_status,
     );
 
-    let composite_risk_score = RiskComponents {
+    let composite_risk_score = state.scoring_config.score(&RiskComponents {
         biometric: biometric_risk,
         tts: tts_risk,
         temporal: temporal_risk,
         automation: automation_risk,
         reputation: reputation_risk,
-    }
-    .composite();
+    });
 
     tracing::info!(
         api_key = %crate::auth::redact::redact_api_key(&api_key),
@@ -949,35 +950,32 @@ pub async fn validate_features_handler(
         automation_risk,
         reputation_risk,
         audio_realism_risk,
-        composite_risk_score,
         "Feature validation passed biometric checks"
     );
 
     // Apply policy threshold: high risk rejects. Strict, so a score landing
     // exactly on the threshold passes.
-    if composite_risk_score > REJECT_THRESHOLD {
+    if state.scoring_config.rejects(composite_risk_score) {
         tracing::warn!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            composite_risk_score,
             "Validation rejected: Composite risk score exceeds threshold"
         );
         return Err(validation_failure(None, study_record_status.as_deref()));
     }
 
-    // Apply graduated friction to the suspicious score range.
-    let attempts = state.wallet_attempts.get_attempts(&wallet);
-    if composite_risk_score >= CAPTCHA_THRESHOLD && attempts <= 1 {
+    // Require another capture while the score remains in the suspicious range.
+    if state.scoring_config.requires_friction(composite_risk_score) {
         tracing::warn!(
             wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            composite_risk_score,
-            attempts,
-            "Validation flagged: Composite risk score in suspicious range on first attempt, requiring dynamic captcha"
+            "Validation flagged: Composite risk score requires another capture"
         );
         return Err(validation_failure(
             Some("captcha_required".to_string()),
             study_record_status.as_deref(),
         ));
     }
+
+    state.wallet_attempts.refund_on_success(&wallet);
 
     Ok(PaddedJson(ValidateFeaturesResponse {
         valid: true,
@@ -997,6 +995,11 @@ fn validation_failure(reason: Option<String>, study_record_status: Option<&str>)
         },
         None => AppError::ValidationFailed { reason },
     }
+}
+
+fn refund_infrastructure_failure(state: &AppState, api_key: &str, wallet: &Pubkey) {
+    state.tracker.refund(api_key);
+    state.wallet_attempts.refund_on_success(wallet);
 }
 
 #[cfg(test)]
@@ -1479,10 +1482,12 @@ mod tests {
 mod validator_reached_tests {
     use super::*;
     use crate::server::{headers_with_key, random_wallet_id, tracker_with_quota};
+    use crate::validation::composite::ScoringConfig;
     use crate::validation::mock_validator::{
-        error_body, state_with_mock_validator, success_body, MockValidator, REPUTATION_FLOOR,
+        error_body, state_with_mock_validator, success_body, MockValidator,
     };
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use std::sync::Arc;
     // Reused rather than re-declared: the request literal names every field, so
     // a second copy would drift the moment `ValidateFeaturesRequest` changes.
     use super::tests::baseline_request;
@@ -1501,10 +1506,14 @@ mod validator_reached_tests {
         }
     }
 
-    /// Composite weights, restated so a change to the handler's table fails
-    /// here rather than silently altering who gets verified.
-    fn expected_composite(biometric: f64, tts: f64, _temporal: f64, automation: f64) -> f64 {
-        0.35 * biometric + 0.25 * tts + 0.15 * automation + REPUTATION_FLOOR
+    fn expected_composite(biometric: f64, tts: f64, automation: f64) -> f64 {
+        ScoringConfig::synthetic_test_policy().score(&RiskComponents {
+            biometric,
+            tts,
+            temporal: 0.0,
+            automation,
+            reputation: DEFAULT_REPUTATION_RISK,
+        })
     }
 
     // ---- reachability, and the gate whose contract was previously inverted ----
@@ -1781,17 +1790,21 @@ mod validator_reached_tests {
             error_body("projection_update_required"),
         )
         .await;
-        let state = state_with_mock_validator(tracker, &mock);
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
 
         let result = validate_features_handler(
-            State(state),
+            State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(baseline_request(wallet_id)),
         )
         .await;
 
         assert!(matches!(result, Err(AppError::ProjectionUpdateRequired)));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
     }
 
     #[tokio::test]
@@ -1833,62 +1846,37 @@ mod validator_reached_tests {
 
     #[tokio::test]
     async fn webdriver_with_the_reject_flag_off_scores_full_automation_risk() {
-        // With the hard gate disabled the signal is not discarded — it enters
-        // the composite at weight 0.15. Pinning both halves means this suite
-        // describes what the flag does in either position without asserting
-        // which default is correct; that policy question is open (see the note
-        // at the automation-risk computation above).
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let mut state = state_with_mock_validator(tracker.clone(), &mock);
         state.automation_webdriver_reject = false;
+        state.scoring_config = Arc::new(
+            ScoringConfig::try_new(50_000, 50_000, 100_000, 700_000, 100_000, 700_000, 899_999)
+                .expect("the automation-isolating policy must be valid"),
+        );
 
         let mut req = baseline_request(random_wallet_id());
         req.client_signals = Some(webdriver_signals());
 
-        validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
-            .await
-            .expect("automation risk alone stays under the reject threshold");
+        let result =
+            validate_features_handler(State(state), None, headers_with_key("test-key"), Json(req))
+                .await;
 
         assert_eq!(mock.request_count(), 1);
-        let expected = expected_composite(0.0, 0.0, 0.0, 1.0);
-        let actual = RiskComponents {
-            biometric: 0.0,
-            tts: 0.0,
-            temporal: 0.0,
-            automation: 1.0,
-            reputation: DEFAULT_REPUTATION_RISK,
-        }
-        .composite();
-        assert!(
-            (actual - expected).abs() < 1e-9,
-            "expected automation score {expected}, got {actual}"
-        );
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationFailed {
+                reason: Some(ref reason)
+            }) if reason == "captcha_required"
+        ));
     }
 
     // ---- composite scoring and decision thresholds ----
 
-    #[test]
-    fn composite_risk_weights_each_layer_as_specified() {
-        let expected = expected_composite(0.4, 0.2, 0.1, 0.0);
-        let actual = RiskComponents {
-            biometric: 0.4,
-            tts: 0.2,
-            temporal: 0.1,
-            automation: 0.0,
-            reputation: DEFAULT_REPUTATION_RISK,
-        }
-        .composite();
-        assert!(
-            (actual - expected).abs() < 1e-9,
-            "expected composite {expected}, got {actual}"
-        );
-    }
-
     #[tokio::test]
     async fn a_composite_above_the_reject_threshold_fails_with_no_reason() {
-        // Above REJECT_THRESHOLD the handler refuses and surfaces no reason:
-        // naming the failing layer would tell an attacker which signal to tune.
+        // Above the rejection threshold, the handler refuses without a reason.
+        // Naming the failing signal would tell an attacker what to tune.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 1.0)).await;
         let mut state = state_with_mock_validator(tracker.clone(), &mock);
@@ -1913,16 +1901,16 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn a_composite_in_the_suspicious_band_requires_a_captcha() {
-        // Inside the captcha band the handler asks for graduated friction rather
-        // than refusing outright. The client routes this reason to a retry UX.
+    async fn a_composite_in_the_suspicious_band_requires_another_capture() {
+        // The legacy reason routes the client to its retry interface.
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
-        let composite = expected_composite(1.0, 1.0, 0.0, 0.0);
+        let composite = expected_composite(1.0, 1.0, 0.0);
         assert!(
-            (CAPTCHA_THRESHOLD..=REJECT_THRESHOLD).contains(&composite),
-            "fixture must land in the captcha band, computed {composite}"
+            state.scoring_config.requires_friction(composite)
+                && !state.scoring_config.rejects(composite),
+            "fixture must land in the friction band, computed {composite}"
         );
 
         let result = validate_features_handler(
@@ -1946,46 +1934,40 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn the_same_suspicious_score_is_admitted_once_attempts_exceed_one() {
-        // Characterization, not endorsement. The captcha check is conditioned on
-        // `attempts <= 1`, and that count is read *after* the success path has
-        // already refunded this request's own slot — so a fresh wallet reads 0
-        // and always qualifies on a first request. Pre-seeding two attempts
-        // pushes the count to 2, and the identical risk score that demanded a
-        // captcha moments earlier now passes.
-        //
-        // Nothing server-side verifies that a captcha was actually solved, so
-        // the friction is advisory. Recorded here because it is invisible
-        // otherwise; whether it should hold is a policy question for the owner.
+    async fn repeated_suspicious_scores_remain_rejected() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 0.0)).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
-        let composite = expected_composite(1.0, 1.0, 0.0, 0.0);
+        let composite = expected_composite(1.0, 1.0, 0.0);
         assert!(
-            (CAPTCHA_THRESHOLD..=REJECT_THRESHOLD).contains(&composite),
-            "fixture must land in the captcha band, computed {composite}"
+            state.scoring_config.requires_friction(composite)
+                && !state.scoring_config.rejects(composite),
+            "fixture must land in the friction band, computed {composite}"
         );
 
         let wallet_id = random_wallet_id();
         let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
-        // Cap is 5, so two pre-seeded attempts leave headroom for the request.
-        state
-            .wallet_attempts
-            .check_and_record_attempt(&wallet)
-            .expect("first pre-seed is under the cap");
-        state
-            .wallet_attempts
-            .check_and_record_attempt(&wallet)
-            .expect("second pre-seed is under the cap");
+        for expected_attempts in 1..=2 {
+            let result = validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(baseline_request(wallet_id.clone())),
+            )
+            .await;
 
-        validate_features_handler(
-            State(state),
-            None,
-            headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
-        )
-        .await
-        .expect("the captcha check no longer applies once attempts exceed one");
+            assert!(matches!(
+                result,
+                Err(AppError::ValidationFailed {
+                    reason: Some(ref reason)
+                }) if reason == "captcha_required"
+            ));
+            assert_eq!(
+                state.wallet_attempts.get_attempts(&wallet),
+                expected_attempts,
+                "each rejected capture must consume one wallet attempt"
+            );
+        }
     }
 
     // ---- the safe-reveal reason filter ----
@@ -2133,11 +2115,7 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn a_threshold_rejection_refunds_the_wallet_slot_but_not_the_quota() {
-        // The success path refunds the wallet attempt before either policy tier
-        // runs, so a capture the validator accepted but the composite refused
-        // costs the user nothing against their own cap — while the integrator
-        // still pays, because the upstream work happened.
+    async fn a_threshold_rejection_consumes_the_wallet_slot_and_quota() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(1.0, 1.0, 1.0)).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
@@ -2164,8 +2142,8 @@ mod validator_reached_tests {
         );
         assert_eq!(
             state.wallet_attempts.get_attempts(&wallet),
-            0,
-            "the wallet slot is refunded before the threshold gates run"
+            1,
+            "a policy rejection must consume the wallet attempt"
         );
     }
 
@@ -2252,34 +2230,112 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn a_null_numeric_in_the_error_body_collapses_to_maximum_biometric_risk() {
-        // `#[serde(default)]` rescues a *missing* key, not a null one: a null
-        // numeric fails f64 deserialization, which fails the entire body, which
-        // `.ok()` turns into None. The error branch's fallback then assumes the
-        // worst and uses biometric_risk = 1.0. Pinned because the failure is
-        // silent — the reason is also lost, so the client sees a bare rejection.
+    async fn a_success_body_missing_a_risk_field_fails_closed() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = success_body(0.0, 0.0, 0.0);
+        body.as_object_mut()
+            .expect("the fixture must be an object")
+            .remove("biometric_risk");
+        let mock = MockValidator::spawn(StatusCode::OK, body).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationServiceUnavailable)
+        ));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+    }
+
+    #[tokio::test]
+    async fn a_success_body_with_an_out_of_range_risk_fails_closed() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = success_body(0.0, 0.0, 0.0);
+        body["biometric_risk"] = serde_json::json!(-0.01);
+        let mock = MockValidator::spawn(StatusCode::OK, body).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id)),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationServiceUnavailable)
+        ));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_rejection_body_fails_as_an_infrastructure_error() {
         let tracker = tracker_with_quota("test-key", 10);
         let mut body = error_body("phrase_content_mismatch");
         body["biometric_risk"] = serde_json::Value::Null;
         let mock = MockValidator::spawn(StatusCode::BAD_REQUEST, body).await;
         let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
 
         let result = validate_features_handler(
-            State(state),
+            State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(baseline_request(wallet_id)),
         )
         .await;
 
-        // `PaddedJson` is not `Debug`; discard the success payload so the
-        // catch-all arm can report what came back instead.
-        match result.map(|_| ()) {
-            Err(AppError::ValidationFailed { reason }) => assert!(
-                reason.is_none(),
-                "an unparseable body loses the reason entirely, got {reason:?}"
-            ),
-            other => panic!("expected ValidationFailed, got {other:?}"),
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationServiceUnavailable)
+        ));
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+    }
+
+    #[tokio::test]
+    async fn upstream_infrastructure_statuses_refund_both_budgets() {
+        for status in [
+            StatusCode::UNAUTHORIZED,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let tracker = tracker_with_quota("test-key", 10);
+            let mock = MockValidator::spawn(status, error_body("ignored")).await;
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+            let wallet_id = random_wallet_id();
+            let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+            let result = validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(baseline_request(wallet_id)),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(AppError::ValidationServiceUnavailable)
+            ));
+            assert_eq!(tracker.get_remaining("test-key"), 10);
+            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
         }
     }
 

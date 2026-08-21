@@ -1,6 +1,5 @@
 pub mod audio;
-// Weighted composite risk score + the reject/captcha thresholds, shared by both
-// branches of the validation handler.
+// Weighted composite score and policy boundaries for accepted validator responses.
 pub mod composite;
 pub mod handler;
 #[cfg(test)]

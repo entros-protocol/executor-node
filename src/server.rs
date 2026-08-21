@@ -29,6 +29,7 @@ use crate::status::handler::status_handler;
 use crate::status::metrics_handler::metrics_handler;
 use crate::status::status_metrics::StatusMetrics;
 use crate::study::{study_definition_handler, study_enrol_handler};
+use crate::validation::composite::ScoringConfig;
 use crate::validation::handler::validate_features_handler;
 
 #[derive(Clone)]
@@ -51,12 +52,13 @@ pub struct AppState {
     pub challenge_registry: Arc<ChallengeNonceRegistry>,
     pub challenge_ttl_secs: u64,
     pub challenge_required: bool,
+    pub scoring_config: Arc<ScoringConfig>,
     /// Observe-only automation-detection logging.
     /// Gates the calibration log in `validate_features_handler`; never affects
     /// the verification decision.
     pub automation_observe: bool,
-    /// Layer A1 automation hard gate: reject requests reporting
-    /// navigator.webdriver === true (prod only). Disable for E2E via
+    /// Reject requests that report navigator.webdriver === true in production.
+    /// Disable this check for end-to-end tests with
     /// `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT`.
     pub automation_webdriver_reject: bool,
     /// Observe-only wallet-reputation logging.
@@ -372,6 +374,7 @@ pub fn build_test_state(
         challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
         challenge_ttl_secs: 300,
         challenge_required: false,
+        scoring_config: Arc::new(ScoringConfig::synthetic_test_policy()),
         automation_observe: true,
         automation_webdriver_reject: false,
         wallet_reputation_observe: true,

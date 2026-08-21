@@ -1,23 +1,7 @@
-//! In-process mock of the upstream validation service, for handler tests.
+//! In-process HTTP mock for validation handler tests.
 //!
-//! `validate_features_handler` reaches its decision code only when
-//! `AppState::validation_url` is `Some`; with `None` it short-circuits at the
-//! dev-skip and roughly 400 lines — the validator round-trip, the composite
-//! risk score, and both policy tiers — never execute. Every test in the crate
-//! passed `None` until this module existed, so that region had no coverage.
-//!
-//! Deliberately dependency-free: `axum`, `tokio` and `reqwest` are already
-//! regular dependencies, so binding a real loopback listener costs nothing in
-//! `Cargo.lock` and mirrors the Router-driving idiom in `server.rs`'s
-//! `per_ip_middleware_tests`.
-//!
-//! The bodies handed to [`MockValidator::spawn`] must mirror what
-//! `entros-validation` actually emits (`ValidateResponse` / `ErrorResponse` in
-//! its `main.rs`): `200` on success, `400` on rejection, and optional fields
-//! *omitted* rather than sent as `null`. That distinction is load-bearing —
-//! `#[serde(default)]` on the executor side rescues a missing key but not a
-//! `null` one, which fails the whole body parse and silently drops the handler
-//! into its fallback arm.
+//! Response bodies must match the private validator contract. Every numeric
+//! risk field is required and must contain a finite value from zero to one.
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -160,27 +144,10 @@ async fn handle_rpc(Json(body): Json<Value>) -> Json<Value> {
     }))
 }
 
-/// An `AppState` wired to `mock`, with every nondeterministic input disabled.
+/// Build deterministic state that routes validation and identity RPC calls to `mock`.
 ///
-/// Three hazards are neutralized here rather than left for each test:
-///
-/// * `wallet_reputation_observe` — `REPUTATION_RPC_GATE` is a *process-wide*
-///   semaphore with 8 permits shared by every test in the binary. Once
-///   `validation_url` is `Some`, the reputation future goes live in every such
-///   test and above 8 concurrent tests `try_acquire` fails nondeterministically,
-///   flipping `reputation_risk` between a computed value and its `0.5` default.
-///   Disabling it pins that term, and with it the composite.
-/// * `relayer_tx` uses the mock server's JSON-RPC route. It returns a successful
-///   account-absence response without reading a developer's local validator.
-/// * `curve_trace_observe` — silences the detached scoring task, which is
-///   irrelevant to these assertions.
-///
-/// With `reputation_risk` pinned at its `0.5` default, every composite in these
-/// tests carries a fixed `0.10 * 0.5 = 0.05` floor.
-///
-/// Bind the [`MockValidator`] to a local first. Passing a temporary drops it at
-/// the end of the statement, which aborts the server and leaves the returned
-/// state pointing at a closed port.
+/// Bind the [`MockValidator`] before this call. The returned state borrows its
+/// address, so dropping the mock closes both test endpoints.
 pub fn state_with_mock_validator(
     tracker: Arc<crate::integrator::tracker::IntegratorTracker>,
     mock: &MockValidator,
@@ -198,10 +165,6 @@ pub fn state_with_mock_validator(
     ));
     state
 }
-
-/// The fixed contribution of `reputation_risk` to every composite in these
-/// tests: the `0.5` no-snapshot default weighted at `0.10`.
-pub const REPUTATION_FLOOR: f64 = 0.05;
 
 /// A success body shaped like `entros-validation`'s `ValidateResponse` with the
 /// given risk components. Optional fields are omitted, not nulled, exactly as
