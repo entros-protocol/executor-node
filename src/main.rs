@@ -43,6 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = Config::from_env()?;
     let environment = config.environment;
+    tracing::info!(
+        source = ?config.scoring_config.source,
+        revision = config.scoring_config.revision,
+        config_id = config.scoring_config.config_id.as_str(),
+        "Scoring configuration loaded"
+    );
 
     // Capture relayer keypair bytes BEFORE moving the keypair into SolanaClient.
     // The bytes are only needed for the dev-mode SAS authority fallback below
@@ -81,9 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Rate limiters initialized"
     );
 
-    // Surface the resolved observe-only automation-detection state (#196, A1)
-    // so a misconfigured EXECUTOR_AUTOMATION_OBSERVE is visible at boot rather
-    // than silently changing logging behaviour.
+    // Log observe-only switches at startup so configuration drift is visible.
     tracing::info!(
         automation_observe = config.automation_observe,
         wallet_reputation_observe = config.wallet_reputation_observe,
@@ -422,6 +426,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         challenge_registry,
         challenge_ttl_secs: config.challenge_ttl_secs,
         challenge_required: config.environment.is_prod(),
+        scoring_config: Arc::new(config.scoring_config.config),
         automation_observe: config.automation_observe,
         automation_webdriver_reject: config.automation_webdriver_reject,
         wallet_reputation_observe: config.wallet_reputation_observe,

@@ -1,52 +1,177 @@
 //! Composite risk scoring for `/validate-features`.
 //!
-//! Combines the risk components into one score and holds the two policy
-//! thresholds applied to it. Both branches of the validation handler score
-//! through here so the arithmetic exists once.
-//!
-//! Rationale for the weights, the threshold values, and the component set is
-//! recorded internally in `docs/reference/EXECUTOR-SCORING-INTERNALS.md`. This
-//! repository is public; keep comments here factual.
+//! The scoring configuration is immutable after startup. Accepted validator
+//! responses use it to apply one consistent policy.
 
-const W_BIOMETRIC: f64 = 0.35;
-const W_TTS: f64 = 0.25;
-/// Reserved while temporal coupling remains research telemetry.
+use std::fmt;
+
+/// Exact weight and threshold denominator.
+pub const PARTS_PER_MILLION: u32 = 1_000_000;
+
+/// Invalid scoring configuration supplied at startup.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ScoringConfigError {
+    #[error("scoring weight {field} must not exceed one million parts")]
+    WeightOutOfRange { field: &'static str },
+    #[error("scoring weights must total one million parts")]
+    WeightBudgetMismatch,
+    #[error("scoring threshold {field} must not exceed one million parts")]
+    ThresholdOutOfRange { field: &'static str },
+    #[error("the friction threshold must be lower than the rejection threshold")]
+    ThresholdOrderInvalid,
+    #[error("the friction threshold is unreachable under the active weight budget")]
+    FrictionThresholdUnreachable,
+    #[error("the rejection threshold is unreachable under the active weight budget")]
+    RejectThresholdUnreachable,
+}
+
+/// Immutable weights and policy boundaries resolved during startup.
 ///
-/// Keeping this share unallocated removes the signal without increasing any
-/// other detector's authority or moving the two policy thresholds.
-const _W_UNALLOCATED: f64 = 0.15;
-const W_AUTOMATION: f64 = 0.15;
-const W_REPUTATION: f64 = 0.10;
+/// Integer parts avoid tolerance-based budget validation. The unallocated share
+/// participates in the budget but never contributes to a decision score.
+#[derive(Clone)]
+pub struct ScoringConfig {
+    biometric_weight: f64,
+    tts_weight: f64,
+    automation_weight: f64,
+    reputation_weight: f64,
+    friction_threshold: f64,
+    reject_threshold: f64,
+}
 
-/// The active and reserved shares sum to a 1.0 budget. A new term must use that
-/// budget rather than extend the range. Checked during compilation, because a
-/// violation would otherwise move both thresholds without changing either one.
-///
-/// `f64::abs` is not const, so the tolerance is bounded from both sides; the sum
-/// does not land on exactly 1.0 in binary floating point.
-const _: () = {
-    let sum = W_BIOMETRIC + W_TTS + _W_UNALLOCATED + W_AUTOMATION + W_REPUTATION;
-    assert!(
-        sum > 1.0 - 1e-9 && sum < 1.0 + 1e-9,
-        "composite weight budget must sum to 1.0"
-    );
-};
+impl ScoringConfig {
+    /// Build a configuration whose weights form one exact budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        biometric_weight_ppm: u32,
+        tts_weight_ppm: u32,
+        unallocated_weight_ppm: u32,
+        automation_weight_ppm: u32,
+        reputation_weight_ppm: u32,
+        friction_threshold_ppm: u32,
+        reject_threshold_ppm: u32,
+    ) -> Result<Self, ScoringConfigError> {
+        for (field, value) in [
+            ("biometric", biometric_weight_ppm),
+            ("tts", tts_weight_ppm),
+            ("unallocated", unallocated_weight_ppm),
+            ("automation", automation_weight_ppm),
+            ("reputation", reputation_weight_ppm),
+        ] {
+            if value > PARTS_PER_MILLION {
+                return Err(ScoringConfigError::WeightOutOfRange { field });
+            }
+        }
 
-/// Scores above this are refused. The comparison is strict.
-pub const REJECT_THRESHOLD: f64 = 0.75;
+        let weight_budget = u64::from(biometric_weight_ppm)
+            + u64::from(tts_weight_ppm)
+            + u64::from(unallocated_weight_ppm)
+            + u64::from(automation_weight_ppm)
+            + u64::from(reputation_weight_ppm);
+        if weight_budget != u64::from(PARTS_PER_MILLION) {
+            return Err(ScoringConfigError::WeightBudgetMismatch);
+        }
 
-/// Scores at or above this take the graduated-friction path. Inclusive.
-pub const CAPTCHA_THRESHOLD: f64 = 0.45;
+        for (field, value) in [
+            ("friction", friction_threshold_ppm),
+            ("rejection", reject_threshold_ppm),
+        ] {
+            if value > PARTS_PER_MILLION {
+                return Err(ScoringConfigError::ThresholdOutOfRange { field });
+            }
+        }
 
-/// Ordering the two thresholds wrongly would leave one tier unreachable, since
-/// the reject tier is evaluated first.
-const _: () = assert!(CAPTCHA_THRESHOLD < REJECT_THRESHOLD);
+        if friction_threshold_ppm >= reject_threshold_ppm {
+            return Err(ScoringConfigError::ThresholdOrderInvalid);
+        }
 
-/// Four scored signals and one research signal for a verification attempt.
-///
-/// Named fields rather than positional arguments: every component is an `f64`
-/// over the same range, so a transposed pair would compile cleanly and misvalue
-/// every verification afterwards.
+        let active_maximum_ppm = PARTS_PER_MILLION - unallocated_weight_ppm;
+        if friction_threshold_ppm > active_maximum_ppm {
+            return Err(ScoringConfigError::FrictionThresholdUnreachable);
+        }
+        if reject_threshold_ppm >= active_maximum_ppm {
+            return Err(ScoringConfigError::RejectThresholdUnreachable);
+        }
+
+        Ok(Self::from_ppm(
+            biometric_weight_ppm,
+            tts_weight_ppm,
+            automation_weight_ppm,
+            reputation_weight_ppm,
+            friction_threshold_ppm,
+            reject_threshold_ppm,
+        ))
+    }
+
+    /// Neutral policy for development without signed scoring configuration.
+    ///
+    /// Its active score cannot reach either threshold. This keeps local
+    /// interface work free from deployment calibration.
+    pub fn development_default() -> Self {
+        Self::from_ppm(
+            200_000,
+            200_000,
+            200_000,
+            200_000,
+            900_000,
+            PARTS_PER_MILLION,
+        )
+    }
+
+    /// Non-production policy used by handler tests.
+    #[cfg(test)]
+    pub(crate) fn synthetic_test_policy() -> Self {
+        Self::try_new(
+            290_000, 210_000, 180_000, 160_000, 160_000, 420_000, 690_000,
+        )
+        .expect("synthetic scoring policy must be valid")
+    }
+
+    fn from_ppm(
+        biometric_weight_ppm: u32,
+        tts_weight_ppm: u32,
+        automation_weight_ppm: u32,
+        reputation_weight_ppm: u32,
+        friction_threshold_ppm: u32,
+        reject_threshold_ppm: u32,
+    ) -> Self {
+        let denominator = f64::from(PARTS_PER_MILLION);
+        Self {
+            biometric_weight: f64::from(biometric_weight_ppm) / denominator,
+            tts_weight: f64::from(tts_weight_ppm) / denominator,
+            automation_weight: f64::from(automation_weight_ppm) / denominator,
+            reputation_weight: f64::from(reputation_weight_ppm) / denominator,
+            friction_threshold: f64::from(friction_threshold_ppm) / denominator,
+            reject_threshold: f64::from(reject_threshold_ppm) / denominator,
+        }
+    }
+
+    /// Calculate the weighted score after bounding each untrusted component.
+    pub fn score(&self, components: &RiskComponents) -> f64 {
+        self.biometric_weight * bounded(components.biometric)
+            + self.tts_weight * bounded(components.tts)
+            + self.automation_weight * bounded(components.automation)
+            + self.reputation_weight * bounded(components.reputation)
+    }
+
+    /// Return true only when the score is above the rejection threshold.
+    pub fn rejects(&self, score: f64) -> bool {
+        score > self.reject_threshold
+    }
+
+    /// Return true when the score reaches the graduated-friction threshold.
+    pub fn requires_friction(&self, score: f64) -> bool {
+        score >= self.friction_threshold
+    }
+}
+
+impl fmt::Debug for ScoringConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ScoringConfig([REDACTED])")
+    }
+}
+
+/// Four scored signals and one unscored research signal.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RiskComponents {
     /// Validator's biometric-distance risk.
@@ -61,30 +186,12 @@ pub struct RiskComponents {
     pub reputation: f64,
 }
 
-impl RiskComponents {
-    /// The weighted composite, always finite and always within `[0, 1]`.
-    ///
-    /// Components are bounded before weighting rather than trusted: they cross a
-    /// service boundary and carry no range validation on arrival. A non-finite
-    /// component is treated as absent, matching how `sanitize_trace` handles
-    /// untrusted floats elsewhere in the crate.
-    pub fn composite(&self) -> f64 {
-        W_BIOMETRIC * bounded(self.biometric)
-            + W_TTS * bounded(self.tts)
-            + W_AUTOMATION * bounded(self.automation)
-            + W_REPUTATION * bounded(self.reputation)
-    }
-}
-
-/// Constrain one component to `[0, 1]`, mapping anything non-finite to zero.
-///
-/// The `is_finite` check has to precede the clamp: `f64::clamp` propagates NaN
-/// rather than resolving it.
+/// Constrain one component to `[0, 1]`, mapping anything non-finite to maximum risk.
 fn bounded(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, 1.0)
     } else {
-        0.0
+        1.0
     }
 }
 
@@ -92,8 +199,10 @@ fn bounded(value: f64) -> f64 {
 mod tests {
     use super::*;
 
-    /// Every component zero except the reputation prior at its no-snapshot
-    /// default, which is the shape of an ordinary passing capture.
+    fn synthetic_policy() -> ScoringConfig {
+        ScoringConfig::synthetic_test_policy()
+    }
+
     fn quiet() -> RiskComponents {
         RiskComponents {
             biometric: 0.0,
@@ -104,11 +213,6 @@ mod tests {
         }
     }
 
-    /// All five components at zero. Raising exactly one isolates its weight.
-    ///
-    /// There is deliberately no runtime test that the weights sum to one: the
-    /// `const` block above asserts it during compilation, so a violation fails
-    /// the build and any test restating it could never run to fail.
     fn silent() -> RiskComponents {
         RiskComponents {
             reputation: 0.0,
@@ -116,78 +220,135 @@ mod tests {
         }
     }
 
-    /// One isolation case: the component's name, a setter that raises only that
-    /// component, and the weight it should then contribute on its own.
-    type WeightCase = (&'static str, fn(&mut RiskComponents), f64);
-
     #[test]
-    fn each_component_is_wired_to_its_own_weight() {
-        // Checks wiring, not values. Raising one component must move the score by
-        // that component's weight and no other, which catches a field mapped to
-        // the wrong constant. It cannot catch a constant whose value changed,
-        // because the expectation reads the same constant: verified by mutation
-        // on 2026-07-29, where transposing W_BIOMETRIC and W_TTS left this test
-        // green. The values themselves are pinned independently by
-        // `expected_composite` in the handler's `validator_reached_tests`, which
-        // restates the table as literals for exactly that reason.
-        let cases: [WeightCase; 4] = [
-            ("biometric", |c| c.biometric = 1.0, W_BIOMETRIC),
-            ("tts", |c| c.tts = 1.0, W_TTS),
-            ("automation", |c| c.automation = 1.0, W_AUTOMATION),
-            ("reputation", |c| c.reputation = 1.0, W_REPUTATION),
-        ];
-        for (label, raise, expected) in cases {
-            let mut components = silent();
-            raise(&mut components);
-            let got = components.composite();
-            assert!(
-                (got - expected).abs() < 1e-9,
-                "{label} alone should score {expected}, got {got}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_quiet_capture_scores_only_the_reputation_prior() {
-        let got = quiet().composite();
-        assert!(
-            (got - 0.05).abs() < 1e-9,
-            "expected the 0.10 weight on a 0.5 prior, got {got}"
-        );
-    }
-
-    #[test]
-    fn temporal_telemetry_does_not_change_the_decision_score() {
-        let baseline = silent().composite();
-        let temporal_only = RiskComponents {
-            temporal: 1.0,
-            ..silent()
-        }
-        .composite();
-
+    fn rejects_a_weight_above_the_budget() {
+        let error = ScoringConfig::try_new(1_000_001, 0, 0, 0, 0, 120_000, 240_000)
+            .expect_err("an oversized weight must fail");
         assert_eq!(
-            temporal_only, baseline,
-            "observe-only temporal telemetry must not affect a verdict"
+            error,
+            ScoringConfigError::WeightOutOfRange { field: "biometric" }
         );
     }
 
     #[test]
-    fn all_scored_components_at_maximum_leave_the_temporal_share_unallocated() {
-        let got = RiskComponents {
+    fn rejects_any_inexact_weight_budget() {
+        for biometric in [289_999, 290_001] {
+            let error = ScoringConfig::try_new(
+                biometric, 210_000, 180_000, 160_000, 160_000, 420_000, 690_000,
+            )
+            .expect_err("an inexact budget must fail");
+            assert_eq!(error, ScoringConfigError::WeightBudgetMismatch);
+        }
+    }
+
+    #[test]
+    fn rejects_thresholds_outside_the_score_range() {
+        let error = ScoringConfig::try_new(
+            290_000, 210_000, 180_000, 160_000, 160_000, 420_000, 1_000_001,
+        )
+        .expect_err("an oversized threshold must fail");
+        assert_eq!(
+            error,
+            ScoringConfigError::ThresholdOutOfRange { field: "rejection" }
+        );
+    }
+
+    #[test]
+    fn rejects_equal_or_inverted_thresholds() {
+        for (friction, rejection) in [(690_000, 690_000), (700_000, 690_000)] {
+            let error = ScoringConfig::try_new(
+                290_000, 210_000, 180_000, 160_000, 160_000, friction, rejection,
+            )
+            .expect_err("misordered thresholds must fail");
+            assert_eq!(error, ScoringConfigError::ThresholdOrderInvalid);
+        }
+    }
+
+    #[test]
+    fn deployed_policy_requires_reachable_friction() {
+        let error = ScoringConfig::try_new(
+            290_000, 210_000, 180_000, 160_000, 160_000, 830_000, 900_000,
+        )
+        .expect_err("an unreachable friction threshold must fail");
+        assert_eq!(error, ScoringConfigError::FrictionThresholdUnreachable);
+    }
+
+    #[test]
+    fn strict_rejection_boundary_must_sit_below_the_active_maximum() {
+        let error = ScoringConfig::try_new(
+            290_000, 210_000, 180_000, 160_000, 160_000, 420_000, 820_000,
+        )
+        .expect_err("an unreachable rejection threshold must fail");
+        assert_eq!(error, ScoringConfigError::RejectThresholdUnreachable);
+    }
+
+    #[test]
+    fn development_policy_is_neutral() {
+        let policy = ScoringConfig::development_default();
+        let maximum = RiskComponents {
             biometric: 1.0,
             tts: 1.0,
             temporal: 1.0,
             automation: 1.0,
             reputation: 1.0,
-        }
-        .composite();
-        assert!((got - 0.85).abs() < 1e-9, "expected 0.85, got {got}");
+        };
+        let score = policy.score(&maximum);
+
+        assert!((score - 0.8).abs() < f64::EPSILON);
+        assert!(!policy.requires_friction(score));
+        assert!(!policy.rejects(score));
     }
 
     #[test]
-    fn a_component_above_one_cannot_inflate_the_score() {
-        // Components cross a service boundary unvalidated, so bounding has to
-        // happen here rather than being assumed upstream.
+    fn each_scored_component_uses_its_configured_weight() {
+        type ComponentCase = (&'static str, fn(&mut RiskComponents), f64);
+
+        let policy = synthetic_policy();
+        let cases: [ComponentCase; 4] = [
+            ("biometric", |c| c.biometric = 1.0, 0.29),
+            ("tts", |c| c.tts = 1.0, 0.21),
+            ("automation", |c| c.automation = 1.0, 0.16),
+            ("reputation", |c| c.reputation = 1.0, 0.16),
+        ];
+
+        for (label, raise, expected) in cases {
+            let mut components = silent();
+            raise(&mut components);
+            let score = policy.score(&components);
+            assert!(
+                (score - expected).abs() < 1e-12,
+                "{label} alone should score {expected}, got {score}"
+            );
+        }
+    }
+
+    #[test]
+    fn temporal_telemetry_never_changes_the_score() {
+        let policy = synthetic_policy();
+        let baseline = policy.score(&silent());
+        let temporal = policy.score(&RiskComponents {
+            temporal: 1.0,
+            ..silent()
+        });
+        assert_eq!(temporal, baseline);
+    }
+
+    #[test]
+    fn active_components_leave_the_reserved_share_unscored() {
+        let policy = synthetic_policy();
+        let score = policy.score(&RiskComponents {
+            biometric: 1.0,
+            tts: 1.0,
+            temporal: 1.0,
+            automation: 1.0,
+            reputation: 1.0,
+        });
+        assert!((score - 0.82).abs() < 1e-12);
+    }
+
+    #[test]
+    fn untrusted_components_are_bounded_before_scoring() {
+        let policy = synthetic_policy();
         let inflated = RiskComponents {
             biometric: 1e300,
             ..quiet()
@@ -196,50 +357,42 @@ mod tests {
             biometric: 1.0,
             ..quiet()
         };
-        assert_eq!(inflated.composite(), capped.composite());
-        assert!(inflated.composite() <= 1.0);
-    }
+        assert_eq!(policy.score(&inflated), policy.score(&capped));
 
-    #[test]
-    fn a_negative_component_cannot_deflate_the_score() {
         let negative = RiskComponents {
             biometric: -5.0,
             ..quiet()
         };
-        assert_eq!(negative.composite(), quiet().composite());
-        assert!(negative.composite() >= 0.0);
-    }
+        assert_eq!(policy.score(&negative), policy.score(&quiet()));
 
-    #[test]
-    fn a_non_finite_component_is_treated_as_absent() {
-        // NaN compares false against everything, so an unguarded non-finite
-        // component would make the resulting score meaningless downstream.
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let components = RiskComponents {
+            let score = policy.score(&RiskComponents {
                 tts: bad,
                 ..quiet()
-            };
-            let got = components.composite();
-            assert!(got.is_finite(), "{bad} produced a non-finite composite");
-            assert_eq!(got, quiet().composite());
+            });
+            let maximum_tts = policy.score(&RiskComponents {
+                tts: 1.0,
+                ..quiet()
+            });
+            assert!(score.is_finite());
+            assert_eq!(score, maximum_tts);
         }
     }
 
     #[test]
-    fn the_score_stays_within_bounds_for_any_input() {
-        for value in [f64::MIN, -1.0, 0.0, 0.5, 1.0, 1e300, f64::MAX, f64::NAN] {
-            let got = RiskComponents {
-                biometric: value,
-                tts: value,
-                temporal: value,
-                automation: value,
-                reputation: value,
-            }
-            .composite();
-            assert!(
-                got.is_finite() && (0.0..=1.0).contains(&got),
-                "component {value} produced {got}, outside [0, 1]"
-            );
-        }
+    fn policy_boundaries_keep_strict_and_inclusive_semantics() {
+        let policy = synthetic_policy();
+        assert!(!policy.rejects(0.69));
+        assert!(policy.rejects(0.690_001));
+        assert!(!policy.requires_friction(0.419_999));
+        assert!(policy.requires_friction(0.42));
+    }
+
+    #[test]
+    fn debug_output_never_contains_configuration_values() {
+        assert_eq!(
+            format!("{:?}", synthetic_policy()),
+            "ScoringConfig([REDACTED])"
+        );
     }
 }
