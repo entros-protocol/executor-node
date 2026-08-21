@@ -44,6 +44,13 @@ The example configuration uses `ENVIRONMENT=dev`. Without `VALIDATION_SERVICE_UR
 
 That mode supports interface development only. It does not perform Entros behavioral validation.
 
+Debug builds use a neutral scoring policy when `EXECUTOR_SCORING_CONFIG_BUNDLE`
+is absent. Every release build requires a valid signed bundle.
+
+Install the script dependencies with `npm ci` before signing a policy. The signer uses the installed `tsx` binary.
+
+Keep the policy, authority keypair, and bundle under `../.config`. The signer rejects private artifacts inside this public worktree.
+
 ## Production startup boundary
 
 `ENVIRONMENT` accepts only `dev` or `prod`. Unknown values stop startup.
@@ -53,6 +60,7 @@ Production requires:
 - At least one explicit `INTEGRATORS` entry.
 - A private `VALIDATION_SERVICE_URL`.
 - A valid `VALIDATION_SERVICE_URL_SIGNATURE`.
+- A valid `EXECUTOR_SCORING_CONFIG_BUNDLE`.
 - At least one valid `CORS_ORIGINS` entry.
 - A dedicated SAS authority when SAS credential fields are configured.
 
@@ -77,6 +85,7 @@ Production refuses the dev validator pass-through and permissive CORS mode.
 | `VALIDATION_SERVICE_URL` | unset | Private validator endpoint |
 | `VALIDATION_SERVICE_URL_SIGNATURE` | unset | Authority signature over the validator URL |
 | `VALIDATION_API_KEY` | unset | Credential sent to the private validator |
+| `EXECUTOR_SCORING_CONFIG_BUNDLE` | unset | Signed scoring configuration required by release builds |
 | `CHALLENGE_TTL_SECS` | `60` | Challenge nonce lifetime |
 | `VALIDATION_WALLET_MAX_ATTEMPTS` | `5` | Failed attempts allowed per wallet window |
 | `VALIDATION_WALLET_WINDOW_SECS` | `3600` | Wallet attempt window |
