@@ -19,9 +19,8 @@ pub struct ChallengeResponse {
     pub expires_in: u64,
     /// Server-issued 5-word phrase the user must speak aloud (drawn from
     /// the curated dictionary at `src/challenge/word_dict.rs`). Bound to the
-    /// nonce in `ChallengeNonceRegistry`; `/validate-features` looks it up
-    /// via `peek_challenge(wallet, ttl)` and forwards it to the validation
-    /// service for word-level content matching (master-list #89).
+    /// nonce in `ChallengeNonceRegistry`. Validation resolves the phrase by
+    /// nonce and forwards it for word-level content matching.
     pub phrase: String,
     /// Server-issued Lissajous curve parameters for the touch challenge.
     pub curve: LissajousParams,
@@ -43,7 +42,7 @@ pub async fn challenge_handler(
 
     Ok(PaddedJson(ChallengeResponse {
         nonce: nonce.to_vec(),
-        expires_in: state.challenge_ttl_secs,
+        expires_in: state.challenge_registry.ttl_secs(),
         phrase,
         curve,
     }))

@@ -50,7 +50,6 @@ pub struct AppState {
     pub validation_url: Option<String>,
     pub validation_api_key: Option<String>,
     pub challenge_registry: Arc<ChallengeNonceRegistry>,
-    pub challenge_ttl_secs: u64,
     pub challenge_required: bool,
     pub scoring_config: Arc<ScoringConfig>,
     /// Observe-only automation-detection logging.
@@ -371,8 +370,7 @@ pub fn build_test_state(
         http_client: Arc::new(reqwest::Client::new()),
         validation_url,
         validation_api_key: None,
-        challenge_registry: Arc::new(ChallengeNonceRegistry::new()),
-        challenge_ttl_secs: 300,
+        challenge_registry: Arc::new(ChallengeNonceRegistry::new(300)),
         challenge_required: false,
         scoring_config: Arc::new(ScoringConfig::synthetic_test_policy()),
         automation_observe: true,

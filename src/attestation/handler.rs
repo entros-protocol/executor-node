@@ -63,15 +63,20 @@ pub async fn attest_handler(
         AppError::InvalidRequest(format!("Invalid wallet address: {}", req.wallet_address))
     })?;
 
-    // 4. Validate server-issued challenge nonce
+    // 4. Parse the server-issued challenge nonce.
     let nonce_arr: [u8; 32] = nonce
         .as_slice()
         .try_into()
         .map_err(|_| AppError::InvalidRequest("Nonce must be 32 bytes".into()))?;
 
+    // 5. Verify wallet ownership before consuming its single-use challenge.
+    verify_wallet_signature(&user_wallet, signature, message)?;
+
+    // 6. Consume the current challenge. The client fetches it immediately
+    // before attestation, so a superseded nonce remains invalid.
     state
         .challenge_registry
-        .validate_and_consume(&user_wallet, &nonce_arr, state.challenge_ttl_secs)
+        .validate_and_consume(&user_wallet, &nonce_arr)
         .map_err(|e| {
             tracing::warn!(
                 wallet = %crate::auth::redact::redact_wallet_id(&user_wallet.to_string()),
@@ -81,10 +86,7 @@ pub async fn attest_handler(
             AppError::Forbidden(format!("Challenge validation failed: {e}"))
         })?;
 
-    // 5. Verify wallet ownership via signed message
-    verify_wallet_signature(&user_wallet, signature, message)?;
-
-    // 6. Issue attestation
+    // 7. Issue attestation.
     match attestor.issue_attestation(&user_wallet).await {
         Ok(sig) => {
             tracing::info!(
@@ -188,4 +190,99 @@ fn verify_wallet_signature(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attestation::sas::SasAttestor;
+    use crate::server::{build_test_state, tracker_with_quota};
+    use solana_sdk::signature::{Keypair, Signer};
+    use std::sync::Arc;
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn current_attestation_message(wallet: &Pubkey) -> String {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after UNIX epoch")
+            .as_secs();
+        format!("Entros-ATTEST:{wallet}:{timestamp}")
+    }
+
+    #[tokio::test]
+    async fn invalid_signature_does_not_consume_the_attestation_challenge() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut state = build_test_state(tracker, None);
+        let wallet = Keypair::new().pubkey();
+        let (nonce, _, _) = state.challenge_registry.issue(wallet);
+        state.sas_attestor = Some(Arc::new(SasAttestor::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1,
+            state.relayer_tx.client(),
+            Keypair::new(),
+        )));
+
+        let result = attest_handler(
+            State(state.clone()),
+            Json(AttestRequest {
+                wallet_address: wallet.to_string(),
+                nonce: Some(nonce.to_vec()),
+                signature: Some("00".repeat(64)),
+                message: Some(current_attestation_message(&wallet)),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+        assert!(state
+            .challenge_registry
+            .validate_and_consume(&wallet, &nonce)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn superseded_nonce_is_invalid_for_attestation() {
+        use crate::validation::mock_validator::{
+            state_with_mock_validator, success_body, MockValidator,
+        };
+        use axum::http::StatusCode;
+
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let wallet = keypair.pubkey();
+        let (superseded_nonce, _, _) = state.challenge_registry.issue(wallet);
+        let (current_nonce, _, _) = state.challenge_registry.issue(wallet);
+        state.sas_attestor = Some(Arc::new(SasAttestor::new(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            1,
+            state.relayer_tx.client(),
+            Keypair::new(),
+        )));
+        let message = current_attestation_message(&wallet);
+        let signature = lower_hex(keypair.sign_message(message.as_bytes()).as_ref());
+
+        let result = attest_handler(
+            State(state.clone()),
+            Json(AttestRequest {
+                wallet_address: wallet.to_string(),
+                nonce: Some(superseded_nonce.to_vec()),
+                signature: Some(signature),
+                message: Some(message),
+            }),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+        assert!(state
+            .challenge_registry
+            .validate_and_consume(&wallet, &current_nonce)
+            .is_ok());
+    }
 }

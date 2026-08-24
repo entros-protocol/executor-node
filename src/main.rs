@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let commitment_registry = Arc::new(CommitmentRegistry::new());
     tracing::info!("Commitment registry initialized (in-memory, resets on restart)");
 
-    let challenge_registry = Arc::new(ChallengeNonceRegistry::new());
+    let challenge_registry = Arc::new(ChallengeNonceRegistry::new(config.challenge_ttl_secs));
     tracing::info!(
         ttl_secs = config.challenge_ttl_secs,
         "Challenge nonce registry initialized"
@@ -368,12 +368,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Spawn background eviction task for stale challenge nonces
     let challenge_ref = Arc::clone(&challenge_registry);
-    let challenge_ttl = config.challenge_ttl_secs;
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
             interval.tick().await;
-            challenge_ref.evict_stale(challenge_ttl);
+            challenge_ref.evict_stale();
         }
     });
 
@@ -424,7 +423,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         validation_url: config.validation_service_url,
         validation_api_key: config.validation_api_key,
         challenge_registry,
-        challenge_ttl_secs: config.challenge_ttl_secs,
         challenge_required: config.environment.is_prod(),
         scoring_config: Arc::new(config.scoring_config.config),
         automation_observe: config.automation_observe,

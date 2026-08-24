@@ -22,6 +22,9 @@ const VALIDATION_URL_AUTHORITY_BS58: &str = "GYm3f7DTvTZ6dN1Gfe7UowHRerxTU4FK2u1
 /// from another tool that happens to be signed by the same authority key
 /// from being a valid validator-URL signature here.
 const VALIDATION_URL_DOMAIN_PREFIX: &str = "Entros-VALIDATOR-URL-V1:";
+const DEFAULT_CHALLENGE_TTL_SECS: u64 = 60;
+/// Limits replay exposure and live nonce retention to five minutes.
+const MAX_CHALLENGE_TTL_SECS: u64 = 300;
 
 /// Verify that `signature_bs58` is a valid Ed25519 signature by `authority`
 /// over `DOMAIN_PREFIX || url`. Internal helper, exposed for tests so they
@@ -304,6 +307,21 @@ fn parse_bool(value: Option<&str>, default: bool) -> bool {
             _ => default,
         },
     }
+}
+
+fn parse_challenge_ttl_secs(value: Option<&str>) -> Result<u64, String> {
+    let ttl_secs = match value {
+        Some(value) => value
+            .parse()
+            .map_err(|e| format!("CHALLENGE_TTL_SECS is not a valid u64: {e}"))?,
+        None => DEFAULT_CHALLENGE_TTL_SECS,
+    };
+    if !(1..=MAX_CHALLENGE_TTL_SECS).contains(&ttl_secs) {
+        return Err(format!(
+            "CHALLENGE_TTL_SECS must be between 1 and {MAX_CHALLENGE_TTL_SECS}"
+        ));
+    }
+    Ok(ttl_secs)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -871,6 +889,20 @@ mod tests {
         assert!(!debug.contains("110000"));
         assert!(!debug.contains("400000"));
     }
+
+    #[test]
+    fn challenge_ttl_defaults_and_accepts_the_bounded_range() {
+        assert_eq!(parse_challenge_ttl_secs(None).unwrap(), 60);
+        assert_eq!(parse_challenge_ttl_secs(Some("1")).unwrap(), 1);
+        assert_eq!(parse_challenge_ttl_secs(Some("300")).unwrap(), 300);
+    }
+
+    #[test]
+    fn challenge_ttl_rejects_zero_oversized_and_malformed_values() {
+        for value in ["0", "301", "not-a-number"] {
+            assert!(parse_challenge_ttl_secs(Some(value)).is_err());
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -905,6 +937,7 @@ pub struct Config {
     /// `VALIDATION_URL_AUTHORITY_BS58` on startup when `ENVIRONMENT=prod`.
     pub validation_service_url_signature: Option<String>,
     pub validation_api_key: Option<String>,
+    /// Challenge lifetime in seconds. Startup accepts values from 1 through 300.
     pub challenge_ttl_secs: u64,
     /// Per-wallet validation-attempt cap. Soft cap on
     /// the number of attempts a single wallet can make in the configured
@@ -1108,10 +1141,8 @@ impl Config {
             std::env::var("VALIDATION_SERVICE_URL_SIGNATURE").ok();
         let validation_api_key = std::env::var("VALIDATION_API_KEY").ok();
 
-        let challenge_ttl_secs: u64 = std::env::var("CHALLENGE_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(60);
+        let challenge_ttl_secs =
+            parse_challenge_ttl_secs(std::env::var("CHALLENGE_TTL_SECS").ok().as_deref())?;
 
         // Default 5 attempts / 1h. Permissive at launch — tightenable
         // via env var once we have real-user failure-rate data.

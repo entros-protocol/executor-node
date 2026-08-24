@@ -10,6 +10,7 @@ use std::str::FromStr;
 use crate::error::AppError;
 use crate::padding::PaddedJson;
 use crate::server::AppState;
+use crate::validation::authorization::{verify_wallet_authorization, WalletAuthorization};
 use crate::validation::composite::RiskComponents;
 
 /// How long to wait on the internal validation service before giving up.
@@ -28,6 +29,11 @@ use crate::validation::composite::RiskComponents;
 const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
 const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
+const FEATURE_VECTOR_WIDTH: usize = 308;
+const AUDIO_FEATURE_WIDTH: usize = 170;
+const NORMALIZED_TOUCH_PROJECTION_VERSION: u16 = 2;
+const COMPATIBILITY_PROJECTION_VERSION: u16 = 1;
+const COMPATIBILITY_FEATURE_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProjectionIntent {
@@ -85,12 +91,85 @@ fn derive_projection_intent(
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectionCompatibilityEvidence {
+    pub projection_version: u16,
+    pub feature_schema_version: u16,
+    pub features: Vec<f64>,
+}
+
+fn validate_projection_compatibility_evidence(
+    projection_version: u16,
+    intent: ProjectionIntent,
+    primary_features: &[f64],
+    evidence: Option<&ProjectionCompatibilityEvidence>,
+) -> Result<(), AppError> {
+    validate_compatibility_evidence_projection_policy(projection_version, evidence)?;
+    if projection_version != NORMALIZED_TOUCH_PROJECTION_VERSION {
+        return Ok(());
+    }
+
+    let required = matches!(
+        intent,
+        ProjectionIntent::Mint | ProjectionIntent::Rebaseline | ProjectionIntent::Reset
+    );
+    let Some(evidence) = evidence else {
+        return if required {
+            Err(AppError::InvalidRequest(
+                "Projection 2 baseline changes require projection 1 compatibility evidence".into(),
+            ))
+        } else {
+            Ok(())
+        };
+    };
+    if !required {
+        return Err(AppError::InvalidRequest(
+            "Compatibility evidence is not allowed for this projection intent".into(),
+        ));
+    }
+    if evidence.projection_version != COMPATIBILITY_PROJECTION_VERSION
+        || evidence.feature_schema_version != COMPATIBILITY_FEATURE_SCHEMA_VERSION
+        || evidence.features.len() != FEATURE_VECTOR_WIDTH
+        || evidence.features.iter().any(|value| !value.is_finite())
+        || primary_features.get(..AUDIO_FEATURE_WIDTH)
+            != evidence.features.get(..AUDIO_FEATURE_WIDTH)
+    {
+        return Err(AppError::InvalidRequest(
+            "Invalid projection compatibility evidence".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_compatibility_evidence_projection_policy(
+    projection_version: u16,
+    evidence: Option<&ProjectionCompatibilityEvidence>,
+) -> Result<(), AppError> {
+    if projection_version != NORMALIZED_TOUCH_PROJECTION_VERSION && evidence.is_some() {
+        return Err(AppError::InvalidRequest(
+            "Compatibility evidence is not allowed for this projection".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Deserialize)]
 pub struct ValidateFeaturesRequest {
     pub features: Vec<f64>,
     pub wallet_id: String,
     #[serde(default)]
     pub projection_version: Option<u16>,
+    /// Projection 1 feature summary derived from the same capture as a
+    /// projection 2 baseline change. The validator uses it only for the legacy
+    /// registry compatibility check.
+    #[serde(default)]
+    pub compatibility_evidence: Option<ProjectionCompatibilityEvidence>,
+    /// Wallet-bound signature over the projection 2 verdict inputs and the
+    /// server-issued challenge nonce.
+    #[serde(default)]
+    pub wallet_authorization: Option<WalletAuthorization>,
     /// Requests a reset-scoped validator receipt for an existing identity.
     /// The executor still derives the identity and projection state from chain.
     #[serde(default)]
@@ -298,6 +377,45 @@ pub struct SignedReceiptDto {
     pub signature_hex: String,
 }
 
+struct PreForwardBudgetGuard<'a> {
+    state: &'a AppState,
+    api_key: &'a str,
+    wallet: &'a Pubkey,
+    refund_pending: bool,
+}
+
+impl<'a> PreForwardBudgetGuard<'a> {
+    fn new(state: &'a AppState, api_key: &'a str, wallet: &'a Pubkey) -> Self {
+        Self {
+            state,
+            api_key,
+            wallet,
+            refund_pending: true,
+        }
+    }
+
+    fn refund(mut self) {
+        self.refund_once();
+    }
+
+    fn validator_reached(mut self) {
+        self.refund_pending = false;
+    }
+
+    fn refund_once(&mut self) {
+        if self.refund_pending {
+            refund_infrastructure_failure(self.state, self.api_key, self.wallet);
+            self.refund_pending = false;
+        }
+    }
+}
+
+impl Drop for PreForwardBudgetGuard<'_> {
+    fn drop(&mut self) {
+        self.refund_once();
+    }
+}
+
 pub async fn validate_features_handler(
     State(state): State<AppState>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -314,15 +432,24 @@ pub async fn validate_features_handler(
     // rejected before touching the rate limiter or validation service.
     let wallet = Pubkey::from_str(&req.wallet_id)
         .map_err(|_| AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id)))?;
+    let projection_version = req.projection_version.unwrap_or(0);
     if req.study.as_ref().is_some_and(|study| !study.validate()) {
         return Err(AppError::InvalidRequest(
             "invalid population-study context".into(),
         ));
     }
+    let authorization_nonce = verify_wallet_authorization(&req, &wallet, projection_version)?;
+    validate_compatibility_evidence_projection_policy(
+        projection_version,
+        req.compatibility_evidence.as_ref(),
+    )?;
 
-    let issued_challenge = state
-        .challenge_registry
-        .peek_challenge(&wallet, state.challenge_ttl_secs);
+    let issued_challenge = match authorization_nonce.as_ref() {
+        Some(nonce) => state
+            .challenge_registry
+            .peek_exact_challenge(&wallet, nonce),
+        None => state.challenge_registry.peek_challenge(&wallet),
+    };
     if state.challenge_required && issued_challenge.is_none() {
         return Err(AppError::InvalidRequest(
             "Verification challenge expired. Start verification again.".into(),
@@ -486,6 +613,7 @@ pub async fn validate_features_handler(
             return Err(e);
         }
     };
+    let budget_guard = PreForwardBudgetGuard::new(&state, &api_key, &wallet);
 
     // Observe-only wallet reputation reads the
     // verifying wallet's PUBLIC on-chain reputation (balance + recent activity)
@@ -503,23 +631,20 @@ pub async fn validate_features_handler(
     // budget, and skip the metrics increment so `validations_performed`
     // reflects work that actually happened. Re-read remaining_quota after
     // the refund so the response reflects the restored balance.
-    let validation_url = match &state.validation_url {
-        Some(url) => url,
-        None => {
-            tracing::debug!("Validation service not configured, skipping");
-            state.wallet_attempts.refund_on_success(&wallet);
-            state.tracker.refund(&api_key);
-            let remaining_after_refund = state.tracker.get_remaining(&api_key);
-            return Ok(PaddedJson(ValidateFeaturesResponse {
-                valid: true,
-                remaining_quota: Some(remaining_after_refund),
-                signed_receipt: None,
-                commitment_hex: None,
-                salt_hex: None,
-                study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
-            }));
-        }
-    };
+    let validation_url = state.validation_url.as_deref();
+    if validation_url.is_none() && projection_version != NORMALIZED_TOUCH_PROJECTION_VERSION {
+        tracing::debug!("Validation service not configured, skipping");
+        budget_guard.refund();
+        let remaining_after_refund = state.tracker.get_remaining(&api_key);
+        return Ok(PaddedJson(ValidateFeaturesResponse {
+            valid: true,
+            remaining_quota: Some(remaining_after_refund),
+            signed_receipt: None,
+            commitment_hex: None,
+            salt_hex: None,
+            study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
+        }));
+    }
 
     // Score the coarse outline against the issued curve for observation only.
     // Run this outside the request path. Detached like `wallet_reputation_observe`,
@@ -556,7 +681,6 @@ pub async fn validate_features_handler(
 
     // Fetch user's verification timestamps from on-chain IdentityState
     let (identity_pda, _) = crate::solana::pda::find_identity_state_pda(&wallet);
-    let projection_version = req.projection_version.unwrap_or(0);
     if req
         .study
         .as_ref()
@@ -577,6 +701,31 @@ pub async fn validate_features_handler(
         projection_version,
         req.baseline_reset,
     )?;
+    validate_projection_compatibility_evidence(
+        projection_version,
+        projection_intent,
+        &req.features,
+        req.compatibility_evidence.as_ref(),
+    )?;
+    if let Some(nonce) = authorization_nonce {
+        state
+            .challenge_registry
+            .validate_and_consume_exact(&wallet, &nonce)
+            .map_err(|_| AppError::Forbidden("Wallet authorization challenge failed".into()))?;
+    }
+    let Some(validation_url) = validation_url else {
+        tracing::debug!("Validation service not configured, skipping after projection checks");
+        budget_guard.refund();
+        let remaining_after_refund = state.tracker.get_remaining(&api_key);
+        return Ok(PaddedJson(ValidateFeaturesResponse {
+            valid: true,
+            remaining_quota: Some(remaining_after_refund),
+            signed_receipt: None,
+            commitment_hex: None,
+            salt_hex: None,
+            study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
+        }));
+    };
     let mut recent_timestamps = Vec::new();
     if let Some(data) = identity_data {
         if data.len() >= 8 && data[..8] == IDENTITY_DISCRIMINATOR {
@@ -635,6 +784,10 @@ pub async fn validate_features_handler(
         validator_body["study"] =
             serde_json::to_value(study).map_err(|_| AppError::ValidationServiceUnavailable)?;
     }
+    if let Some(evidence) = req.compatibility_evidence.as_ref() {
+        validator_body["compatibility_evidence"] =
+            serde_json::to_value(evidence).map_err(|_| AppError::ValidationServiceUnavailable)?;
+    }
     let mut request = state
         .http_client
         .post(format!("{validation_url}/validate"))
@@ -691,7 +844,10 @@ pub async fn validate_features_handler(
     let (response_res, reputation_opt) = tokio::join!(request.send(), reputation_future);
 
     let response = match response_res {
-        Ok(r) => r,
+        Ok(r) => {
+            budget_guard.validator_reached();
+            r
+        }
         Err(e) => {
             // Full error detail stays in ops logs; the wire response
             // body resolves to a generic "service temporarily unavailable"
@@ -703,11 +859,6 @@ pub async fn validate_features_handler(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream request failed"
             );
-            // Infrastructure failure — refund integrator quota AND the
-            // per-wallet attempt slot. The wallet did nothing wrong; if
-            // the validator was unreachable the user shouldn't pay against
-            // their per-wallet budget.
-            refund_infrastructure_failure(&state, &api_key, &wallet);
             return Err(AppError::ValidationServiceUnavailable);
         }
     };
@@ -1052,6 +1203,217 @@ mod tests {
             derive_projection_intent(Some(&identity_data_with_projection(0)), 1, true).is_err()
         );
     }
+
+    pub(super) fn projection_one_compatibility_evidence() -> ProjectionCompatibilityEvidence {
+        ProjectionCompatibilityEvidence {
+            projection_version: 1,
+            feature_schema_version: 4,
+            features: vec![0.0; FEATURE_VECTOR_WIDTH],
+        }
+    }
+
+    #[test]
+    fn projection_two_compatibility_evidence_is_required_by_chain_intent() {
+        let evidence = projection_one_compatibility_evidence();
+        let primary_features = evidence.features.clone();
+
+        for intent in [
+            ProjectionIntent::Mint,
+            ProjectionIntent::Rebaseline,
+            ProjectionIntent::Reset,
+        ] {
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_ok());
+            assert!(
+                validate_projection_compatibility_evidence(2, intent, &primary_features, None)
+                    .is_err()
+            );
+        }
+
+        assert!(validate_projection_compatibility_evidence(
+            2,
+            ProjectionIntent::Update,
+            &primary_features,
+            None
+        )
+        .is_ok());
+        assert!(validate_projection_compatibility_evidence(
+            2,
+            ProjectionIntent::Update,
+            &primary_features,
+            Some(&evidence),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn earlier_projections_reject_compatibility_evidence_for_every_intent() {
+        let evidence = projection_one_compatibility_evidence();
+        let primary_features = evidence.features.clone();
+
+        for projection_version in [0, 1] {
+            for intent in [
+                ProjectionIntent::Mint,
+                ProjectionIntent::Update,
+                ProjectionIntent::Rebaseline,
+                ProjectionIntent::Reset,
+            ] {
+                assert!(validate_projection_compatibility_evidence(
+                    projection_version,
+                    intent,
+                    &primary_features,
+                    Some(&evidence),
+                )
+                .is_err());
+                assert!(validate_projection_compatibility_evidence(
+                    projection_version,
+                    intent,
+                    &primary_features,
+                    None
+                )
+                .is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn projection_two_compatibility_evidence_has_fixed_versions_width_and_finite_values() {
+        let mut evidence = projection_one_compatibility_evidence();
+        let primary_features = evidence.features.clone();
+        for intent in [
+            ProjectionIntent::Mint,
+            ProjectionIntent::Rebaseline,
+            ProjectionIntent::Reset,
+        ] {
+            evidence.projection_version = 0;
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+            evidence.projection_version = 2;
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+
+            evidence = projection_one_compatibility_evidence();
+            evidence.feature_schema_version = 3;
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+            evidence.feature_schema_version = 5;
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+
+            evidence = projection_one_compatibility_evidence();
+            evidence.features.pop();
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+            evidence.features.push(0.0);
+            evidence.features.push(0.0);
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+
+            evidence = projection_one_compatibility_evidence();
+            evidence.features[0] = f64::NAN;
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+            evidence.features[0] = f64::INFINITY;
+            assert!(validate_projection_compatibility_evidence(
+                2,
+                intent,
+                &primary_features,
+                Some(&evidence)
+            )
+            .is_err());
+
+            evidence = projection_one_compatibility_evidence();
+        }
+    }
+
+    #[test]
+    fn malformed_projection_compatibility_evidence_is_rejected_at_deserialization() {
+        let base = serde_json::json!({
+            "features": vec![0.0; FEATURE_VECTOR_WIDTH],
+            "wallet_id": "abc",
+            "projection_version": 2,
+        });
+        let malformed = [
+            serde_json::json!({
+                "projection_version": 1,
+                "features": vec![0.0; FEATURE_VECTOR_WIDTH],
+            }),
+            serde_json::json!({
+                "projection_version": 1,
+                "feature_schema_version": 4,
+            }),
+            serde_json::json!({
+                "projection_version": "1",
+                "feature_schema_version": 4,
+                "features": vec![0.0; FEATURE_VECTOR_WIDTH],
+            }),
+            serde_json::json!({
+                "projection_version": 1,
+                "feature_schema_version": 4,
+                "features": vec![0.0; FEATURE_VECTOR_WIDTH],
+                "wallet_id": "must-not-enter-the-nested-contract",
+            }),
+        ];
+
+        for evidence in malformed {
+            let mut request = base.clone();
+            request["compatibility_evidence"] = evidence;
+            assert!(serde_json::from_value::<ValidateFeaturesRequest>(request).is_err());
+        }
+    }
+
+    #[test]
+    fn older_payloads_can_omit_projection_compatibility_evidence() {
+        let request: ValidateFeaturesRequest = serde_json::from_value(serde_json::json!({
+            "features": vec![0.0; FEATURE_VECTOR_WIDTH],
+            "wallet_id": "abc",
+            "projection_version": 1,
+        }))
+        .expect("projection 1 payload remains compatible");
+
+        assert!(request.compatibility_evidence.is_none());
+    }
+
     use crate::integrator::wallet_attempts::WalletAttemptTracker;
     use crate::server::{build_test_state, headers_with_key, random_wallet_id, tracker_with_quota};
 
@@ -1063,6 +1425,8 @@ mod tests {
             features: vec![0.0; 308],
             wallet_id,
             projection_version: None,
+            compatibility_evidence: None,
+            wallet_authorization: None,
             baseline_reset: false,
             f0_contour: None,
             accel_magnitude: None,
@@ -1482,15 +1846,17 @@ mod tests {
 mod validator_reached_tests {
     use super::*;
     use crate::server::{headers_with_key, random_wallet_id, tracker_with_quota};
+    use crate::validation::authorization::{authorization_message, request_digest};
     use crate::validation::composite::ScoringConfig;
     use crate::validation::mock_validator::{
         error_body, state_with_mock_validator, success_body, MockValidator,
     };
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
+    use solana_sdk::signature::{Keypair, Signer};
     use std::sync::Arc;
     // Reused rather than re-declared: the request literal names every field, so
     // a second copy would drift the moment `ValidateFeaturesRequest` changes.
-    use super::tests::baseline_request;
+    use super::tests::{baseline_request, projection_one_compatibility_evidence};
 
     const DEFAULT_REPUTATION_RISK: f64 = 0.5;
 
@@ -1514,6 +1880,33 @@ mod validator_reached_tests {
             automation,
             reputation: DEFAULT_REPUTATION_RISK,
         })
+    }
+
+    fn lower_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn authorize_projection_two_request(
+        state: &AppState,
+        keypair: &Keypair,
+        request: &mut ValidateFeaturesRequest,
+    ) -> [u8; 32] {
+        let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
+        set_projection_two_authorization(keypair, nonce, request);
+        nonce
+    }
+
+    fn set_projection_two_authorization(
+        keypair: &Keypair,
+        nonce: [u8; 32],
+        request: &mut ValidateFeaturesRequest,
+    ) {
+        let digest = request_digest(request).expect("projection 2 request digest");
+        let message = authorization_message(&keypair.pubkey(), &nonce, 2, &digest);
+        request.wallet_authorization = Some(WalletAuthorization {
+            nonce: nonce.to_vec(),
+            signature_hex: lower_hex(keypair.sign_message(message.as_bytes()).as_ref()),
+        });
     }
 
     // ---- reachability, and the gate whose contract was previously inverted ----
@@ -1558,6 +1951,309 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
+    async fn projection_two_mint_forwards_compatibility_evidence_unchanged() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let evidence = projection_one_compatibility_evidence();
+        let expected = serde_json::to_value(&evidence).expect("compatibility evidence serializes");
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        request.compatibility_evidence = Some(evidence);
+        let nonce = authorize_projection_two_request(&state, &keypair, &mut request);
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .expect("a projection 2 mint with compatibility evidence must reach the validator");
+
+        let sent = mock.received();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].get("compatibility_evidence"), Some(&expected));
+        assert_eq!(
+            sent[0].get("receipt_purpose"),
+            Some(&serde_json::json!("mint"))
+        );
+        assert!(sent[0].get("wallet_authorization").is_none());
+        assert!(state
+            .challenge_registry
+            .validate_and_consume(&keypair.pubkey(), &nonce)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn projection_two_mint_without_compatibility_evidence_stops_before_validation() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        let nonce = authorize_projection_two_request(&state, &keypair, &mut request);
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        assert!(mock.received().is_empty());
+        assert!(state
+            .challenge_registry
+            .validate_and_consume(&keypair.pubkey(), &nonce)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn projection_two_audio_block_mismatch_stops_before_validation() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let mut evidence = projection_one_compatibility_evidence();
+        evidence.features[169] = 1.0;
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        request.compatibility_evidence = Some(evidence);
+        authorize_projection_two_request(&state, &keypair, &mut request);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        assert!(mock.received().is_empty());
+    }
+
+    #[tokio::test]
+    async fn projection_two_compatibility_touch_block_may_differ_at_audio_boundary() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let mut evidence = projection_one_compatibility_evidence();
+        evidence.features[170] = 1.0;
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        request.compatibility_evidence = Some(evidence);
+        authorize_projection_two_request(&state, &keypair, &mut request);
+
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .expect("the compatibility touch block may differ from the primary projection");
+
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn projection_two_validation_nonce_is_consumed_exactly_once() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        request.compatibility_evidence = Some(projection_one_compatibility_evidence());
+        authorize_projection_two_request(&state, &keypair, &mut request);
+        let authorization = request
+            .wallet_authorization
+            .clone()
+            .expect("authorized fixture");
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .expect("first use succeeds");
+
+        let mut replay = baseline_request(keypair.pubkey().to_string());
+        replay.projection_version = Some(2);
+        replay.compatibility_evidence = Some(projection_one_compatibility_evidence());
+        replay.wallet_authorization = Some(authorization);
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(replay),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn projection_two_dev_skip_enforces_contract_and_consumes_nonce_once() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.validation_url = None;
+        let keypair = Keypair::new();
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        request.compatibility_evidence = Some(projection_one_compatibility_evidence());
+        let nonce = authorize_projection_two_request(&state, &keypair, &mut request);
+        let authorization = request
+            .wallet_authorization
+            .clone()
+            .expect("authorized fixture");
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .expect("the first authorized projection 2 dev request succeeds");
+
+        assert!(state
+            .challenge_registry
+            .validate_and_consume(&keypair.pubkey(), &nonce)
+            .is_err());
+        let mut replay = baseline_request(keypair.pubkey().to_string());
+        replay.projection_version = Some(2);
+        replay.compatibility_evidence = Some(projection_one_compatibility_evidence());
+        replay.wallet_authorization = Some(authorization);
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(replay),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::Forbidden(_))));
+        assert!(mock.received().is_empty());
+    }
+
+    #[tokio::test]
+    async fn projection_two_uses_the_challenge_bound_to_its_signed_nonce() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let (signed_nonce, signed_phrase, _) = state.challenge_registry.issue(keypair.pubkey());
+        let mut request = baseline_request(keypair.pubkey().to_string());
+        request.projection_version = Some(2);
+        request.compatibility_evidence = Some(projection_one_compatibility_evidence());
+        set_projection_two_authorization(&keypair, signed_nonce, &mut request);
+        loop {
+            let (_, later_phrase, _) = state.challenge_registry.issue(keypair.pubkey());
+            if later_phrase != signed_phrase {
+                break;
+            }
+        }
+
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .expect("a later challenge must not invalidate an in-flight signed capture");
+
+        let sent = mock.received();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["expected_phrase"], signed_phrase);
+    }
+
+    #[tokio::test]
+    async fn projections_zero_and_one_dev_skip_leave_the_challenge_unchanged() {
+        for projection_version in [0, 1] {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = crate::server::build_test_state(tracker, None);
+            let keypair = Keypair::new();
+            let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
+            let mut request = baseline_request(keypair.pubkey().to_string());
+            request.projection_version = Some(projection_version);
+
+            validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(request),
+            )
+            .await
+            .expect("earlier projection dev behavior remains compatible");
+
+            assert!(state
+                .challenge_registry
+                .validate_and_consume(&keypair.pubkey(), &nonce)
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn projections_zero_and_one_dev_skip_reject_compatibility_evidence() {
+        for projection_version in [0, 1] {
+            let tracker = tracker_with_quota("test-key", 10);
+            let state = crate::server::build_test_state(tracker, None);
+            let mut request = baseline_request(random_wallet_id());
+            request.projection_version = Some(projection_version);
+            request.compatibility_evidence = Some(projection_one_compatibility_evidence());
+
+            let result = validate_features_handler(
+                State(state),
+                None,
+                headers_with_key("test-key"),
+                Json(request),
+            )
+            .await;
+
+            assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        }
+    }
+
+    #[tokio::test]
+    async fn projections_zero_and_one_leave_the_challenge_for_attestation() {
+        for projection_version in [0, 1] {
+            let tracker = tracker_with_quota("test-key", 10);
+            let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+            let state = state_with_mock_validator(tracker, &mock);
+            let keypair = Keypair::new();
+            let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
+            let mut request = baseline_request(keypair.pubkey().to_string());
+            request.projection_version = Some(projection_version);
+
+            validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(request),
+            )
+            .await
+            .expect("earlier projection validation remains compatible");
+
+            assert!(state
+                .challenge_registry
+                .validate_and_consume(&keypair.pubkey(), &nonce)
+                .is_ok());
+        }
+    }
+
+    #[tokio::test]
     async fn a_successful_wire_response_does_not_expose_the_composite_score() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
@@ -1595,7 +2291,7 @@ mod validator_reached_tests {
 
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
-        let mut state = state_with_mock_validator(tracker, &mock);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
         state.relayer_tx = std::sync::Arc::new(
             crate::relayer::transaction::RelayerTransaction::new(std::sync::Arc::new(
                 crate::solana::client::SolanaClient::new("http://127.0.0.1:1", Keypair::new()),
@@ -1611,11 +2307,21 @@ mod validator_reached_tests {
             "closed RPC port returned {rpc_probe:?}"
         );
 
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+        tracker
+            .check_and_deduct("test-key")
+            .expect("seed integrator usage");
+        state
+            .wallet_attempts
+            .check_and_record_attempt(&wallet)
+            .expect("seed wallet usage");
+
         let result = validate_features_handler(
-            State(state),
+            State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(baseline_request(wallet_id)),
         )
         .await;
 
@@ -1624,6 +2330,8 @@ mod validator_reached_tests {
             other => panic!("expected Solana RPC failure, got {other:?}"),
         }
         assert!(mock.received().is_empty());
+        assert_eq!(tracker.get_remaining("test-key"), 9);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
     }
 
     #[tokio::test]
@@ -1726,8 +2434,17 @@ mod validator_reached_tests {
     async fn study_projection_must_match_the_validation_request() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
-        let state = state_with_mock_validator(tracker, &mock);
-        let mut request = baseline_request(random_wallet_id());
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+        tracker
+            .check_and_deduct("test-key")
+            .expect("seed integrator usage");
+        state
+            .wallet_attempts
+            .check_and_record_attempt(&wallet)
+            .expect("seed wallet usage");
+        let mut request = baseline_request(wallet_id);
         request.study = Some(StudyRequestContext {
             token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
             record_id: "00112233445566778899aabbccddeeff".into(),
@@ -1737,7 +2454,7 @@ mod validator_reached_tests {
         });
 
         let result = validate_features_handler(
-            State(state),
+            State(state.clone()),
             None,
             headers_with_key("test-key"),
             Json(request),
@@ -1752,6 +2469,39 @@ mod validator_reached_tests {
             other => panic!("expected projection mismatch rejection, got {other:?}"),
         }
         assert!(mock.received().is_empty());
+        assert_eq!(tracker.get_remaining("test-key"), 9);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+    }
+
+    #[tokio::test]
+    async fn projection_intent_failure_refunds_each_budget_once() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+        tracker
+            .check_and_deduct("test-key")
+            .expect("seed integrator usage");
+        state
+            .wallet_attempts
+            .check_and_record_attempt(&wallet)
+            .expect("seed wallet usage");
+        let mut request = baseline_request(wallet_id);
+        request.baseline_reset = true;
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        assert!(mock.received().is_empty());
+        assert_eq!(tracker.get_remaining("test-key"), 9);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
     }
 
     #[tokio::test]
@@ -2355,7 +3105,7 @@ mod validator_reached_tests {
         state.challenge_registry.issue(wallet);
         let (issued_phrase, _) = state
             .challenge_registry
-            .peek_challenge(&wallet, state.challenge_ttl_secs)
+            .peek_challenge(&wallet)
             .expect("a freshly issued challenge is within its TTL");
 
         validate_features_handler(
