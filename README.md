@@ -86,7 +86,7 @@ Production refuses the dev validator pass-through and permissive CORS mode.
 | `VALIDATION_SERVICE_URL_SIGNATURE` | unset | Authority signature over the validator URL |
 | `VALIDATION_API_KEY` | unset | Credential sent to the private validator |
 | `EXECUTOR_SCORING_CONFIG_BUNDLE` | unset | Signed scoring configuration required by release builds |
-| `CHALLENGE_TTL_SECS` | `60` | Challenge nonce lifetime |
+| `CHALLENGE_TTL_SECS` | `60` | Challenge nonce lifetime in seconds. Allowed range: 1-300. |
 | `VALIDATION_WALLET_MAX_ATTEMPTS` | `5` | Failed attempts allowed per wallet window |
 | `VALIDATION_WALLET_WINDOW_SECS` | `3600` | Wallet attempt window |
 | `SAS_CREDENTIAL_PDA` | unset | SAS credential address |

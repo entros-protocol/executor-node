@@ -1,4 +1,4 @@
-//! Server-side challenge phrase generator (master-list #89, v3).
+//! Server-side challenge phrase generator.
 //!
 //! Picks 5 random words from `word_dict::WORDS` — a curated dictionary of
 //! 1,357 neutral/positive English words (4-8 letters, 1-3 syllables, no
