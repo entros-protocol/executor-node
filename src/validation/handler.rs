@@ -186,10 +186,8 @@ pub struct ValidateFeaturesRequest {
     /// for phrase content binding. Absent for older SDK versions.
     #[serde(default)]
     pub audio_samples_b64: Option<String>,
-    /// Native sample rate of the transmitted audio. Forwarded unchanged to
-    /// the validation service, which resamples to 16kHz if the browser
-    /// delivered a rate other than the SDK target (common on iOS Safari
-    /// with Bluetooth codec negotiation).
+    /// Sample rate of the transmitted PCM. Current clients canonicalize to
+    /// 16 kHz. The validation service resamples legacy noncanonical input.
     #[serde(default)]
     pub audio_sample_rate_hz: Option<u32>,
     /// Deprecated client field retained for request compatibility.
