@@ -207,12 +207,9 @@ pub struct ValidateFeaturesRequest {
     /// sensor provenance. They contain no fingerprints or direct user data.
     #[serde(default)]
     pub client_signals: Option<ClientSignals>,
-    /// Coarse curve-trace outline (touch-curve Stage 1). Equal-time resampled
-    /// `{x,y}` points of the user's trace in the client 200x200 viewBox frame,
-    /// plus the outline's wall-clock span. Scored against the issued Lissajous
-    /// curve (region proximity + gesture speed/nature) for observe-only
-    /// calibration — NOT forwarded to the validation service and never gates the
-    /// decision in Stage 1. Absent for older SDKs.
+    /// Coarse equal-time curve-trace outline in the client viewBox frame.
+    /// Region, kinematic, and path-alignment metrics remain telemetry only.
+    /// The executor does not forward the outline to the validation service.
     #[serde(default, deserialize_with = "deserialize_lenient_option")]
     pub curve_trace: Option<CurveTracePayload>,
     /// Observe-only capture-timing summary from the SDK: how the motion stream
@@ -316,6 +313,9 @@ pub struct CaptureSignals {
     /// Virtual audio/video device detection flag.
     #[serde(default)]
     pub virtual_device: bool,
+    /// Whether supported browser capture applied voice isolation.
+    #[serde(default)]
+    pub voice_isolation_applied: Option<bool>,
     /// Spectral flatness of the audio capture (Wiener entropy).
     #[serde(default)]
     pub flatness: Option<f64>,
@@ -412,6 +412,42 @@ impl Drop for PreForwardBudgetGuard<'_> {
     fn drop(&mut self) {
         self.refund_once();
     }
+}
+
+fn validator_request_body(
+    req: &ValidateFeaturesRequest,
+    expected_phrase: Option<&str>,
+    projection_version: u16,
+    projection_intent: ProjectionIntent,
+    recent_timestamps: &[i64],
+    origin_ip: &str,
+    origin_ua: &str,
+) -> Result<serde_json::Value, AppError> {
+    let mut body = serde_json::json!({
+        "features": req.features,
+        "wallet_id": req.wallet_id,
+        "f0_contour": req.f0_contour,
+        "accel_magnitude": req.accel_magnitude,
+        "audio_samples_b64": req.audio_samples_b64,
+        "audio_sample_rate_hz": req.audio_sample_rate_hz,
+        "expected_phrase": expected_phrase,
+        "projection_version": projection_version,
+        "receipt_purpose": projection_intent.receipt_purpose(projection_version),
+        "request_receipt": projection_intent == ProjectionIntent::Mint,
+        "recent_timestamps": recent_timestamps,
+        "origin_ip": origin_ip,
+        "origin_ua": origin_ua,
+        "capture_timing": req.capture_timing,
+    });
+    if let Some(study) = req.study.as_ref() {
+        body["study"] =
+            serde_json::to_value(study).map_err(|_| AppError::ValidationServiceUnavailable)?;
+    }
+    if let Some(evidence) = req.compatibility_evidence.as_ref() {
+        body["compatibility_evidence"] =
+            serde_json::to_value(evidence).map_err(|_| AppError::ValidationServiceUnavailable)?;
+    }
+    Ok(body)
 }
 
 pub async fn validate_features_handler(
@@ -762,30 +798,15 @@ pub async fn validate_features_handler(
     // Build request to internal validation service. Forward time-series and
     // audio fields unchanged — the validation service handles absence of any
     // field (old SDK versions).
-    let mut validator_body = serde_json::json!({
-        "features": req.features,
-        "wallet_id": req.wallet_id,
-        "f0_contour": req.f0_contour,
-        "accel_magnitude": req.accel_magnitude,
-        "audio_samples_b64": req.audio_samples_b64,
-        "audio_sample_rate_hz": req.audio_sample_rate_hz,
-        "expected_phrase": expected_phrase,
-        "projection_version": projection_version,
-        "receipt_purpose": projection_intent.receipt_purpose(projection_version),
-        "request_receipt": projection_intent == ProjectionIntent::Mint,
-        "recent_timestamps": recent_timestamps,
-        "origin_ip": Some(ip.to_string()),
-        "origin_ua": Some(user_agent.to_string()),
-        "capture_timing": req.capture_timing,
-    });
-    if let Some(study) = req.study.as_ref() {
-        validator_body["study"] =
-            serde_json::to_value(study).map_err(|_| AppError::ValidationServiceUnavailable)?;
-    }
-    if let Some(evidence) = req.compatibility_evidence.as_ref() {
-        validator_body["compatibility_evidence"] =
-            serde_json::to_value(evidence).map_err(|_| AppError::ValidationServiceUnavailable)?;
-    }
+    let validator_body = validator_request_body(
+        &req,
+        expected_phrase.as_deref(),
+        projection_version,
+        projection_intent,
+        &recent_timestamps,
+        &ip.to_string(),
+        user_agent,
+    )?;
     let mut request = state
         .http_client
         .post(format!("{validation_url}/validate"))
@@ -881,6 +902,17 @@ pub async fn validate_features_handler(
         // that into the composite requires separate calibration.
         let acoustic_eval =
             crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
+        if let Some(voice_isolation_applied) = signals
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.voice_isolation_applied)
+        {
+            tracing::debug!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
+                voice_isolation_applied,
+                "CAPTURE_OBSERVATION: client-reported voice isolation state"
+            );
+        }
         if acoustic_eval.risk_score > 0.0 {
             tracing::info!(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -1154,6 +1186,13 @@ fn refund_infrastructure_failure(state: &AppState, api_key: &str, wallet: &Pubke
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::MAX_REQUEST_BODY_BYTES;
+    use crate::validation::transport_fixture::{
+        synthetic_transport_fixture, MAXIMUM_DURATION_MS, REPRESENTATIVE_DURATION_MS,
+        SAMPLE_RATE_HZ,
+    };
+    use base64::{engine::general_purpose, Engine as _};
+    use std::collections::BTreeSet;
 
     fn identity_data_with_projection(version: u16) -> Vec<u8> {
         let mut data = vec![0_u8; IDENTITY_PROJECTION_VERSION_OFFSET + 2];
@@ -1437,6 +1476,171 @@ mod tests {
             capture_timing: None,
             study: None,
         }
+    }
+
+    #[test]
+    fn synthetic_transport_requests_freeze_the_client_contract() {
+        for (duration_ms, expected_json_bytes, expected_pcm_hash) in [
+            (
+                REPRESENTATIVE_DURATION_MS,
+                535_967,
+                "1d48b0b5fbfba855850def32635aa57da79de251f0922c32cc6fac4da0b63358",
+            ),
+            (
+                MAXIMUM_DURATION_MS,
+                888_139,
+                "76613da053ac8dbe3d1d42b1f34128c350ea2d80f94f2bef5893c67a8f18f071",
+            ),
+        ] {
+            let fixture = synthetic_transport_fixture(duration_ms);
+            let encoded = serde_json::to_vec(&fixture.request).expect("fixture serializes");
+            let request: ValidateFeaturesRequest =
+                serde_json::from_slice(&encoded).expect("fixture deserializes");
+            let pcm_hash: String = solana_sdk::hash::hash(&fixture.pcm_bytes)
+                .to_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+
+            assert!(encoded.len() < MAX_REQUEST_BODY_BYTES);
+            assert_eq!(encoded.len(), expected_json_bytes);
+            assert_eq!(pcm_hash, expected_pcm_hash);
+            assert_eq!(request.features.len(), FEATURE_VECTOR_WIDTH);
+            assert_eq!(request.features[0], -154.0 / 16.0);
+            assert_eq!(request.features[FEATURE_VECTOR_WIDTH - 1], 153.0 / 16.0);
+            assert_eq!(request.projection_version, Some(2));
+            assert!(!request.baseline_reset);
+            let compatibility = request
+                .compatibility_evidence
+                .as_ref()
+                .expect("compatibility evidence exists");
+            assert_eq!(compatibility.projection_version, 1);
+            assert_eq!(compatibility.feature_schema_version, 4);
+            assert_eq!(compatibility.features.len(), FEATURE_VECTOR_WIDTH);
+            assert_eq!(compatibility.features[0], -154.0 / 32.0);
+            assert_eq!(
+                compatibility.features[FEATURE_VECTOR_WIDTH - 1],
+                153.0 / 32.0
+            );
+            assert_eq!(
+                request
+                    .f0_contour
+                    .as_ref()
+                    .expect("F0 contour exists")
+                    .len(),
+                duration_ms / 10
+            );
+            assert_eq!(
+                request
+                    .accel_magnitude
+                    .as_ref()
+                    .expect("acceleration contour exists")
+                    .len(),
+                duration_ms / 10
+            );
+            assert_eq!(request.audio_sample_rate_hz, Some(SAMPLE_RATE_HZ as u32));
+            assert_eq!(
+                general_purpose::STANDARD
+                    .decode(request.audio_samples_b64.as_ref().expect("audio exists"))
+                    .expect("audio is base64"),
+                fixture.pcm_bytes
+            );
+            assert_eq!(
+                request
+                    .curve_trace
+                    .as_ref()
+                    .expect("outline exists")
+                    .duration_ms,
+                duration_ms as f64
+            );
+            let outline = &request.curve_trace.as_ref().unwrap().points;
+            assert_eq!(outline.len(), 64);
+            assert_eq!(outline[0], [0.0, 0.0]);
+            assert_eq!(outline[1], [100.0 / 63.0, 1_700.0 / 63.0]);
+            assert_eq!(outline[63], [100.0, 4_700.0 / 63.0]);
+            let signals = request.client_signals.as_ref().expect("signals exist");
+            assert_eq!(signals.v, 1);
+            assert_eq!(signals.env.as_deref(), Some("non-browser"));
+            let capture = signals.capture.as_ref().expect("capture signals exist");
+            assert_eq!(capture.voice_isolation_applied, None);
+            assert!(
+                !signals
+                    .automation
+                    .as_ref()
+                    .expect("automation signals exist")
+                    .webdriver
+            );
+        }
+    }
+
+    #[test]
+    fn synthetic_transport_request_forwards_only_the_validator_contract() {
+        let fixture = synthetic_transport_fixture(MAXIMUM_DURATION_MS);
+        let request: ValidateFeaturesRequest =
+            serde_json::from_value(fixture.request).expect("fixture deserializes");
+        let expected_features = request.features.clone();
+        let expected_compatibility =
+            serde_json::to_value(request.compatibility_evidence.as_ref().unwrap()).unwrap();
+        let expected_audio = request.audio_samples_b64.clone();
+        let expected_f0 = request.f0_contour.clone();
+        let expected_accel = request.accel_magnitude.clone();
+        let body = validator_request_body(
+            &request,
+            Some("amber river orbit cedar signal"),
+            2,
+            ProjectionIntent::Mint,
+            &[11, 22],
+            "127.0.0.1",
+            "synthetic-agent",
+        )
+        .expect("validator body builds");
+
+        let actual_keys: BTreeSet<&str> = body
+            .as_object()
+            .expect("validator body is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let expected_keys: BTreeSet<&str> = [
+            "accel_magnitude",
+            "audio_sample_rate_hz",
+            "audio_samples_b64",
+            "capture_timing",
+            "compatibility_evidence",
+            "expected_phrase",
+            "f0_contour",
+            "features",
+            "origin_ip",
+            "origin_ua",
+            "projection_version",
+            "receipt_purpose",
+            "recent_timestamps",
+            "request_receipt",
+            "wallet_id",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(actual_keys, expected_keys);
+        assert_eq!(body["features"], serde_json::json!(expected_features));
+        assert_eq!(body["wallet_id"], "11111111111111111111111111111111");
+        assert_eq!(body["compatibility_evidence"], expected_compatibility);
+        assert_eq!(body["audio_samples_b64"], serde_json::json!(expected_audio));
+        assert_eq!(body["f0_contour"], serde_json::json!(expected_f0));
+        assert_eq!(body["accel_magnitude"], serde_json::json!(expected_accel));
+        assert_eq!(body["audio_sample_rate_hz"], SAMPLE_RATE_HZ);
+        assert_eq!(body["expected_phrase"], "amber river orbit cedar signal");
+        assert_eq!(body["projection_version"], 2);
+        assert_eq!(body["receipt_purpose"], "mint");
+        assert_eq!(body["request_receipt"], true);
+        assert_eq!(body["recent_timestamps"], serde_json::json!([11, 22]));
+        assert_eq!(body["origin_ip"], "127.0.0.1");
+        assert_eq!(body["origin_ua"], "synthetic-agent");
+        assert_eq!(body["capture_timing"], serde_json::Value::Null);
+        assert!(body.get("wallet_authorization").is_none());
+        assert!(body.get("client_signals").is_none());
+        assert!(body.get("curve_trace").is_none());
+        assert!(body.get("baseline_reset").is_none());
+        assert!(body.get("commitment_new_hex").is_none());
     }
 
     #[test]

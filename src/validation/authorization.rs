@@ -275,6 +275,9 @@ mod tests {
         ProjectionCompatibilityEvidence, StudyCaptureClass, StudyRequestContext,
         ValidateFeaturesRequest,
     };
+    use crate::validation::transport_fixture::{
+        synthetic_transport_fixture, MAXIMUM_DURATION_MS, REPRESENTATIVE_DURATION_MS,
+    };
     use solana_sdk::signature::{Keypair, Signer};
 
     fn request_fixture(wallet_id: String) -> ValidateFeaturesRequest {
@@ -304,6 +307,7 @@ mod tests {
                 }),
                 capture: Some(CaptureSignals {
                     virtual_device: false,
+                    voice_isolation_applied: None,
                     flatness: Some(0.125),
                     centroid: Some(2_400.0),
                 }),
@@ -355,6 +359,33 @@ mod tests {
                 "request_sha256:a629314bf11f266689983f629f55c299789c9fca387e34593a8d323661d5f21a",
             )
         );
+    }
+
+    #[test]
+    fn synthetic_transport_authorization_digests_match_client_golden_vectors() {
+        for (duration_ms, expected_pulse, expected_mobile) in [
+            (
+                REPRESENTATIVE_DURATION_MS,
+                "8b86127ac85da7e3c81fa0571bc3d249effa555579ed3d40710fa02e48f417e4",
+                "e1e0f756b79cbba6effc4bcff726c75cc6ad0cf248e6498d82b08572d539830f",
+            ),
+            (
+                MAXIMUM_DURATION_MS,
+                "698b79352706fb7f47d8080ad03a73ec6ca37cb8bbdfa9f50def963a64c2f3cb",
+                "4abdbe8e105ecbe49c60f8d0d8444df6bdf89889094b55e8ea481209a109b7ec",
+            ),
+        ] {
+            let mut request: ValidateFeaturesRequest =
+                serde_json::from_value(synthetic_transport_fixture(duration_ms).request)
+                    .expect("fixture deserializes");
+            let pulse_digest = lower_hex(&request_digest(&request).expect("Pulse fixture digest"));
+            assert_eq!(pulse_digest, expected_pulse);
+
+            request.client_signals = None;
+            let mobile_digest =
+                lower_hex(&request_digest(&request).expect("mobile fixture digest"));
+            assert_eq!(mobile_digest, expected_mobile);
+        }
     }
 
     #[test]
