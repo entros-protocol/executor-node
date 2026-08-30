@@ -463,6 +463,154 @@ mod request_trace_tests {
     }
 }
 
+#[cfg(test)]
+mod request_body_limit_tests {
+    use super::*;
+    use crate::validation::handler::ValidateFeaturesRequest;
+    use crate::validation::transport_fixture::{
+        padded_request_body, synthetic_transport_fixture, MAXIMUM_DURATION_MS,
+        REPRESENTATIVE_DURATION_MS,
+    };
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, Request, StatusCode};
+    use axum::routing::post;
+    use axum::Json;
+    use futures_util::stream::{self, StreamExt};
+    use std::time::{Duration, Instant};
+    use tower::util::ServiceExt;
+
+    const PRESSURE_RUNS: usize = 30;
+    const PRESSURE_CONCURRENCY: [usize; 5] = [1, 4, 8, 16, 30];
+
+    async fn accept_synthetic_request(Json(_request): Json<ValidateFeaturesRequest>) -> StatusCode {
+        StatusCode::NO_CONTENT
+    }
+
+    fn boundary_router() -> Router {
+        Router::new()
+            .route("/validate-features", post(accept_synthetic_request))
+            .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+            .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_READ_TIMEOUT))
+            .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+    }
+
+    async fn send_to(router: Router, body: Bytes) -> StatusCode {
+        let content_length = body.len();
+        router
+            .oneshot(
+                Request::post("/validate-features")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_LENGTH, content_length)
+                    .body(Body::from(body))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    async fn send(body: Vec<u8>) -> StatusCode {
+        send_to(boundary_router(), Bytes::from(body)).await
+    }
+
+    fn percentile_ms(sorted: &[Duration], percentile: usize) -> f64 {
+        let rank = (sorted.len() * percentile).div_ceil(100);
+        sorted[rank.saturating_sub(1)].as_secs_f64() * 1_000.0
+    }
+
+    #[tokio::test]
+    async fn synthetic_transport_request_freezes_the_one_mebibyte_boundary() {
+        let exact = padded_request_body(MAXIMUM_DURATION_MS, MAX_REQUEST_BODY_BYTES);
+        assert_eq!(send(exact).await, StatusCode::NO_CONTENT);
+
+        let oversized = padded_request_body(MAXIMUM_DURATION_MS, MAX_REQUEST_BODY_BYTES + 1);
+        assert_eq!(send(oversized).await, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn synthetic_transport_request_rejects_oversized_bodies_without_content_length() {
+        let body = Bytes::from(padded_request_body(
+            MAXIMUM_DURATION_MS,
+            MAX_REQUEST_BODY_BYTES + 1,
+        ));
+        let response = boundary_router()
+            .oneshot(
+                Request::post("/validate-features")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        assert!(response.status().is_client_error());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn synthetic_transport_request_boundary_pressure_is_failure_free() {
+        for (payload, duration_ms) in [
+            ("representative", REPRESENTATIVE_DURATION_MS),
+            ("maximum", MAXIMUM_DURATION_MS),
+        ] {
+            let source_body = Bytes::from(
+                serde_json::to_vec(&synthetic_transport_fixture(duration_ms).request)
+                    .expect("synthetic request serializes"),
+            );
+            assert!(source_body.len() < MAX_REQUEST_BODY_BYTES);
+
+            for concurrency in PRESSURE_CONCURRENCY {
+                let router = boundary_router();
+                let arrivals = vec![Instant::now(); PRESSURE_RUNS];
+                let batch_started = Instant::now();
+                let results: Vec<(StatusCode, Duration, Duration)> = stream::iter(arrivals)
+                    .map(|arrived| {
+                        let router = router.clone();
+                        let body = Bytes::copy_from_slice(source_body.as_ref());
+                        tokio::spawn(async move {
+                            let service_started = Instant::now();
+                            let status = send_to(router, body).await;
+                            (status, arrived.elapsed(), service_started.elapsed())
+                        })
+                    })
+                    .buffer_unordered(concurrency)
+                    .map(|result| result.expect("request task joins"))
+                    .collect()
+                    .await;
+                let batch_elapsed = batch_started.elapsed();
+
+                assert_eq!(results.len(), PRESSURE_RUNS);
+                assert!(results
+                    .iter()
+                    .all(|(status, _, _)| *status == StatusCode::NO_CONTENT));
+
+                if std::env::var_os("ENTROS_TRANSPORT_BENCHMARK").as_deref()
+                    == Some(std::ffi::OsStr::new("1"))
+                {
+                    let mut sojourn: Vec<Duration> =
+                        results.iter().map(|(_, latency, _)| *latency).collect();
+                    let mut service: Vec<Duration> =
+                        results.iter().map(|(_, _, latency)| *latency).collect();
+                    sojourn.sort_unstable();
+                    service.sort_unstable();
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "payload": payload,
+                            "bytes": source_body.len(),
+                            "runs": PRESSURE_RUNS,
+                            "concurrency": concurrency,
+                            "rps": PRESSURE_RUNS as f64 / batch_elapsed.as_secs_f64(),
+                            "p50_ms": percentile_ms(&sojourn, 50),
+                            "p95_ms": percentile_ms(&sojourn, 95),
+                            "service_p50_ms": percentile_ms(&service, 50),
+                            "service_p95_ms": percentile_ms(&service, 95),
+                        })
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Generate a fresh, valid Solana wallet id (base58 pubkey) for tests
 /// that need a parseable wallet but don't care about its identity.
 #[cfg(test)]

@@ -1213,6 +1213,7 @@ name = "executor-node"
 version = "0.1.2"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "borsh 1.6.1",
  "bs58",
  "dashmap 6.1.0",

@@ -34,6 +34,7 @@ solana-attestation-service-client = "1.0.9"
 reqwest = { version = "0.12", features = ["json"] }
 
 [dev-dependencies]
+base64 = "0.22"
 tower = { version = "0.5", features = ["util"] }
 # `test-util` gives `#[tokio::test(start_paused = true)]`, which lets the
 # timing tests assert against the real 4-second clamp in virtual time.

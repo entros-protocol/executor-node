@@ -5,3 +5,5 @@ pub mod composite;
 pub mod handler;
 #[cfg(test)]
 pub mod mock_validator;
+#[cfg(test)]
+pub(crate) mod transport_fixture;

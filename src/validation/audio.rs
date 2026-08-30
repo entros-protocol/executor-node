@@ -88,6 +88,7 @@ mod tests {
     fn passes_normal_physical_mic_signals() {
         let cap = CaptureSignals {
             virtual_device: false,
+            voice_isolation_applied: None,
             flatness: Some(0.15),
             centroid: Some(1800.0),
         };
@@ -102,6 +103,7 @@ mod tests {
     fn flags_virtual_device_driver() {
         let cap = CaptureSignals {
             virtual_device: true,
+            voice_isolation_applied: None,
             flatness: Some(0.15),
             centroid: Some(1800.0),
         };
@@ -114,6 +116,7 @@ mod tests {
     fn flags_flatness_out_of_bounds_low() {
         let cap = CaptureSignals {
             virtual_device: false,
+            voice_isolation_applied: None,
             flatness: Some(0.005),
             centroid: Some(1800.0),
         };
@@ -126,6 +129,7 @@ mod tests {
     fn flags_flatness_out_of_bounds_high() {
         let cap = CaptureSignals {
             virtual_device: false,
+            voice_isolation_applied: None,
             flatness: Some(0.92),
             centroid: Some(1800.0),
         };
@@ -138,6 +142,7 @@ mod tests {
     fn flags_centroid_out_of_bounds_low() {
         let cap = CaptureSignals {
             virtual_device: false,
+            voice_isolation_applied: None,
             flatness: Some(0.15),
             centroid: Some(45.0),
         };
@@ -150,6 +155,7 @@ mod tests {
     fn flags_centroid_out_of_bounds_high() {
         let cap = CaptureSignals {
             virtual_device: false,
+            voice_isolation_applied: None,
             flatness: Some(0.15),
             centroid: Some(7200.0),
         };
@@ -162,6 +168,7 @@ mod tests {
     fn combines_multiple_violations_clamped_at_one() {
         let cap = CaptureSignals {
             virtual_device: false,
+            voice_isolation_applied: None,
             flatness: Some(0.95),
             centroid: Some(8500.0),
         };
@@ -175,6 +182,7 @@ mod tests {
     fn flags_virtual_device_combined_with_out_of_bounds_flatness_and_centroid() {
         let cap = CaptureSignals {
             virtual_device: true,
+            voice_isolation_applied: None,
             flatness: Some(0.99),
             centroid: Some(9500.0),
         };
