@@ -106,7 +106,11 @@ impl IntegratorTracker {
     pub fn refund(&self, api_key: &str) {
         if let Some(mut entry) = self.state.get_mut(api_key) {
             entry.used = entry.used.saturating_sub(1);
-            tracing::info!(api_key, used = entry.used, "Quota refunded");
+            tracing::info!(
+                api_key = %crate::auth::redact::redact_api_key(api_key),
+                used = entry.used,
+                "Quota refunded"
+            );
         }
     }
 

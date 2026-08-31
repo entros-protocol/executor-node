@@ -22,12 +22,14 @@ use serde_json::Value;
 pub struct MockValidator {
     addr: SocketAddr,
     received: Arc<Mutex<Vec<Value>>>,
-    server: tokio::task::JoinHandle<()>,
+    server: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for MockValidator {
     fn drop(&mut self) {
-        self.server.abort();
+        if let Some(server) = self.server.as_ref() {
+            server.abort();
+        }
     }
 }
 
@@ -85,7 +87,7 @@ impl MockValidator {
         Self {
             addr,
             received,
-            server,
+            server: Some(server),
         }
     }
 
@@ -113,6 +115,20 @@ impl MockValidator {
     /// Number of upstream requests received.
     pub fn request_count(&self) -> usize {
         self.received().len()
+    }
+
+    /// Stop the server and wait until its listener has closed.
+    pub async fn shutdown(mut self) -> SocketAddr {
+        let addr = self.addr;
+        if let Some(server) = self.server.take() {
+            server.abort();
+            match server.await {
+                Ok(()) => {}
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => panic!("mock validator task failed during shutdown: {error}"),
+            }
+        }
+        addr
     }
 }
 
@@ -172,6 +188,7 @@ pub fn state_with_mock_validator(
 pub fn success_body(biometric: f64, tts: f64, temporal: f64) -> Value {
     serde_json::json!({
         "valid": true,
+        "phrase_validation_status": "validated",
         "biometric_risk": biometric,
         "tts_risk": tts,
         "temporal_risk": temporal,

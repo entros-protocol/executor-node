@@ -405,6 +405,9 @@ pub fn headers_with_key(api_key: &str) -> axum::http::HeaderMap {
 }
 
 #[cfg(test)]
+pub(crate) static LOG_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
 mod request_trace_tests {
     use super::*;
     use axum::http::Request;
@@ -428,10 +431,11 @@ mod request_trace_tests {
         }
     }
 
-    #[test]
-    fn request_trace_excludes_query_values() {
+    #[tokio::test]
+    async fn request_trace_excludes_query_values() {
         const SECRET_QUERY_VALUE: &str = "wallet-query-must-not-appear";
 
+        let _log_capture_guard = LOG_CAPTURE_LOCK.lock().await;
         let logs = Arc::new(Mutex::new(Vec::new()));
         let writer_logs = Arc::clone(&logs);
         let subscriber = tracing_subscriber::fmt()
