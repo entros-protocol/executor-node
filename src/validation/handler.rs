@@ -375,6 +375,24 @@ pub struct SignedReceiptDto {
     pub signature_hex: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PhraseValidationStatus {
+    Validated,
+    Unvalidated,
+    NotApplicable,
+}
+
+impl PhraseValidationStatus {
+    const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Validated => "validated",
+            Self::Unvalidated => "unvalidated",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
 struct PreForwardBudgetGuard<'a> {
     state: &'a AppState,
     api_key: &'a str,
@@ -948,6 +966,7 @@ pub async fn validate_features_handler(
     #[allow(dead_code)]
     struct ValidatorSuccessBody {
         valid: bool,
+        phrase_validation_status: PhraseValidationStatus,
         #[serde(default)]
         signed_receipt: Option<SignedReceiptDto>,
         #[serde(default)]
@@ -1083,9 +1102,8 @@ pub async fn validate_features_handler(
             refund_infrastructure_failure(&state, &api_key, &wallet);
             return Err(AppError::ValidationServiceUnavailable);
         }
-        Err(error) => {
+        Err(_) => {
             tracing::error!(
-                error = %error,
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream returned an invalid success response"
             );
@@ -1098,6 +1116,7 @@ pub async fn validate_features_handler(
         signed_receipt,
         commitment_hex,
         salt_hex,
+        phrase_validation_status,
         biometric_risk,
         tts_risk,
         temporal_risk,
@@ -1107,6 +1126,7 @@ pub async fn validate_features_handler(
         body.signed_receipt,
         body.commitment_hex,
         body.salt_hex,
+        body.phrase_validation_status,
         body.biometric_risk,
         body.tts_risk,
         body.temporal_risk,
@@ -1131,6 +1151,7 @@ pub async fn validate_features_handler(
         automation_risk,
         reputation_risk,
         audio_realism_risk,
+        phrase_validation_status = phrase_validation_status.as_str(),
         "Feature validation passed biometric checks"
     );
 
@@ -2055,12 +2076,29 @@ mod validator_reached_tests {
     };
     use axum::{body::to_bytes, http::StatusCode, response::IntoResponse};
     use solana_sdk::signature::{Keypair, Signer};
-    use std::sync::Arc;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
     // Reused rather than re-declared: the request literal names every field, so
     // a second copy would drift the moment `ValidateFeaturesRequest` changes.
     use super::tests::{baseline_request, projection_one_compatibility_evidence};
 
     const DEFAULT_REPUTATION_RISK: f64 = 0.5;
+
+    struct LogWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn webdriver_signals() -> ClientSignals {
         ClientSignals {
@@ -2485,6 +2523,375 @@ mod validator_reached_tests {
             json.get("composite_risk_score").is_none(),
             "the successful response must not expose internal risk scores"
         );
+    }
+
+    #[tokio::test]
+    async fn every_recognized_phrase_validation_status_preserves_the_existing_verdict() {
+        for status in ["validated", "unvalidated", "not_applicable"] {
+            let tracker = tracker_with_quota("test-key", 10);
+            let mut body = success_body(0.0, 0.0, 0.0);
+            body["phrase_validation_status"] = serde_json::json!(status);
+            let mock = MockValidator::spawn(StatusCode::OK, body).await;
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+
+            let response = validate_features_handler(
+                State(state),
+                None,
+                headers_with_key("test-key"),
+                Json(baseline_request(random_wallet_id())),
+            )
+            .await
+            .expect("recognized status must preserve the existing pass")
+            .into_response();
+            let body = to_bytes(
+                response.into_body(),
+                crate::padding::RESPONSE_PADDING_TARGET + 1,
+            )
+            .await
+            .expect("the response body must be readable");
+            let json: serde_json::Value =
+                serde_json::from_slice(&body).expect("the response body must be valid JSON");
+
+            assert_eq!(body.len(), crate::padding::RESPONSE_PADDING_TARGET);
+            assert_eq!(json.get("valid"), Some(&serde_json::Value::Bool(true)));
+            assert!(
+                json.get("phrase_validation_status").is_none(),
+                "the private status must not cross the public response boundary"
+            );
+            assert_eq!(tracker.get_remaining("test-key"), 9);
+        }
+    }
+
+    #[tokio::test]
+    async fn phrase_validation_status_does_not_change_composite_policy_outcomes() {
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        enum PolicyOutcome {
+            Pass,
+            Friction,
+            Rejection,
+        }
+
+        fn classify(
+            result: Result<PaddedJson<ValidateFeaturesResponse>, AppError>,
+        ) -> PolicyOutcome {
+            match result {
+                Ok(response) => {
+                    assert!(response.0.valid);
+                    PolicyOutcome::Pass
+                }
+                Err(AppError::ValidationFailed {
+                    reason: Some(reason),
+                }) if reason == "captcha_required" => PolicyOutcome::Friction,
+                Err(AppError::ValidationFailed { reason: None }) => PolicyOutcome::Rejection,
+                Err(AppError::ValidationFailed { reason }) => {
+                    panic!("unexpected validation reason: {reason:?}")
+                }
+                Err(error) => panic!("unexpected policy error: {error:?}"),
+            }
+        }
+
+        let policy = ScoringConfig::synthetic_test_policy();
+        for (biometric, tts, temporal, automation, expected) in [
+            (0.0, 0.0, 0.0, 0.0, PolicyOutcome::Pass),
+            (1.0, 1.0, 0.0, 0.0, PolicyOutcome::Friction),
+            (1.0, 1.0, 1.0, 1.0, PolicyOutcome::Rejection),
+        ] {
+            let composite = expected_composite(biometric, tts, automation);
+            match expected {
+                PolicyOutcome::Pass => {
+                    assert!(!policy.requires_friction(composite));
+                    assert!(!policy.rejects(composite));
+                }
+                PolicyOutcome::Friction => {
+                    assert!(policy.requires_friction(composite));
+                    assert!(!policy.rejects(composite));
+                }
+                PolicyOutcome::Rejection => assert!(policy.rejects(composite)),
+            }
+
+            let mut baseline = None;
+            for status in ["validated", "unvalidated", "not_applicable"] {
+                let tracker = tracker_with_quota("test-key", 10);
+                let mut body = success_body(biometric, tts, temporal);
+                body["phrase_validation_status"] = serde_json::json!(status);
+                let mock = MockValidator::spawn(StatusCode::OK, body).await;
+                let mut state = state_with_mock_validator(tracker, &mock);
+                state.automation_webdriver_reject = false;
+                let mut request = baseline_request(random_wallet_id());
+                if automation > 0.0 {
+                    request.client_signals = Some(webdriver_signals());
+                }
+
+                let observed = classify(
+                    validate_features_handler(
+                        State(state),
+                        None,
+                        headers_with_key("test-key"),
+                        Json(request),
+                    )
+                    .await,
+                );
+
+                assert_eq!(observed, expected, "status {status} changed the fixture");
+                assert_eq!(
+                    *baseline.get_or_insert(observed),
+                    observed,
+                    "status {status} changed the policy outcome"
+                );
+                assert_eq!(mock.request_count(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recognized_phrase_validation_logs_only_the_canonical_status() {
+        const PRIVATE_DETAIL: &str = "private-model-path";
+
+        let _log_capture_guard = crate::server::LOG_CAPTURE_LOCK.lock().await;
+        let tracker = tracker_with_quota("test-key", 10);
+        let mut body = success_body(0.0, 0.0, 0.0);
+        body["phrase_validation_status"] = serde_json::json!("unvalidated");
+        body["phrase_validation_detail"] = serde_json::json!(PRIVATE_DETAIL);
+        let mock = MockValidator::spawn(StatusCode::OK, body).await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let wallet_id = random_wallet_id();
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let writer_logs = Arc::clone(&logs);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || LogWriter(Arc::clone(&writer_logs)))
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(baseline_request(wallet_id.clone())),
+        )
+        .await
+        .expect("unvalidated status must preserve the existing pass");
+        drop(subscriber_guard);
+
+        let log_bytes = logs.lock().expect("log buffer lock").clone();
+        let log_text = String::from_utf8(log_bytes).expect("trace output must be UTF-8");
+        assert!(
+            log_text.contains("phrase_validation_status=\"unvalidated\""),
+            "the canonical status must be visible to operators: {log_text}"
+        );
+        assert!(!log_text.contains(PRIVATE_DETAIL));
+        assert!(!log_text.contains(&wallet_id));
+    }
+
+    #[tokio::test]
+    async fn invalid_phrase_validation_statuses_fail_as_redacted_infrastructure_errors() {
+        const API_KEY: &str = "test-key-private";
+        const UNKNOWN_STATUS: &str = "secret-validator-state";
+
+        let _log_capture_guard = crate::server::LOG_CAPTURE_LOCK.lock().await;
+        for invalid_status in [
+            None,
+            Some(serde_json::Value::Null),
+            Some(serde_json::json!({ "internal": "model-missing" })),
+            Some(serde_json::json!(UNKNOWN_STATUS)),
+        ] {
+            let tracker = tracker_with_quota(API_KEY, 10);
+            let mut body = success_body(0.0, 0.0, 0.0);
+            match invalid_status {
+                Some(value) => body["phrase_validation_status"] = value,
+                None => {
+                    body.as_object_mut()
+                        .expect("the fixture must be an object")
+                        .remove("phrase_validation_status");
+                }
+            }
+            let mock = MockValidator::spawn(StatusCode::OK, body).await;
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+            let wallet_id = random_wallet_id();
+            let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+            let logs = Arc::new(Mutex::new(Vec::new()));
+            let writer_logs = Arc::clone(&logs);
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_max_level(tracing::Level::INFO)
+                .with_writer(move || LogWriter(Arc::clone(&writer_logs)))
+                .finish();
+            let subscriber_guard = tracing::subscriber::set_default(subscriber);
+            let result = validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key(API_KEY),
+                Json(baseline_request(wallet_id.clone())),
+            )
+            .await;
+            drop(subscriber_guard);
+
+            let error = match result.map(|_| ()) {
+                Err(error @ AppError::ValidationServiceUnavailable) => error,
+                other => panic!("expected ValidationServiceUnavailable, got {other:?}"),
+            };
+            assert_eq!(tracker.get_remaining(API_KEY), 10);
+            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+
+            let response = error.into_response();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            assert!(response.status().is_server_error());
+            let public_body = to_bytes(
+                response.into_body(),
+                crate::padding::RESPONSE_PADDING_TARGET + 1,
+            )
+            .await
+            .expect("the response body must be readable");
+            let public_text = std::str::from_utf8(&public_body).expect("response must be UTF-8");
+            assert_eq!(public_body.len(), crate::padding::RESPONSE_PADDING_TARGET);
+            assert!(!public_text.contains(UNKNOWN_STATUS));
+            assert!(!public_text.contains("model-missing"));
+            assert!(!public_text.contains("phrase_validation_status"));
+
+            let log_bytes = logs.lock().expect("log buffer lock").clone();
+            let log_text = String::from_utf8(log_bytes).expect("trace output must be UTF-8");
+            assert!(
+                log_text.contains("Validation upstream returned an invalid success response"),
+                "the contract failure must remain visible to operators: {log_text}"
+            );
+            assert!(!log_text.contains(UNKNOWN_STATUS));
+            assert!(!log_text.contains("model-missing"));
+            assert!(!log_text.contains(&wallet_id));
+            let refund_log = log_text
+                .lines()
+                .find(|line| line.contains("Quota refunded"))
+                .expect("the infrastructure failure must log its quota refund");
+            assert!(refund_log.contains(&crate::auth::redact::redact_api_key(API_KEY)));
+            assert!(!refund_log.contains(API_KEY));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn phrase_validation_contract_stays_exact_under_bounded_concurrency() {
+        const QUOTA_RESERVE: u64 = 5;
+
+        #[derive(Clone, Copy, Debug)]
+        enum ContractCase {
+            Unvalidated,
+            Missing,
+            Unknown,
+        }
+
+        impl ContractCase {
+            fn response_body(self) -> serde_json::Value {
+                let mut body = success_body(0.0, 0.0, 0.0);
+                match self {
+                    Self::Unvalidated => {
+                        body["phrase_validation_status"] = serde_json::json!("unvalidated");
+                    }
+                    Self::Missing => {
+                        body.as_object_mut()
+                            .expect("the fixture must be an object")
+                            .remove("phrase_validation_status");
+                    }
+                    Self::Unknown => {
+                        body["phrase_validation_status"] = serde_json::json!("unknown-status");
+                    }
+                }
+                body
+            }
+
+            const fn is_recognized(self) -> bool {
+                matches!(self, Self::Unvalidated)
+            }
+        }
+
+        async fn run_burst(concurrency: usize, case: ContractCase) {
+            let initial_quota = concurrency as u64 + QUOTA_RESERVE;
+            let tracker = tracker_with_quota("test-key", initial_quota);
+            let mock = MockValidator::spawn(StatusCode::OK, case.response_body()).await;
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+            let wallet_ids: Vec<String> = (0..concurrency).map(|_| random_wallet_id()).collect();
+            let mut tasks = Vec::with_capacity(concurrency);
+
+            for wallet_id in wallet_ids.iter().cloned() {
+                let state = state.clone();
+                tasks.push(tokio::spawn(async move {
+                    let result = validate_features_handler(
+                        State(state),
+                        None,
+                        headers_with_key("test-key"),
+                        Json(baseline_request(wallet_id.clone())),
+                    )
+                    .await;
+                    (wallet_id, result)
+                }));
+            }
+
+            let mut remaining_quota = Vec::with_capacity(concurrency);
+            for task in tasks {
+                let (wallet_id, result) = task
+                    .await
+                    .unwrap_or_else(|error| panic!("{case:?} request task failed: {error}"));
+                let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+                if case.is_recognized() {
+                    match result {
+                        Ok(response) => {
+                            assert!(response.0.valid);
+                            remaining_quota.push(
+                                response
+                                    .0
+                                    .remaining_quota
+                                    .expect("successful requests report remaining quota"),
+                            );
+                        }
+                        Err(error) => panic!("{case:?} request returned {error:?}"),
+                    }
+                } else {
+                    match result {
+                        Err(AppError::ValidationServiceUnavailable) => {}
+                        Err(error) => panic!("{case:?} request returned {error:?}"),
+                        Ok(_) => panic!("{case:?} request unexpectedly succeeded"),
+                    }
+                }
+
+                assert_eq!(
+                    state.wallet_attempts.get_attempts(&wallet),
+                    0,
+                    "{case:?} must not retain a wallet attempt"
+                );
+            }
+
+            assert_eq!(mock.request_count(), concurrency);
+            if case.is_recognized() {
+                remaining_quota.sort_unstable();
+                let expected_remaining: Vec<u64> =
+                    (QUOTA_RESERVE..QUOTA_RESERVE + concurrency as u64).collect();
+                assert_eq!(remaining_quota, expected_remaining);
+                assert_eq!(tracker.get_remaining("test-key"), QUOTA_RESERVE);
+            } else {
+                assert!(remaining_quota.is_empty());
+                assert_eq!(tracker.get_remaining("test-key"), initial_quota);
+            }
+
+            let addr = mock.shutdown().await;
+            assert!(
+                tokio::net::TcpStream::connect(addr).await.is_err(),
+                "{case:?} mock listener leaked after shutdown"
+            );
+        }
+
+        for concurrency in [1, 10, 30] {
+            for case in [
+                ContractCase::Unvalidated,
+                ContractCase::Missing,
+                ContractCase::Unknown,
+            ] {
+                run_burst(concurrency, case).await;
+            }
+        }
     }
 
     #[tokio::test]
