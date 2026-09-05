@@ -8,6 +8,8 @@ use crate::server::AppState;
 
 #[derive(Deserialize)]
 pub struct VerifyRequest {
+    #[serde(default)]
+    pub proof_generation: Option<String>,
     pub proof_bytes: Vec<u8>,
     pub public_inputs: Vec<Vec<u8>>,
     pub commitment: Vec<u8>,
@@ -74,6 +76,16 @@ pub async fn verify_handler(
     headers: axum::http::HeaderMap,
     Json(req): Json<VerifyRequest>,
 ) -> Result<PaddedJson<VerifyResponse>, AppError> {
+    if req
+        .proof_generation
+        .as_deref()
+        .is_some_and(|generation| generation != "legacy")
+        || req.public_inputs.len() == 6
+    {
+        return Err(AppError::InvalidRequest(
+            "This endpoint does not support the requested proof generation. Use authenticated wallet submission.".to_owned(),
+        ));
+    }
     let api_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
@@ -313,10 +325,34 @@ mod tests {
             is_first: bool,
         ) -> VerifyRequest {
             VerifyRequest {
+                proof_generation: None,
                 proof_bytes: vec![0u8; proof_len],
                 public_inputs,
                 commitment: commitment.to_vec(),
                 is_first_verification: is_first,
+            }
+        }
+
+        #[tokio::test]
+        async fn unsupported_generation_does_not_record_commitment_or_deduct_quota() {
+            for (generation, input_count) in [
+                (Some("request-bound-v1"), 4),
+                (None, 6),
+                (Some("unknown"), 4),
+            ] {
+                let tracker = tracker_with_quota("test-key", 10);
+                let state = build_test_state(tracker.clone(), None);
+                let registry = state.commitment_registry.clone();
+                let mut req =
+                    build_request(256, vec![vec![1u8; 32]; input_count], TEST_COMMITMENT, true);
+                req.proof_generation = generation.map(str::to_owned);
+                let result =
+                    verify_handler(State(state), headers_with_key("test-key"), Json(req)).await;
+                assert!(
+                    matches!(result, Err(AppError::InvalidRequest(message)) if message.contains("proof generation"))
+                );
+                assert!(!registry.check_and_record("test-key", TEST_COMMITMENT));
+                assert_eq!(tracker.get_remaining("test-key"), 10);
             }
         }
 
@@ -387,6 +423,7 @@ mod tests {
             let tracker = tracker_with_quota("test-key", 10);
             let state = build_test_state(tracker.clone(), None);
             let req = VerifyRequest {
+                proof_generation: None,
                 proof_bytes: vec![0u8; 256],
                 public_inputs: valid_inputs(),
                 commitment: vec![0u8; 31],
