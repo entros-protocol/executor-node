@@ -408,6 +408,87 @@ pub fn headers_with_key(api_key: &str) -> axum::http::HeaderMap {
 pub(crate) static LOG_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
+mod proof_generation_pressure_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use futures_util::stream::{self, StreamExt};
+    use std::net::SocketAddr;
+    use tower::util::ServiceExt;
+
+    #[tokio::test(start_paused = true)]
+    async fn unsupported_proof_bursts_preserve_quota_and_commitments() {
+        const REQUESTS: usize = 128;
+        for concurrency in [1, 16, 64] {
+            let tracker = tracker_with_quota("pressure-test", 10);
+            let mut state = build_test_state(tracker.clone(), None);
+            state.api_keys = Arc::new(vec!["pressure-test".to_owned()]);
+            state.rate_limiter = Arc::new(RateLimiter::new(10_000));
+            state.per_ip_rate_limiter = Arc::new(PerIpRateLimiter::new(10_000));
+            let registry = state.commitment_registry.clone();
+            let metrics = state.metrics.clone();
+            let router = create_router(state, &[]);
+            let started = std::time::Instant::now();
+            let statuses: Vec<StatusCode> = stream::iter(0..REQUESTS)
+                .map(|index| {
+                    let router = router.clone();
+                    async move {
+                        let generation = match index % 3 {
+                            0 => Some("request-bound-v1"),
+                            1 => Some("unknown"),
+                            _ => None,
+                        };
+                        let body = serde_json::to_vec(&serde_json::json!({
+                            "proof_generation": generation,
+                            "proof_bytes": vec![0u8; 256],
+                            "public_inputs": vec![vec![0u8; 32]; if generation.is_none() { 6 } else { 4 }],
+                            "commitment": vec![7u8; 32],
+                            "is_first_verification": true,
+                        }))
+                        .expect("synthetic request encodes");
+                        let peer: SocketAddr = "127.0.0.1:12345".parse().expect("test peer");
+                        router
+                            .oneshot(
+                                Request::post("/verify")
+                                    .header(header::CONTENT_TYPE, "application/json")
+                                    .header(header::CONTENT_LENGTH, body.len())
+                                    .header("x-api-key", "pressure-test")
+                                    .extension(ConnectInfo(peer))
+                                    .body(Body::from(body))
+                                    .expect("request builds"),
+                            )
+                            .await
+                            .expect("router responds")
+                            .status()
+                    }
+                })
+                .buffer_unordered(concurrency)
+                .collect()
+                .await;
+            assert_eq!(statuses.len(), REQUESTS);
+            assert!(statuses
+                .iter()
+                .all(|status| *status == StatusCode::BAD_REQUEST));
+            assert_eq!(tracker.get_remaining("pressure-test"), 10);
+            assert!(!registry.check_and_record("pressure-test", [7u8; 32]));
+            assert_eq!(metrics.verifications_relayed(), 0);
+            println!(
+                "{}",
+                serde_json::json!({
+                    "scope": "in-process router with virtual timing delays",
+                    "requests": REQUESTS,
+                    "concurrency": concurrency,
+                    "rejected": statuses.len(),
+                    "quota_unchanged": true,
+                    "commitment_unchanged": true,
+                    "wall_ms": started.elapsed().as_secs_f64() * 1_000.0,
+                })
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod request_trace_tests {
     use super::*;
     use axum::http::Request;
