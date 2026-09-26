@@ -38,6 +38,7 @@ impl Drop for MockValidator {
 struct MockState {
     status: StatusCode,
     body: MockBody,
+    retry_after: Option<&'static str>,
     received: Arc<Mutex<Vec<Value>>>,
     accounts: Arc<Mutex<std::collections::HashMap<String, Value>>>,
 }
@@ -49,29 +50,46 @@ enum MockBody {
 }
 
 impl MockValidator {
-    /// Bind a mock validator that answers every `POST /validate` with
+    /// Bind a mock validator that answers every `POST /validate` and every paired route with
     /// `status` and `body`, recording each request body it was sent.
     pub async fn spawn(status: StatusCode, body: Value) -> Self {
-        Self::spawn_with_body(status, MockBody::Json(body)).await
+        Self::spawn_with_body(status, MockBody::Json(body), None).await
+    }
+
+    /// Bind a mock validator that also sends `Retry-After: retry_after`.
+    pub async fn spawn_retry_after(
+        status: StatusCode,
+        body: Value,
+        retry_after: &'static str,
+    ) -> Self {
+        Self::spawn_with_body(status, MockBody::Json(body), Some(retry_after)).await
     }
 
     /// Bind a mock validator that returns bytes which are not valid JSON.
     pub async fn spawn_raw(status: StatusCode, body: impl Into<Vec<u8>>) -> Self {
-        Self::spawn_with_body(status, MockBody::Raw(body.into())).await
+        Self::spawn_with_body(status, MockBody::Raw(body.into()), None).await
     }
 
-    async fn spawn_with_body(status: StatusCode, body: MockBody) -> Self {
+    async fn spawn_with_body(
+        status: StatusCode,
+        body: MockBody,
+        retry_after: Option<&'static str>,
+    ) -> Self {
         let received = Arc::new(Mutex::new(Vec::new()));
         let accounts = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let state = MockState {
             accounts: accounts.clone(),
             status,
             body,
+            retry_after,
             received: received.clone(),
         };
 
         let app = Router::new()
             .route("/validate", post(handle))
+            .route("/paired/sessions", post(handle))
+            .route("/paired/commit", post(handle))
+            .route("/paired/validate", post(handle))
             .route("/", post(handle_rpc))
             .with_state(state);
 
@@ -154,10 +172,17 @@ async fn handle(State(state): State<MockState>, Json(body): Json<Value>) -> Resp
         .lock()
         .expect("mock request log is never held across a panic")
         .push(body);
-    match state.body {
+    let mut response = match state.body {
         MockBody::Json(body) => (state.status, Json(body)).into_response(),
         MockBody::Raw(body) => (state.status, body).into_response(),
+    };
+    if let Some(seconds) = state.retry_after {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static(seconds),
+        );
     }
+    response
 }
 
 async fn handle_rpc(State(state): State<MockState>, Json(body): Json<Value>) -> Json<Value> {

@@ -6,6 +6,7 @@ mod error;
 mod integrator;
 mod listener;
 mod padding;
+mod paired;
 mod relayer;
 mod reputation;
 mod server;
@@ -13,6 +14,7 @@ mod solana;
 mod status;
 mod study;
 mod timing;
+mod upstream;
 mod validation;
 
 use std::sync::Arc;
@@ -437,7 +439,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cross_wallet_cooldown,
         cross_wallet_cooldown_enforce: config.cross_wallet_cooldown_enforce,
         probing_blocklist,
+        paired_enabled: config.paired_enabled,
+        session_gate: Arc::new(tokio::sync::Semaphore::new(
+            config.paired_session_concurrency,
+        )),
     };
+    tracing::info!(
+        paired_enabled = config.paired_enabled,
+        paired_session_concurrency = config.paired_session_concurrency,
+        "Paired session routes"
+    );
 
     let app = create_router(state, &config.cors_origins);
 

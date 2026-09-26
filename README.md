@@ -25,11 +25,26 @@ The private validator performs feature checks, phrase transcription, acoustic an
 | `POST /validate-features` | API key | Forward capture evidence to the private validator |
 | `POST /verify` | API key | Relay a walletless Groth16 verification transaction |
 | `POST /attest` | API key and wallet proof | Issue a SAS attestation when configured |
+| `POST /challenge/paired` | API key | Open a paired session when paired sessions are enabled |
+| `POST /paired/commit` | API key | Commit one paired round when paired sessions are enabled |
+| `POST /validate-session` | API key | Finalize a paired session when paired sessions are enabled |
 | `GET /health` | Public | Return service health |
 | `GET /status` | Optional API key | Return `status` publicly and detailed metrics to authenticated callers |
 | `GET /metrics` | Public | Return aggregate Prometheus counters |
 
 Walletless verification does not issue SAS attestations.
+
+A paired session runs three rounds of one word and one short path. The validator holds the
+round state, so this service keeps none. Opening and committing are untimed, and the finalize
+request goes through the same timing floor, quota and admission checks as
+`/validate-features`. The paired routes answer 404 until `EXECUTOR_PAIRED_ENABLED` is set.
+
+Paired rounds show that the client fixed each round's evidence before the next round was
+revealed. They show nothing more about where that evidence came from.
+
+Finalize requests share `EXECUTOR_PAIRED_SESSION_CONCURRENCY` slots. A request that finds no
+free slot within two seconds answers 503 with reason `session_busy`. Nothing was consumed, so
+the client sends the same finalize again. A finalize body must arrive within 20 seconds.
 
 ## Local development
 
@@ -86,7 +101,7 @@ Production refuses the dev validator pass-through and permissive CORS mode.
 | `VALIDATION_SERVICE_URL_SIGNATURE` | unset | Authority signature over the validator URL |
 | `VALIDATION_API_KEY` | unset | Credential sent to the private validator |
 | `EXECUTOR_SCORING_CONFIG_BUNDLE` | unset | Signed scoring configuration required by release builds |
-| `CHALLENGE_TTL_SECS` | `60` | Challenge nonce lifetime in seconds. Allowed range: 1-300. |
+| `CHALLENGE_TTL_SECS` | `180` | Challenge nonce lifetime in seconds. Allowed range: 1-300. |
 | `VALIDATION_WALLET_MAX_ATTEMPTS` | `5` | Failed attempts allowed per wallet window |
 | `VALIDATION_WALLET_WINDOW_SECS` | `3600` | Wallet attempt window |
 | `SAS_CREDENTIAL_PDA` | unset | SAS credential address |
@@ -100,6 +115,8 @@ Production refuses the dev validator pass-through and permissive CORS mode.
 | `EXECUTOR_CURVE_TRACE_OBSERVE` | `true` | Record bounded curve-trace telemetry |
 | `VALIDATION_CROSS_WALLET_COOLDOWN_SECS` | `86400` | Cross-wallet cooldown duration |
 | `VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE` | `false` | Enforce the cooldown when enabled |
+| `EXECUTOR_PAIRED_ENABLED` | `false` | Serve the paired-session routes |
+| `EXECUTOR_PAIRED_SESSION_CONCURRENCY` | `16` | Paired finalize requests buffered at once. Allowed range: 1-128. |
 
 Do not place keypairs or API credentials in source control.
 

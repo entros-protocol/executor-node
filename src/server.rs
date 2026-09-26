@@ -29,6 +29,7 @@ use crate::status::handler::status_handler;
 use crate::status::metrics_handler::metrics_handler;
 use crate::status::status_metrics::StatusMetrics;
 use crate::study::{study_definition_handler, study_enrol_handler};
+use crate::timing::{min_duration_middleware, BodyPolicy};
 use crate::validation::composite::ScoringConfig;
 use crate::validation::handler::validate_features_handler;
 
@@ -75,6 +76,10 @@ pub struct AppState {
     pub cross_wallet_cooldown_enforce: bool,
     /// IP blocklist for probing attacks. Maps IP address to block expiration time.
     pub probing_blocklist: Arc<dashmap::DashMap<std::net::IpAddr, std::time::Instant>>,
+    /// Serves the paired-session routes when true.
+    pub paired_enabled: bool,
+    /// Bounds paired finalize requests buffered at once.
+    pub session_gate: Arc<tokio::sync::Semaphore>,
 }
 
 async fn auth_middleware(
@@ -166,6 +171,33 @@ async fn attest_rate_limit_middleware(
     Ok(next.run(request).await)
 }
 
+/// How long a finalize waits for a slot before it is refused. A slot turns over in the time
+/// one handler takes, so a burst queues briefly instead of failing. The body is not read while
+/// it waits, so a waiting request holds a connection and no buffered bytes.
+const SESSION_SLOT_WAIT: Duration = Duration::from_secs(2);
+
+/// Takes one paired finalize slot, or refuses once none frees in time. The slot is taken before
+/// the body is buffered, so the gate bounds the memory those bodies hold, and it travels with
+/// the request to the handler, which releases it on return rather than after the timing floor.
+async fn session_gate_middleware(
+    State(state): State<AppState>,
+    mut request: Request,
+    next: Next,
+) -> Result<Response, AppError> {
+    let permit = tokio::time::timeout(
+        SESSION_SLOT_WAIT,
+        Arc::clone(&state.session_gate).acquire_owned(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .ok_or(AppError::PairedBusy)?;
+    request
+        .extensions_mut()
+        .insert(crate::paired::SessionSlot::new(permit));
+    Ok(next.run(request).await)
+}
+
 const STUDY_REQUEST_BODY_BYTES: usize = 4 * 1024;
 
 /// Largest request body the executor accepts, in bytes.
@@ -181,6 +213,25 @@ const STUDY_REQUEST_BODY_BYTES: usize = 4 * 1024;
 /// stream when that header is absent, and `DefaultBodyLimit` bounds what an
 /// extractor will buffer.
 pub const MAX_REQUEST_BODY_BYTES: usize = 1_048_576;
+
+/// The whole paired finalize body must arrive within this. A paired body is larger than any
+/// other, and each one holds a finalize slot while it uploads.
+const SESSION_BODY_READ_DEADLINE: Duration = Duration::from_secs(20);
+
+/// Wraps one group of verify routes. The per-IP limiter runs outside the group's auth and
+/// timing stack, and the body limit runs outside the limiter, so an oversized upload is refused
+/// on its `Content-Length` before it counts against its network or reaches anything else.
+/// `RequestBodyLimitLayer` also caps a stream without that header, and `DefaultBodyLimit`
+/// bounds what an extractor buffers.
+fn verify_group(router: Router<AppState>, state: &AppState, limit: usize) -> Router<AppState> {
+    router
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            per_ip_rate_limit_middleware,
+        ))
+        .route_layer(DefaultBodyLimit::max(limit))
+        .route_layer(RequestBodyLimitLayer::new(limit))
+}
 
 /// How long a request body may go without delivering a frame before the
 /// connection is reclaimed.
@@ -246,21 +297,63 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
     //   key, which is the resource-exhaustion path this stack is meant to
     //   close. Auth failures are already distinguishable by their 401, so
     //   leaving them unclamped reveals nothing new.
-    let timed_routes = if validation_only {
-        Router::new()
+    let timed_routes = verify_group(
+        if validation_only {
+            Router::new()
+        } else {
+            Router::new().route("/verify", post(verify_handler))
+        }
+        .route("/validate-features", post(validate_features_handler))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            BodyPolicy::limit(MAX_REQUEST_BODY_BYTES),
+            min_duration_middleware,
+        ))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        )),
+        &state,
+        MAX_REQUEST_BODY_BYTES,
+    );
+
+    // The paired finalize is timed like `/validate-features`, with its own body limit, a total
+    // upload deadline, and a gate that bounds how many of its larger bodies are held at once.
+    let session_routes = if state.paired_enabled {
+        verify_group(
+            Router::new()
+                .route(
+                    "/validate-session",
+                    post(crate::paired::finalize::validate_session_handler),
+                )
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    rate_limit_middleware,
+                ))
+                .route_layer(middleware::from_fn_with_state(
+                    BodyPolicy {
+                        max_bytes: crate::paired::SESSION_BODY_BYTES,
+                        read_deadline: Some(SESSION_BODY_READ_DEADLINE),
+                    },
+                    min_duration_middleware,
+                ))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    session_gate_middleware,
+                ))
+                .route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth_middleware,
+                )),
+            &state,
+            crate::paired::SESSION_BODY_BYTES,
+        )
     } else {
-        Router::new().route("/verify", post(verify_handler))
-    }
-    .route("/validate-features", post(validate_features_handler))
-    .route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        rate_limit_middleware,
-    ))
-    .route_layer(middleware::from_fn(crate::timing::min_duration_middleware))
-    .route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth_middleware,
-    ));
+        Router::new()
+    };
 
     // Untimed authenticated routes: /challenge issues nonces (fast by design,
     // user-blocking before the verify call) and /attest already exposes its
@@ -284,35 +377,76 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
             .route_layer(RequestBodyLimitLayer::new(STUDY_REQUEST_BODY_BYTES))
     };
 
-    let untimed_routes = Router::new()
-        .route("/challenge", get(challenge_handler))
-        .route("/validation-deployment", get(validation_deployment_handler))
-        .merge(if validation_only {
-            Router::new()
-        } else {
-            attest_route
-        })
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            rate_limit_middleware,
-        ))
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            auth_middleware,
-        ));
+    let untimed_routes = verify_group(
+        Router::new()
+            .route("/challenge", get(challenge_handler))
+            .route("/validation-deployment", get(validation_deployment_handler))
+            .merge(if validation_only {
+                Router::new()
+            } else {
+                attest_route
+            })
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                rate_limit_middleware,
+            ))
+            .route_layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            )),
+        &state,
+        MAX_REQUEST_BODY_BYTES,
+    );
 
-    // Apply per-IP rate limiting to ALL verify routes (timed + untimed).
-    // Sits OUTSIDE both min-duration and per-API-key/per-wallet limiters
-    // so hostile traffic is rejected before consuming server resources.
-    // Excluded: /health, /status, /metrics — Railway healthchecks and
-    // Prometheus scrapers are expected to hit at high cadence.
-    let verify_routes = timed_routes
-        .merge(untimed_routes)
-        .route_layer(middleware::from_fn_with_state(
-            state.clone(),
-            per_ip_rate_limit_middleware,
+    // Opening a session and committing a round stay untimed. A commit carries digests only,
+    // and a timing floor on every round would add seconds inside the interaction.
+    let paired_round_routes = if state.paired_enabled {
+        let paired = |path: &str, handler, limit| {
+            verify_group(
+                Router::new()
+                    .route(path, handler)
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        rate_limit_middleware,
+                    ))
+                    .route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        auth_middleware,
+                    )),
+                &state,
+                limit,
+            )
+        };
+        paired(
+            "/challenge/paired",
+            post(crate::paired::open_handler),
+            crate::paired::OPEN_BODY_BYTES,
+        )
+        .merge(paired(
+            "/paired/commit",
+            post(crate::paired::commit_handler),
+            crate::paired::COMMIT_BODY_BYTES,
         ))
+    } else {
+        Router::new()
+    };
+
+    // Every verify group carries per-IP rate limiting (see `verify_group`). It sits OUTSIDE
+    // both min-duration and the per-API-key and per-wallet limiters, so hostile traffic is
+    // rejected before consuming server resources. /health, /status and /metrics carry none,
+    // because Railway healthchecks and Prometheus scrapers hit them at high cadence.
+    let verify_routes = timed_routes
+        .merge(session_routes)
+        .merge(untimed_routes)
+        .merge(paired_round_routes)
         .merge(study_routes);
+
+    // The outer transport limit is the largest body any served route accepts.
+    let transport_limit = if state.paired_enabled {
+        crate::paired::SESSION_BODY_BYTES
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    };
 
     let cors = if cors_origins.is_empty() {
         // No origins configured — permissive for development
@@ -349,7 +483,7 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
         // Service. Axum's own docs say so and recommend `tower_http::limit`
         // for untrusted remotes. On its own it bounds nothing before an
         // extractor runs, which is why the real limit is the layer below.
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(transport_limit))
         // Reclaim a stalled upload. Applied inside the size limit so only
         // bodies that passed the cheap `Content-Length` check get wrapped.
         .layer(RequestBodyTimeoutLayer::new(REQUEST_BODY_READ_TIMEOUT))
@@ -358,7 +492,7 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
         // the stream when the header is absent. Outermost of the three so
         // an oversized upload never reaches auth, the rate limiters, or the
         // body-buffering inside `min_duration_middleware`.
-        .layer(RequestBodyLimitLayer::new(MAX_REQUEST_BODY_BYTES))
+        .layer(RequestBodyLimitLayer::new(transport_limit))
         .layer(cors)
         .layer(TraceLayer::new_for_http().make_span_with(make_http_request_span))
         .with_state(state)
@@ -407,6 +541,8 @@ pub fn build_test_state(
         cross_wallet_cooldown: Arc::new(CrossWalletCooldownTracker::new(86400)),
         cross_wallet_cooldown_enforce: false,
         probing_blocklist: Arc::new(dashmap::DashMap::new()),
+        paired_enabled: false,
+        session_gate: Arc::new(tokio::sync::Semaphore::new(16)),
     }
 }
 
@@ -1224,6 +1360,95 @@ mod load_pressure {
         }
     }
 
+    /// Every finalize holds its slot only while its handler runs. With 16 slots and a 4 s
+    /// floor, a slot held through the floor would cap the route at 4 finalizes a second and
+    /// refuse most of this burst as busy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore = "load measurement; run with --ignored --nocapture"]
+    async fn paired_finalize_frees_its_slot_before_the_floor() {
+        use crate::validation::mock_validator::{
+            state_with_mock_validator, success_body, MockValidator,
+        };
+        const WORKERS: usize = 64;
+        const PER_WORKER: usize = 4;
+
+        let mock =
+            MockValidator::spawn(axum::http::StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker_with_quota("load-key", u64::MAX), &mock);
+        state.api_keys = Arc::new(vec!["load-key".into()]);
+        state.paired_enabled = true;
+        state.rate_limiter = Arc::new(RateLimiter::new(1_000_000));
+        state.per_ip_rate_limiter = Arc::new(PerIpRateLimiter::new(1_000_000));
+        let app = create_router(state, &[]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+
+        let client = reqwest::Client::builder()
+            .pool_max_idle_per_host(WORKERS)
+            .build()
+            .unwrap();
+        let segment = |round: u32| {
+            serde_json::json!({
+                "round_index": round,
+                "audio_b64": "A".repeat(160_000),
+                "coarse_path_hex": "01",
+            })
+        };
+        let passed = Arc::new(AtomicU64::new(0));
+        let busy = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let mut handles = Vec::new();
+        for _ in 0..WORKERS {
+            let (client, base) = (client.clone(), base.clone());
+            let (passed, busy) = (Arc::clone(&passed), Arc::clone(&busy));
+            let body = serde_json::json!({
+                "capture_protocol": "paired",
+                "projection_version": 1,
+                "session_id": "00112233445566778899aabbccddeeff",
+                "final_digest": "ab".repeat(32),
+                "segments": [segment(1), segment(2), segment(3)],
+                "features": vec![0.5; 308],
+            });
+            handles.push(tokio::spawn(async move {
+                for _ in 0..PER_WORKER {
+                    let mut body = body.clone();
+                    body["wallet_id"] = solana_sdk::pubkey::Pubkey::new_unique().to_string().into();
+                    let response = client
+                        .post(format!("{base}/validate-session"))
+                        .header("x-api-key", "load-key")
+                        .json(&body)
+                        .send()
+                        .await
+                        .unwrap();
+                    match response.status().as_u16() {
+                        200 => passed.fetch_add(1, Ordering::Relaxed),
+                        503 => busy.fetch_add(1, Ordering::Relaxed),
+                        other => panic!("unexpected status {other}"),
+                    };
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.unwrap();
+        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let (passed, busy) = (passed.load(Ordering::Relaxed), busy.load(Ordering::Relaxed));
+        println!(
+            "  /validate-session      n={:<5} passed={passed:<5} busy={busy:<4} {:>6.1} finalizes/s over {elapsed:.1} s",
+            WORKERS * PER_WORKER,
+            (passed + busy) as f64 / elapsed,
+        );
+        assert_eq!(busy, 0, "a finalize slot outlived its handler");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     #[ignore = "load measurement; run with --ignored --nocapture"]
     async fn oversized_bodies_never_reach_a_handler() {
@@ -1271,5 +1496,212 @@ mod load_pressure {
             "server degraded after the burst"
         );
         println!("  post-burst /health     {}", health.status());
+    }
+}
+
+#[cfg(test)]
+mod route_limit_tests {
+    use super::*;
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, Request as HttpRequest, StatusCode};
+    use tower::util::ServiceExt;
+
+    fn state(paired_enabled: bool) -> AppState {
+        let mut state = build_test_state(tracker_with_quota("key", 10), None);
+        state.api_keys = Arc::new(vec!["key".into()]);
+        state.paired_enabled = paired_enabled;
+        state
+    }
+
+    async fn status_of(state: AppState, path: &str, body_len: usize) -> StatusCode {
+        create_router(state, &[])
+            .oneshot(
+                HttpRequest::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::CONTENT_LENGTH, body_len)
+                    .header("x-api-key", "key")
+                    .body(Body::from(Bytes::from(vec![b' '; body_len])))
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds")
+            .status()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn each_route_group_holds_its_own_limit() {
+        for (paired, path, limit) in [
+            (false, "/validate-features", MAX_REQUEST_BODY_BYTES),
+            (true, "/validate-features", MAX_REQUEST_BODY_BYTES),
+            (false, "/attest", MAX_REQUEST_BODY_BYTES),
+            (true, "/validate-session", crate::paired::SESSION_BODY_BYTES),
+            (true, "/challenge/paired", crate::paired::OPEN_BODY_BYTES),
+            (true, "/paired/commit", crate::paired::COMMIT_BODY_BYTES),
+        ] {
+            assert_ne!(
+                status_of(state(paired), path, limit).await,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path} accepts exactly its limit"
+            );
+            assert_eq!(
+                status_of(state(paired), path, limit + 1).await,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "{path} refuses one byte over its limit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn paired_routes_do_not_exist_while_paired_sessions_are_off() {
+        for path in ["/challenge/paired", "/paired/commit", "/validate-session"] {
+            assert_eq!(
+                status_of(state(false), path, 2).await,
+                StatusCode::NOT_FOUND,
+                "{path}"
+            );
+        }
+    }
+
+    fn post(path: &str, body: Body) -> HttpRequest<Body> {
+        let mut request = HttpRequest::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-api-key", "key")
+            .body(body)
+            .expect("request builds");
+        request
+            .extensions_mut()
+            .insert(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                [203, 0, 113, 9],
+                4_000,
+            ))));
+        request
+    }
+
+    /// A body the finalize handler parses and then refuses, so the request runs the whole
+    /// stack, handler included.
+    fn out_of_bounds_session() -> Body {
+        Body::from(
+            serde_json::json!({
+                "capture_protocol": "paired",
+                "wallet_id": "11111111111111111111111111111111",
+                "projection_version": 1,
+                "session_id": "00",
+                "final_digest": "00",
+                "segments": [],
+                "features": [],
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finalize_slot_frees_when_the_handler_returns_not_after_the_floor() {
+        let mut single_slot = state(true);
+        single_slot.session_gate = Arc::new(tokio::sync::Semaphore::new(1));
+        let router = create_router(single_slot, &[]);
+
+        let first = tokio::spawn(
+            router
+                .clone()
+                .oneshot(post("/validate-session", out_of_bounds_session())),
+        );
+        // The first request is now inside its timing floor.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let second = router
+            .oneshot(post("/validate-session", out_of_bounds_session()))
+            .await
+            .expect("router responds");
+        assert_eq!(second.status(), StatusCode::BAD_REQUEST);
+        let first = first.await.expect("task").expect("router responds");
+        assert_eq!(first.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_malformed_paired_body_is_refused_as_invalid_request() {
+        for path in ["/challenge/paired", "/paired/commit", "/validate-session"] {
+            let response = create_router(state(true), &[])
+                .oneshot(post(path, Body::from("{\"wallet\":1}")))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+            let bytes = axum::body::to_bytes(response.into_body(), 64_000)
+                .await
+                .expect("body");
+            let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(body["reason"], "invalid_request", "{path}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_body_over_the_group_limit_is_refused() {
+        for (path, limit) in [
+            ("/paired/commit", crate::paired::COMMIT_BODY_BYTES),
+            ("/validate-session", crate::paired::SESSION_BODY_BYTES),
+            ("/validate-features", MAX_REQUEST_BODY_BYTES),
+        ] {
+            let chunks = futures_util::stream::iter(
+                vec![b' '; limit + 1]
+                    .chunks(4_096)
+                    .map(|chunk| Ok::<_, std::convert::Infallible>(Bytes::copy_from_slice(chunk)))
+                    .collect::<Vec<_>>(),
+            );
+            let response = create_router(state(true), &[])
+                .oneshot(post(path, Body::from_stream(chunks)))
+                .await
+                .expect("router responds");
+            assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE, "{path}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_body_is_refused_before_it_counts_against_its_network() {
+        let mut limited = state(true);
+        limited.per_ip_rate_limiter = Arc::new(PerIpRateLimiter::new(1));
+        let router = create_router(limited, &[]);
+        let spend = router
+            .clone()
+            .oneshot(post("/paired/commit", Body::from("{}")))
+            .await
+            .expect("router responds");
+        assert_ne!(spend.status(), StatusCode::TOO_MANY_REQUESTS);
+        let oversized = vec![b' '; crate::paired::COMMIT_BODY_BYTES + 1];
+        let mut request = post("/paired/commit", Body::from(oversized.clone()));
+        request
+            .headers_mut()
+            .insert(header::CONTENT_LENGTH, oversized.len().into());
+        assert_eq!(
+            router.oneshot(request).await.expect("responds").status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transport_limit_follows_the_paired_flag() {
+        // With paired sessions off, nothing larger than the single-capture limit is read.
+        assert_eq!(
+            status_of(
+                state(false),
+                "/validate-session",
+                MAX_REQUEST_BODY_BYTES + 1
+            )
+            .await,
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_session_gate_refuses_before_buffering() {
+        let mut busy = state(true);
+        busy.session_gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let response = create_router(busy, &[])
+            .oneshot(post("/validate-session", Body::from("{}")))
+            .await
+            .expect("router responds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), 64_000)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["reason"], "session_busy");
     }
 }

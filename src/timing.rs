@@ -16,13 +16,31 @@ use std::future::Future;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tokio::time::Instant;
 
 use crate::error::AppError;
-use crate::server::MAX_REQUEST_BODY_BYTES;
+
+/// How much of a timed route group's body is buffered, and for how long.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyPolicy {
+    pub max_bytes: usize,
+    /// The whole body must arrive within this, on top of the transport's per-frame timeout.
+    /// Without it a client that sends one frame just inside each per-frame window can hold the
+    /// request open for as long as it likes.
+    pub read_deadline: Option<Duration>,
+}
+
+impl BodyPolicy {
+    pub const fn limit(max_bytes: usize) -> Self {
+        Self {
+            max_bytes,
+            read_deadline: None,
+        }
+    }
+}
 
 /// Lower bound on response time for endpoints that talk to the validator.
 /// Calibrated to match `validate-features` 25th-percentile latency on a
@@ -94,11 +112,25 @@ where
 ///
 /// The size cap here is a backstop. `RequestBodyLimitLayer` sits outside the
 /// whole stack and rejects on `Content-Length` before a byte is read, so a
-/// body reaching this point has already been bounded once.
-pub async fn min_duration_middleware(request: Request, next: Next) -> Response {
+/// body reaching this point has already been bounded once. Each route group
+/// passes its own cap, the same value its outer layer enforces, and may add a
+/// total read deadline.
+pub async fn min_duration_middleware(
+    State(policy): State<BodyPolicy>,
+    request: Request,
+    next: Next,
+) -> Response {
     let (parts, body) = request.into_parts();
 
-    let bytes = match axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+    let read = axum::body::to_bytes(body, policy.max_bytes);
+    let read = match policy.read_deadline {
+        Some(deadline) => match tokio::time::timeout(deadline, read).await {
+            Ok(read) => read,
+            Err(_) => return AppError::RequestBodyTimeout.into_response(),
+        },
+        None => read.await,
+    };
+    let bytes = match read {
         Ok(bytes) => bytes,
         // Classify rather than collapse. Three different conditions surface
         // here as one error type, and they do not mean the same thing to a
@@ -143,6 +175,7 @@ fn classify_body_error(err: axum::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::MAX_REQUEST_BODY_BYTES;
     use axum::http::StatusCode;
     use axum::routing::post;
     use axum::Router;
@@ -160,7 +193,10 @@ mod tests {
     fn echo_router() -> Router {
         Router::new()
             .route("/t", post(|body: String| async move { body }))
-            .route_layer(axum::middleware::from_fn(min_duration_middleware))
+            .route_layer(axum::middleware::from_fn_with_state(
+                BodyPolicy::limit(MAX_REQUEST_BODY_BYTES),
+                min_duration_middleware,
+            ))
     }
 
     /// The security claim of this module: a slow upload cannot eat the
@@ -217,7 +253,10 @@ mod tests {
 
         let app = Router::new()
             .route("/t", post(|body: String| async move { body }))
-            .route_layer(axum::middleware::from_fn(min_duration_middleware))
+            .route_layer(axum::middleware::from_fn_with_state(
+                BodyPolicy::limit(MAX_REQUEST_BODY_BYTES),
+                min_duration_middleware,
+            ))
             .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
                 Duration::from_secs(5),
             ));
@@ -240,6 +279,41 @@ mod tests {
             StatusCode::REQUEST_TIMEOUT,
             "a stalled body must not be reported as PAYLOAD_TOO_LARGE"
         );
+    }
+
+    /// A client that keeps each frame inside the per-frame timeout still meets
+    /// the total deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_trickled_body_meets_the_total_deadline() {
+        let app = Router::new()
+            .route("/t", post(|body: String| async move { body }))
+            .route_layer(axum::middleware::from_fn_with_state(
+                BodyPolicy {
+                    max_bytes: MAX_REQUEST_BODY_BYTES,
+                    read_deadline: Some(Duration::from_secs(20)),
+                },
+                min_duration_middleware,
+            ))
+            .layer(tower_http::timeout::RequestBodyTimeoutLayer::new(
+                Duration::from_secs(5),
+            ));
+        let frames = futures_util::stream::unfold((), |()| async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Some((
+                Ok::<_, std::convert::Infallible>(axum::body::Bytes::from_static(b"x")),
+                (),
+            ))
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/t")
+            .body(Body::from_stream(frames))
+            .expect("request builds");
+
+        let started = Instant::now();
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        assert!(started.elapsed() <= Duration::from_secs(21));
     }
 
     /// The in-stack backstop, for anything that reaches here without having

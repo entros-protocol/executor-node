@@ -129,6 +129,25 @@ pub enum AppError {
     /// Surfaces as `429 Too Many Requests` with a `Retry-After` header.
     #[error("Cross-wallet cooldown active")]
     CrossWalletCooldownActive { retry_after_secs: u64 },
+
+    /// A paired-session request refused for a protocol reason, such as an expired round, a
+    /// superseded session or a malformed body. The reason names the rule and no server value.
+    #[error("Paired session request refused")]
+    PairedRejected { status: StatusCode, reason: String },
+
+    /// The paired session was consumed and a fault stopped its verdict. No verdict was
+    /// rendered, so the client opens a new session.
+    #[error("Paired session technical failure")]
+    PairedTechnicalFailure,
+
+    /// The validator could not be reached for a paired-session request.
+    #[error("Paired session service unavailable")]
+    PairedUnavailable,
+
+    /// Too many paired finalize requests are buffered at once. Nothing was consumed, so the
+    /// client sends the same finalize again.
+    #[error("Paired session service busy")]
+    PairedBusy,
 }
 
 impl IntoResponse for AppError {
@@ -186,6 +205,31 @@ impl IntoResponse for AppError {
             return resp;
         }
 
+        if let AppError::PairedRejected { status, reason } = &self {
+            let body = json!({
+                "error": "The verification session could not continue.",
+                "reason": reason,
+            });
+            return (*status, axum::Json(Padded::new(body))).into_response();
+        }
+
+        if matches!(self, AppError::PairedBusy) {
+            let body = json!({
+                "error": "The verification service is busy. Please try again.",
+                "reason": "session_busy",
+                "retry_after": 1,
+            });
+            let mut response = (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(Padded::new(body)),
+            )
+                .into_response();
+            response
+                .headers_mut()
+                .insert("retry-after", HeaderValue::from_static("1"));
+            return response;
+        }
+
         let (status, message) = match &self {
             AppError::InvalidRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::PayloadTooLarge => (
@@ -236,6 +280,17 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 "This verification client must update before continuing.".into(),
             ),
+            AppError::PairedRejected { .. } | AppError::PairedBusy => {
+                unreachable!("handled above")
+            }
+            AppError::PairedTechnicalFailure => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Verification could not be completed. Please start again.".into(),
+            ),
+            AppError::PairedUnavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Validation service temporarily unavailable. Please try again.".into(),
+            ),
         };
 
         // WalletRateLimited surfaces `reason + retry_after` so the client
@@ -273,6 +328,12 @@ impl IntoResponse for AppError {
                     "reason": "projection_update_required",
                 })
             }
+            AppError::RateLimited => {
+                json!({
+                    "error": message,
+                    "reason": "rate_limited",
+                })
+            }
             AppError::StudyValidationFailed {
                 reason,
                 study_record_status,
@@ -299,6 +360,18 @@ impl IntoResponse for AppError {
                     // purpose: no verdict was rendered on this capture, so it
                     // must not consume the wallet's verification budget.
                     "reason": "validation_timeout",
+                })
+            }
+            AppError::PairedTechnicalFailure => {
+                json!({
+                    "error": message,
+                    "reason": "technical_failure",
+                })
+            }
+            AppError::PairedUnavailable => {
+                json!({
+                    "error": message,
+                    "reason": "validation_unavailable",
                 })
             }
             _ => json!({ "error": message }),
