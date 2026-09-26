@@ -14,6 +14,7 @@ mod status;
 mod study;
 mod timing;
 mod validation;
+mod upstream;
 
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use axum::extract::State;
-use axum::http::{header::RETRY_AFTER, HeaderValue, StatusCode};
+use axum::http::{header::RETRY_AFTER, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
@@ -12,7 +12,6 @@ use crate::server::AppState;
 
 const STUDY_PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const STUDY_RESPONSE_BODY_BYTES: usize = 16 * 1024;
-const MAX_RETRY_AFTER_SECS: u64 = 300;
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,28 +117,17 @@ async fn proxy_study_request(
     path: &str,
     body: serde_json::Value,
 ) -> Result<Response, AppError> {
-    let validation_url = state
-        .validation_url
-        .as_ref()
-        .ok_or(AppError::ValidationServiceUnavailable)?;
-    let mut request = state
-        .http_client
-        .post(format!("{validation_url}{path}"))
-        .json(&body)
-        .timeout(STUDY_PROXY_TIMEOUT);
-    if let Some(key) = &state.validation_api_key {
-        request = request.bearer_auth(key);
-    }
-    let mut upstream = request
-        .send()
-        .await
-        .map_err(|_| AppError::ValidationServiceUnavailable)?;
-    let status =
-        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let retry_after = upstream.headers().get(RETRY_AFTER).cloned();
-    let response_body = read_bounded_json(&mut upstream).await;
-    let (status, response_body) = match response_body {
-        Some(body) => (status, body),
+    let reply = crate::upstream::post_json(
+        state,
+        path,
+        &body,
+        STUDY_PROXY_TIMEOUT,
+        STUDY_RESPONSE_BODY_BYTES,
+    )
+    .await
+    .map_err(|_| AppError::ValidationServiceUnavailable)?;
+    let (status, response_body) = match reply.body {
+        Some(body) => (reply.status, body),
         None => (
             StatusCode::BAD_GATEWAY,
             serde_json::json!({ "error": "Study service returned an invalid response" }),
@@ -147,37 +135,11 @@ async fn proxy_study_request(
     };
     let mut response = (status, Json(response_body)).into_response();
     if status == StatusCode::TOO_MANY_REQUESTS {
-        if let Some(value) = retry_after.and_then(valid_retry_after) {
+        if let Some(value) = reply.retry_after {
             response.headers_mut().insert(RETRY_AFTER, value);
         }
     }
     Ok(response)
-}
-
-fn valid_retry_after(value: HeaderValue) -> Option<HeaderValue> {
-    let seconds = value.to_str().ok()?.parse::<u64>().ok()?;
-    if seconds == 0 {
-        return None;
-    }
-    HeaderValue::from_str(&seconds.min(MAX_RETRY_AFTER_SECS).to_string()).ok()
-}
-
-async fn read_bounded_json(response: &mut reqwest::Response) -> Option<serde_json::Value> {
-    if response
-        .content_length()
-        .is_some_and(|length| length > STUDY_RESPONSE_BODY_BYTES as u64)
-    {
-        return None;
-    }
-
-    let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.ok()? {
-        if body.len().saturating_add(chunk.len()) > STUDY_RESPONSE_BODY_BYTES {
-            return None;
-        }
-        body.extend_from_slice(&chunk);
-    }
-    serde_json::from_slice(&body).ok()
 }
 
 #[cfg(test)]
@@ -185,6 +147,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    use axum::http::HeaderValue;
     use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
     use serde_json::Value;
 
@@ -454,15 +417,6 @@ mod tests {
             response.headers().get(RETRY_AFTER),
             Some(&HeaderValue::from_static("7"))
         );
-    }
-
-    #[test]
-    fn retry_after_is_clamped() {
-        assert_eq!(
-            valid_retry_after(HeaderValue::from_static("18446744073709551615")),
-            Some(HeaderValue::from_static("300"))
-        );
-        assert_eq!(valid_retry_after(HeaderValue::from_static("0")), None);
     }
 
     #[tokio::test]
