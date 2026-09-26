@@ -8,9 +8,9 @@ const REDACT_PREFIX_LEN: usize = 6;
 
 /// Returns a short, log-safe form of an API key.
 ///
-/// `"gRAC5wF+6TPcQr25iCTgxSxj00fmmalXLXOlEn6yhFw="`
+/// `"k3yEXAMPLEexampleEXAMPLEexampleEXAMPLE00000="`
 ///   becomes
-/// `"gRAC5w…"`
+/// `"k3yEXA…"`
 ///
 /// Six characters of base64-derived prefix is enough to differentiate keys
 /// in a typical integrator pool while leaking minimal entropy. Empty input
@@ -82,10 +82,10 @@ mod tests {
 
     #[test]
     fn redacts_long_keys_to_prefix() {
-        let full = "gRAC5wF+6TPcQr25iCTgxSxj00fmmalXLXOlEn6yhFw=";
+        let full = "k3yEXAMPLEexampleEXAMPLEexampleEXAMPLE00000=";
         let redacted = redact_api_key(full);
-        assert_eq!(redacted, "gRAC5w…");
-        assert!(!redacted.contains("yhFw"));
+        assert_eq!(redacted, "k3yEXA…");
+        assert!(!redacted.contains("00000="));
     }
 
     #[test]
@@ -112,7 +112,7 @@ mod tests {
 
     #[test]
     fn redaction_is_deterministic() {
-        let full = "gRAC5wF+6TPcQr25iCTgxSxj00fmmalXLXOlEn6yhFw=";
+        let full = "k3yEXAMPLEexampleEXAMPLEexampleEXAMPLE00000=";
         assert_eq!(redact_api_key(full), redact_api_key(full));
     }
 
