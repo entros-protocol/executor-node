@@ -108,6 +108,15 @@ pub async fn open_handler(
     PairedJson(request): PairedJson<OpenRequest>,
 ) -> Result<Response, AppError> {
     let wallet = Pubkey::from_str(&request.wallet).map_err(|_| invalid_request())?;
+    // An unlisted wallet gets the answer a client reads as paired sessions being off, so it
+    // falls back to the single capture.
+    if state
+        .paired_wallets
+        .as_ref()
+        .is_some_and(|wallets| !wallets.contains(&wallet))
+    {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
     if request.tier != "trace" {
         return Err(invalid_request());
     }
@@ -311,6 +320,37 @@ mod tests {
             ));
         }
         assert_eq!(mock.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unlisted_wallet_opens_nothing_and_sees_paired_sessions_off() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let mut state = state_with_mock_validator(tracker(), &mock);
+        let listed = Pubkey::new_from_array([7; 32]);
+        state.paired_wallets = Some(Arc::new(std::collections::HashSet::from([listed])));
+
+        let response = open_handler(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            open_request(WALLET, "trace"),
+        )
+        .await
+        .expect("answered");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = to_bytes(response.into_body(), 64).await.expect("body");
+        assert!(body.is_empty());
+        assert_eq!(mock.request_count(), 0);
+
+        open_handler(
+            State(state),
+            None,
+            HeaderMap::new(),
+            open_request(&listed.to_string(), "trace"),
+        )
+        .await
+        .expect("forwarded");
+        assert_eq!(mock.request_count(), 1);
     }
 
     #[tokio::test]

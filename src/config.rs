@@ -4,6 +4,7 @@ use serde::Deserialize;
 use solana_sdk::hash::hashv;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signature};
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
@@ -313,6 +314,24 @@ fn parse_bool(value: Option<&str>, default: bool) -> bool {
 
 const DEFAULT_PAIRED_SESSION_CONCURRENCY: usize = 16;
 const MAX_PAIRED_SESSION_CONCURRENCY: usize = 128;
+
+/// Wallets allowed to open paired sessions, from a comma-separated list. Unset or empty admits
+/// every wallet.
+fn parse_paired_wallets(value: Option<&str>) -> Result<Option<HashSet<Pubkey>>, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|wallet| !wallet.is_empty())
+        .map(|wallet| {
+            Pubkey::from_str(wallet)
+                .map_err(|_| format!("EXECUTOR_PAIRED_WALLETS holds an invalid wallet: {wallet}"))
+        })
+        .collect::<Result<HashSet<_>, _>>()
+        .map(Some)
+}
 
 fn parse_paired_session_concurrency(value: Option<&str>) -> Result<usize, String> {
     let Some(value) = value else {
@@ -919,6 +938,17 @@ mod tests {
     }
 
     #[test]
+    fn paired_wallets_admit_everyone_when_unset_and_reject_invalid_entries() {
+        assert_eq!(parse_paired_wallets(None).unwrap(), None);
+        assert_eq!(parse_paired_wallets(Some("  ")).unwrap(), None);
+        let first = Pubkey::new_from_array([1; 32]);
+        let second = Pubkey::new_from_array([2; 32]);
+        let listed = parse_paired_wallets(Some(&format!(" {first} ,{second},"))).unwrap();
+        assert_eq!(listed, Some(HashSet::from([first, second])));
+        assert!(parse_paired_wallets(Some(&format!("{first},not-a-wallet"))).is_err());
+    }
+
+    #[test]
     fn paired_session_concurrency_defaults_and_rejects_out_of_range_values() {
         assert_eq!(parse_paired_session_concurrency(None).unwrap(), 16);
         assert_eq!(parse_paired_session_concurrency(Some("1")).unwrap(), 1);
@@ -1022,6 +1052,10 @@ pub struct Config {
     /// Paired finalize requests buffered at once. Each body may reach 2 MiB, so this bounds
     /// their memory. Configurable via `EXECUTOR_PAIRED_SESSION_CONCURRENCY`. Default 16.
     pub paired_session_concurrency: usize,
+    /// Wallets allowed to open paired sessions. Any other wallet gets the 404 that clients read
+    /// as paired sessions being off. `None` admits every wallet. Configurable via
+    /// `EXECUTOR_PAIRED_WALLETS`, a comma-separated list.
+    pub paired_wallets: Option<HashSet<Pubkey>>,
     pub scoring_config: ResolvedScoringConfig,
 }
 
@@ -1228,6 +1262,8 @@ impl Config {
                 .ok()
                 .as_deref(),
         )?;
+        let paired_wallets =
+            parse_paired_wallets(std::env::var("EXECUTOR_PAIRED_WALLETS").ok().as_deref())?;
 
         Ok(Config {
             environment,
@@ -1261,6 +1297,7 @@ impl Config {
             cross_wallet_cooldown_enforce,
             paired_enabled,
             paired_session_concurrency,
+            paired_wallets,
             scoring_config,
         })
     }

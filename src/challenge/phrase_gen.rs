@@ -1,8 +1,8 @@
 //! Server-side challenge phrase generator.
 //!
 //! Picks 5 random words from `word_dict::WORDS` — a curated dictionary of
-//! 1,357 neutral/positive English words (4-8 letters, 1-3 syllables, no
-//! homophones, no substring collisions). The same dictionary is vendored
+//! 1,240 neutral/positive English words (4-8 letters, 1-3 syllables, no
+//! homophones, no substring collisions, none the speech decoder confuses). The same dictionary is vendored
 //! into `entros-validation/src/word_dict.rs` so the validator knows what the
 //! executor could have issued; the two files are kept in sync by the
 //! shared curation script at `entros-validation/scripts/curate-dictionary.py`.
@@ -38,7 +38,7 @@ pub fn generate_phrase(word_count: usize) -> String {
     }
     let mut rng = rand::thread_rng();
     // `choose_multiple` samples without replacement — our dictionary has
-    // 1,357 entries so it always returns exactly `word_count` items in
+    // 1,240 entries so it always returns exactly `word_count` items in
     // practice. `.copied()` turns iterator items from `&&str` to `&str`.
     word_dict::WORDS
         .choose_multiple(&mut rng, word_count)
@@ -81,7 +81,7 @@ mod tests {
     #[test]
     fn successive_calls_differ() {
         // Not a hard guarantee — two calls could theoretically produce the
-        // same 5-word phrase — but with 1,357^5 ≈ 4.7×10^15 phrase space
+        // same 5-word phrase — but with 1,240^5 ≈ 2.9×10^15 phrase space
         // collision is astronomically unlikely.
         let a = generate_phrase(5);
         let b = generate_phrase(5);
