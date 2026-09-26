@@ -112,6 +112,19 @@ impl WalletAttemptTracker {
         Ok(())
     }
 
+    /// Whether the wallet has cap room, without recording an attempt. Returns
+    /// `Err(retry_after_secs)` when its window budget is spent.
+    pub fn check(&self, wallet: &Pubkey) -> Result<(), u64> {
+        let Some(entry) = self.state.get(wallet) else {
+            return Ok(());
+        };
+        let elapsed = Instant::now().duration_since(entry.window_start);
+        if elapsed < self.window_duration && entry.attempts >= self.max_attempts {
+            return Err(self.window_duration.saturating_sub(elapsed).as_secs());
+        }
+        Ok(())
+    }
+
     /// Refund a slot consumed by `check_and_record_attempt`. Call after a
     /// successful validation so the wallet's budget is restored. Idempotent
     /// safety: never decrements below zero.
@@ -177,6 +190,24 @@ mod tests {
             }
             Ok(()) => panic!("expected wallet to be rate-limited at cap"),
         }
+    }
+
+    #[test]
+    fn checking_reports_the_cap_without_spending_an_attempt() {
+        let tracker = WalletAttemptTracker::default_for_tests();
+        let wallet = dummy_wallet(9);
+        for _ in 0..TEST_MAX {
+            assert!(tracker.check(&wallet).is_ok());
+        }
+        assert_eq!(tracker.get_attempts(&wallet), 0);
+        for _ in 0..TEST_MAX {
+            tracker
+                .check_and_record_attempt(&wallet)
+                .expect("attempt within cap");
+        }
+        let retry_after = tracker.check(&wallet).expect_err("cap reached");
+        assert!(retry_after > 0 && retry_after <= TEST_WINDOW_SECS);
+        assert_eq!(tracker.get_attempts(&wallet), TEST_MAX);
     }
 
     #[test]

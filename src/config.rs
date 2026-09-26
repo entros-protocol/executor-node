@@ -22,7 +22,9 @@ const VALIDATION_URL_AUTHORITY_BS58: &str = "GYm3f7DTvTZ6dN1Gfe7UowHRerxTU4FK2u1
 /// from another tool that happens to be signed by the same authority key
 /// from being a valid validator-URL signature here.
 const VALIDATION_URL_DOMAIN_PREFIX: &str = "Entros-VALIDATOR-URL-V1:";
-const DEFAULT_CHALLENGE_TTL_SECS: u64 = 60;
+/// Long enough that a client starting capture with two minutes of lifetime left can open
+/// capture on a fresh nonce. At 60 seconds every capture-start check would refuse.
+const DEFAULT_CHALLENGE_TTL_SECS: u64 = 180;
 /// Limits replay exposure and live nonce retention to five minutes.
 const MAX_CHALLENGE_TTL_SECS: u64 = 300;
 
@@ -307,6 +309,25 @@ fn parse_bool(value: Option<&str>, default: bool) -> bool {
             _ => default,
         },
     }
+}
+
+const DEFAULT_PAIRED_SESSION_CONCURRENCY: usize = 16;
+const MAX_PAIRED_SESSION_CONCURRENCY: usize = 128;
+
+fn parse_paired_session_concurrency(value: Option<&str>) -> Result<usize, String> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_PAIRED_SESSION_CONCURRENCY);
+    };
+    value
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|count| (1..=MAX_PAIRED_SESSION_CONCURRENCY).contains(count))
+        .ok_or_else(|| {
+            format!(
+                "EXECUTOR_PAIRED_SESSION_CONCURRENCY must be 1-{MAX_PAIRED_SESSION_CONCURRENCY}"
+            )
+        })
 }
 
 fn parse_challenge_ttl_secs(value: Option<&str>) -> Result<u64, String> {
@@ -892,9 +913,19 @@ mod tests {
 
     #[test]
     fn challenge_ttl_defaults_and_accepts_the_bounded_range() {
-        assert_eq!(parse_challenge_ttl_secs(None).unwrap(), 60);
+        assert_eq!(parse_challenge_ttl_secs(None).unwrap(), 180);
         assert_eq!(parse_challenge_ttl_secs(Some("1")).unwrap(), 1);
         assert_eq!(parse_challenge_ttl_secs(Some("300")).unwrap(), 300);
+    }
+
+    #[test]
+    fn paired_session_concurrency_defaults_and_rejects_out_of_range_values() {
+        assert_eq!(parse_paired_session_concurrency(None).unwrap(), 16);
+        assert_eq!(parse_paired_session_concurrency(Some("1")).unwrap(), 1);
+        assert_eq!(parse_paired_session_concurrency(Some("128")).unwrap(), 128);
+        for value in ["0", "129", "many", ""] {
+            assert!(parse_paired_session_concurrency(Some(value)).is_err());
+        }
     }
 
     #[test]
@@ -985,6 +1016,12 @@ pub struct Config {
     /// logged but verification proceeds. Configurable via `VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE`.
     /// Default false (observe-only for NAT/shared-network safety).
     pub cross_wallet_cooldown_enforce: bool,
+    /// Serves the paired-session routes when true. Off by default, so the routes answer 404.
+    /// Configurable via `EXECUTOR_PAIRED_ENABLED`.
+    pub paired_enabled: bool,
+    /// Paired finalize requests buffered at once. Each body may reach 2 MiB, so this bounds
+    /// their memory. Configurable via `EXECUTOR_PAIRED_SESSION_CONCURRENCY`. Default 16.
+    pub paired_session_concurrency: usize,
     pub scoring_config: ResolvedScoringConfig,
 }
 
@@ -1185,6 +1222,13 @@ impl Config {
         let cross_wallet_cooldown_enforce =
             parse_bool_env("VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE", false);
 
+        let paired_enabled = parse_bool_env("EXECUTOR_PAIRED_ENABLED", false);
+        let paired_session_concurrency = parse_paired_session_concurrency(
+            std::env::var("EXECUTOR_PAIRED_SESSION_CONCURRENCY")
+                .ok()
+                .as_deref(),
+        )?;
+
         Ok(Config {
             environment,
             rpc_url,
@@ -1215,6 +1259,8 @@ impl Config {
             curve_trace_observe,
             cross_wallet_cooldown_secs,
             cross_wallet_cooldown_enforce,
+            paired_enabled,
+            paired_session_concurrency,
             scoring_config,
         })
     }

@@ -27,16 +27,16 @@ use crate::validation::composite::RiskComponents;
 /// variable that can be turned back on for a calibration window, and this
 /// timeout must not become the thing that breaks when it is.
 const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
+pub(crate) const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
 const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
-const FEATURE_VECTOR_WIDTH: usize = 308;
+pub(crate) const FEATURE_VECTOR_WIDTH: usize = 308;
 const AUDIO_FEATURE_WIDTH: usize = 170;
 const NORMALIZED_TOUCH_PROJECTION_VERSION: u16 = 2;
 const COMPATIBILITY_PROJECTION_VERSION: u16 = 1;
 const COMPATIBILITY_FEATURE_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ProjectionIntent {
+pub(crate) enum ProjectionIntent {
     Mint,
     Update,
     Rebaseline,
@@ -44,7 +44,7 @@ enum ProjectionIntent {
 }
 
 impl ProjectionIntent {
-    fn receipt_purpose(self, projection_version: u16) -> Option<&'static str> {
+    pub(crate) fn receipt_purpose(self, projection_version: u16) -> Option<&'static str> {
         match self {
             Self::Mint => Some("mint"),
             Self::Rebaseline => Some("rebaseline"),
@@ -377,14 +377,14 @@ pub struct SignedReceiptDto {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PhraseValidationStatus {
+pub(crate) enum PhraseValidationStatus {
     Validated,
     Unvalidated,
     NotApplicable,
 }
 
 impl PhraseValidationStatus {
-    const fn as_str(&self) -> &'static str {
+    pub(crate) const fn as_str(&self) -> &'static str {
         match self {
             Self::Validated => "validated",
             Self::Unvalidated => "unvalidated",
@@ -393,7 +393,7 @@ impl PhraseValidationStatus {
     }
 }
 
-struct PreForwardBudgetGuard<'a> {
+pub(crate) struct PreForwardBudgetGuard<'a> {
     state: &'a AppState,
     api_key: &'a str,
     wallet: &'a Pubkey,
@@ -401,7 +401,7 @@ struct PreForwardBudgetGuard<'a> {
 }
 
 impl<'a> PreForwardBudgetGuard<'a> {
-    fn new(state: &'a AppState, api_key: &'a str, wallet: &'a Pubkey) -> Self {
+    pub(crate) fn new(state: &'a AppState, api_key: &'a str, wallet: &'a Pubkey) -> Self {
         Self {
             state,
             api_key,
@@ -410,11 +410,11 @@ impl<'a> PreForwardBudgetGuard<'a> {
         }
     }
 
-    fn refund(mut self) {
+    pub(crate) fn refund(mut self) {
         self.refund_once();
     }
 
-    fn validator_reached(mut self) {
+    pub(crate) fn validator_reached(mut self) {
         self.refund_pending = false;
     }
 
@@ -468,6 +468,398 @@ fn validator_request_body(
     Ok(body)
 }
 
+/// The client IP and a bounded user agent.
+///
+/// The user agent is bounded before it is used or forwarded. It is the one attacker-controlled
+/// string that crosses the service boundary unmeasured: it goes into the origin hash, into
+/// logs, and into the body sent to the validator, where it counts against that service's own
+/// body limit. A browser sends a couple of hundred bytes. Anything past the bound is a client
+/// with something else in mind, and the prefix is all the origin hash needs.
+pub(crate) fn request_origin(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+) -> (std::net::IpAddr, &str) {
+    const MAX_USER_AGENT_BYTES: usize = 512;
+    let ip = crate::auth::client_ip::extract_client_ip(headers, peer)
+        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    let user_agent_raw = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    let user_agent = match user_agent_raw.char_indices().nth(MAX_USER_AGENT_BYTES) {
+        Some((cut, _)) => &user_agent_raw[..cut],
+        None => user_agent_raw,
+    };
+    (ip, user_agent)
+}
+
+/// Rejects a client IP under an active probing block, and clears an expired one.
+pub(crate) fn check_probing_block(state: &AppState, ip: std::net::IpAddr) -> Result<(), AppError> {
+    if let Some(expire_time) = state.probing_blocklist.get(&ip).map(|r| *r) {
+        let now = std::time::Instant::now();
+        if expire_time > now {
+            let retry_after_secs = expire_time.duration_since(now).as_secs();
+            tracing::warn!(
+                ip = %crate::auth::redact::redact_ip(ip),
+                retry_after_secs,
+                "Probing blocklist active for client IP"
+            );
+            return Err(AppError::IpRateLimited {
+                retry_after_secs: retry_after_secs.max(1),
+            });
+        } else {
+            state.probing_blocklist.remove(&ip);
+        }
+    }
+    Ok(())
+}
+
+/// Applies the cross-wallet cooldown. Logs every overlap and rejects only when enforced.
+pub(crate) fn check_cross_wallet_cooldown(
+    state: &AppState,
+    ip: std::net::IpAddr,
+    user_agent: &str,
+    wallet_id: &str,
+) -> Result<(), AppError> {
+    if let Err(remaining_secs) = state
+        .cross_wallet_cooldown
+        .check_cooldown(ip, user_agent, wallet_id)
+    {
+        tracing::warn!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+            ip = %crate::auth::redact::redact_ip(ip),
+            enforced = state.cross_wallet_cooldown_enforce,
+            remaining_secs,
+            "Cross-wallet verification cooldown active"
+        );
+        if state.cross_wallet_cooldown_enforce {
+            return Err(AppError::CrossWalletCooldownActive {
+                retry_after_secs: remaining_secs,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a browser that reports WebDriver, and logs automation and capture signals for
+/// calibration. The logging never affects a verdict.
+pub(crate) fn screen_client_signals(
+    state: &AppState,
+    wallet_id: &str,
+    client_signals: Option<&ClientSignals>,
+) -> Result<(), AppError> {
+    // A browser reporting navigator.webdriver === true
+    // is refused ahead of the validation round-trip, skipping the upstream call.
+    // The dev pass-through with no validator configured is unaffected. Framework
+    // `tells` are handled separately below. Disable for the team's own E2E
+    // automation via EXECUTOR_AUTOMATION_WEBDRIVER_REJECT=false.
+    //
+    if state.automation_webdriver_reject
+        && state.validation_url.is_some()
+        && client_signals
+            .and_then(|c| c.automation.as_ref())
+            .is_some_and(|a| a.webdriver)
+    {
+        tracing::info!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+            "Automated browser detected (navigator.webdriver) — rejecting verification"
+        );
+        return Err(AppError::ValidationFailed {
+            reason: Some("automated_browser_detected".into()),
+        });
+    }
+
+    // Log the automation signal for real-traffic calibration. Privacy-first:
+    // only automation-framework artifacts (WebDriver flag + framework labels)
+    // are reported, never fingerprints or user data, and a privacy-hardened
+    // browser (Tor / RFP) reports no webdriver flag and is never rejected.
+    if state.automation_observe {
+        let signals = client_signals;
+        match signals.and_then(|c| c.automation.as_ref()) {
+            Some(a) if a.webdriver || !a.tells.is_empty() => {
+                // Cap the logged labels so a malicious oversized payload can't
+                // bloat the log line; the full count is logged separately. `env`
+                // is attacker-controlled free text, so it is Debug-formatted
+                // (`?`) — like `tells` — to escape control chars and prevent
+                // log-line injection against the plaintext log subscriber.
+                let tells: Vec<&str> = a.tells.iter().take(16).map(String::as_str).collect();
+                tracing::info!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                    webdriver = a.webdriver,
+                    env = ?signals.and_then(|c| c.env.as_deref()).unwrap_or("unknown"),
+                    tell_count = a.tells.len(),
+                    tells = ?tells,
+                    schema = signals.map_or(0, |c| c.v),
+                    "Automation signal observed"
+                );
+            }
+            Some(_) => {
+                tracing::debug!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                    "Client signals present and clean"
+                );
+            }
+            None => tracing::debug!("No automation signals on request (older SDK or non-browser)"),
+        }
+        if let Some(c) = signals.and_then(|sig| sig.capture.as_ref()) {
+            if c.virtual_device || c.flatness.is_some() || c.centroid.is_some() {
+                tracing::info!(
+                    wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                    virtual_device = c.virtual_device,
+                    flatness = ?c.flatness,
+                    centroid = ?c.centroid,
+                    "Capture signals observed"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Records one wallet attempt, then deducts integrator quota. A wallet over its attempt cap
+/// fails first, so it never burns quota. The caller owns the refund from here on.
+pub(crate) fn admit_attempt(
+    state: &AppState,
+    api_key: &str,
+    wallet: &Pubkey,
+    wallet_id: &str,
+) -> Result<u64, AppError> {
+    if let Err(retry_after_secs) = state.wallet_attempts.check_and_record_attempt(wallet) {
+        tracing::info!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+            retry_after_secs,
+            "Wallet rate limited"
+        );
+        return Err(AppError::WalletRateLimited { retry_after_secs });
+    }
+
+    // From this point on, the wallet attempt slot is consumed. Every
+    // early-return path that does NOT correspond to a real validation
+    // failure must refund the slot — otherwise legitimate users would be
+    // counted against their per-wallet budget for infrastructure issues
+    // (integrator quota exhausted, validator unreachable, etc.).
+    match state.tracker.check_and_deduct(api_key) {
+        Ok(remaining) => Ok(remaining),
+        Err(e) => {
+            // Integrator quota exhausted — not the wallet's fault.
+            state.wallet_attempts.refund_on_success(wallet);
+            Err(e)
+        }
+    }
+}
+
+/// Verification timestamps from the on-chain identity account, oldest layouts included.
+fn recent_timestamps(identity_data: Option<&[u8]>) -> Vec<i64> {
+    let mut recent_timestamps = Vec::new();
+    if let Some(data) = identity_data {
+        if data.len() >= 8 && data[..8] == IDENTITY_DISCRIMINATOR {
+            // Offset for recent_timestamps is 127
+            // Struct layout: recent_timestamps is [i64; 52] = 416 bytes
+            if data.len() >= 127 + 52 * 8 {
+                for i in 0..52 {
+                    let offset = 127 + i * 8;
+                    let ts = i64::from_le_bytes(
+                        data[offset..offset + 8]
+                            .try_into()
+                            .expect("slice of 8 bytes is always convertible to [u8; 8]"),
+                    );
+                    if ts > 0 {
+                        recent_timestamps.push(ts);
+                    }
+                }
+            } else if data.len() > 127 {
+                // Support partial / legacy accounts if they were not realloc'd yet
+                let available_slots = (data.len() - 127) / 8;
+                for i in 0..available_slots {
+                    let offset = 127 + i * 8;
+                    let ts = i64::from_le_bytes(
+                        data[offset..offset + 8]
+                            .try_into()
+                            .expect("slice of 8 bytes is always convertible to [u8; 8]"),
+                    );
+                    if ts > 0 {
+                        recent_timestamps.push(ts);
+                    }
+                }
+            }
+        }
+    }
+    recent_timestamps
+}
+
+/// Reads the wallet's public on-chain reputation for the risk prior. A shared gate bounds
+/// concurrent reads, and a slow or failed read yields `None` instead of blocking the verdict.
+pub(crate) async fn observe_reputation(
+    state: &AppState,
+    wallet: &Pubkey,
+    wallet_id: &str,
+) -> Option<crate::reputation::WalletReputation> {
+    if state.wallet_reputation_observe {
+        if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
+            let client = state.relayer_tx.client();
+            let _permit = permit;
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(1500),
+                crate::reputation::fetch_wallet_reputation(&client, wallet),
+            )
+            .await
+            {
+                Ok(Ok(rep)) => Some(rep),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                        "Observe-only reputation fetch failed"
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                        "Observe-only reputation fetch timed out after 1500ms"
+                    );
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                "Reputation RPC gate saturated; skipping observe-only check"
+            );
+            None
+        }
+    } else {
+        None
+    }
+}
+
+/// Automation risk from client-reported WebDriver and framework labels. Client-reported
+/// acoustic realism is logged for calibration and never scored.
+pub(crate) fn automation_risk(client_signals: Option<&ClientSignals>, wallet_id: &str) -> f64 {
+    let mut automation_risk = 0.0;
+    if let Some(signals) = client_signals {
+        if let Some(a) = signals.automation.as_ref() {
+            if a.webdriver {
+                automation_risk = 1.0;
+            } else if !a.tells.is_empty() {
+                automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
+            }
+        }
+        // Client-reported acoustic realism is
+        // OBSERVE / TELEMETRY ONLY — spoofable (computed in the browser), so it
+        // MUST NOT feed the pass/fail decision. Log for calibration; do NOT add
+        // it to automation_risk. The un-forgeable acoustic check is computed
+        // server-side from the raw audio the validator already receives; wiring
+        // that into the composite requires separate calibration.
+        let acoustic_eval =
+            crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
+        if let Some(voice_isolation_applied) = signals
+            .capture
+            .as_ref()
+            .and_then(|capture| capture.voice_isolation_applied)
+        {
+            tracing::debug!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                voice_isolation_applied,
+                "CAPTURE_OBSERVATION: client-reported voice isolation state"
+            );
+        }
+        if acoustic_eval.risk_score > 0.0 {
+            tracing::info!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                virtual_device = acoustic_eval.virtual_device_detected,
+                flatness_out_of_bounds = acoustic_eval.flatness_out_of_bounds,
+                centroid_out_of_bounds = acoustic_eval.centroid_out_of_bounds,
+                acoustic_risk = acoustic_eval.risk_score,
+                "REALISM_OBSERVATION: client-reported acoustic anomaly (telemetry only, not scored)"
+            );
+        }
+    }
+    automation_risk
+}
+
+/// Reputation risk from the public balance and activity. An unread wallet scores the middle.
+pub(crate) fn reputation_risk(
+    reputation: Option<&crate::reputation::WalletReputation>,
+    wallet_id: &str,
+) -> f64 {
+    if let Some(rep) = reputation {
+        let sol_score = (rep.sol_lamports as f64 / 100_000_000.0).min(1.0);
+        let activity_score = (rep.signature_count as f64 / 10.0).min(1.0);
+        let rep_prior = 0.5 * sol_score + 0.5 * activity_score;
+        let mut risk = 1.0 - rep_prior;
+        if rep.sybil_risk > 0.0 {
+            risk = (risk + 0.5).min(1.0);
+            tracing::warn!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                parent_wallet = ?rep.parent_wallet.map(|p| p.to_string()),
+                "Sybil wallet funding activity detected! Parent wallet registered within 24h."
+            );
+        }
+        risk
+    } else {
+        0.5
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct ValidatorSuccessBody {
+    pub(crate) valid: bool,
+    pub(crate) phrase_validation_status: PhraseValidationStatus,
+    #[serde(default)]
+    pub(crate) signed_receipt: Option<SignedReceiptDto>,
+    #[serde(default)]
+    pub(crate) commitment_hex: Option<String>,
+    #[serde(default)]
+    pub(crate) salt_hex: Option<String>,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) biometric_risk: f64,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) tts_risk: f64,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) temporal_risk: f64,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) audio_realism_risk: f64,
+    #[serde(default)]
+    pub(crate) probing_detected: Option<bool>,
+    #[serde(default)]
+    pub(crate) study_record_status: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct ValidatorErrorBody {
+    #[serde(default)]
+    pub(crate) reason: Option<String>,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) biometric_risk: f64,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) tts_risk: f64,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) temporal_risk: f64,
+    #[serde(deserialize_with = "deserialize_risk_score")]
+    pub(crate) audio_realism_risk: f64,
+    #[serde(default)]
+    pub(crate) probing_detected: Option<bool>,
+    #[serde(default)]
+    pub(crate) study_record_status: Option<String>,
+}
+
+pub(crate) fn deserialize_risk_score<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <f64 as serde::Deserialize>::deserialize(deserializer)?;
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(value)
+    } else {
+        Err(serde::de::Error::custom(
+            "risk score must be finite and between zero and one",
+        ))
+    }
+}
+
 pub async fn validate_features_handler(
     State(state): State<AppState>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -510,130 +902,14 @@ pub async fn validate_features_handler(
     let expected_phrase = issued_challenge.as_ref().map(|(phrase, _)| phrase.clone());
 
     // Extract the client IP and user agent for the cross-wallet cooldown check.
-    let ip = crate::auth::client_ip::extract_client_ip(&headers, peer.map(|Extension(c)| c.0))
-        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
-
-    // Bounded before it is used or forwarded. This is the one attacker-
-    // controlled string that crosses the service boundary unmeasured: it goes
-    // into the origin hash, into logs, and into the body sent to the
-    // validator, where it counts against that service's own body limit. A
-    // browser sends a couple of hundred bytes; anything past the bound is a
-    // client with something else in mind, and the prefix is all the origin
-    // hash needs.
-    const MAX_USER_AGENT_BYTES: usize = 512;
-    let user_agent_raw = headers
-        .get(axum::http::header::USER_AGENT)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let user_agent = match user_agent_raw.char_indices().nth(MAX_USER_AGENT_BYTES) {
-        Some((cut, _)) => &user_agent_raw[..cut],
-        None => user_agent_raw,
-    };
+    let (ip, user_agent) = request_origin(&headers, peer.map(|Extension(c)| c.0));
 
     // Reject an active probing block before allocating validation resources.
-    if let Some(expire_time) = state.probing_blocklist.get(&ip).map(|r| *r) {
-        let now = std::time::Instant::now();
-        if expire_time > now {
-            let retry_after_secs = expire_time.duration_since(now).as_secs();
-            tracing::warn!(
-                ip = %crate::auth::redact::redact_ip(ip),
-                retry_after_secs,
-                "Probing blocklist active for client IP"
-            );
-            return Err(AppError::IpRateLimited {
-                retry_after_secs: retry_after_secs.max(1),
-            });
-        } else {
-            state.probing_blocklist.remove(&ip);
-        }
-    }
+    check_probing_block(&state, ip)?;
 
-    if let Err(remaining_secs) =
-        state
-            .cross_wallet_cooldown
-            .check_cooldown(ip, user_agent, &req.wallet_id)
-    {
-        tracing::warn!(
-            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            ip = %crate::auth::redact::redact_ip(ip),
-            enforced = state.cross_wallet_cooldown_enforce,
-            remaining_secs,
-            "Cross-wallet verification cooldown active"
-        );
-        if state.cross_wallet_cooldown_enforce {
-            return Err(AppError::CrossWalletCooldownActive {
-                retry_after_secs: remaining_secs,
-            });
-        }
-    }
+    check_cross_wallet_cooldown(&state, ip, user_agent, &req.wallet_id)?;
 
-    // A browser reporting navigator.webdriver === true
-    // is refused ahead of the validation round-trip, skipping the upstream call.
-    // The dev pass-through with no validator configured is unaffected. Framework
-    // `tells` are handled separately below. Disable for the team's own E2E
-    // automation via EXECUTOR_AUTOMATION_WEBDRIVER_REJECT=false.
-    //
-    if state.automation_webdriver_reject
-        && state.validation_url.is_some()
-        && req
-            .client_signals
-            .as_ref()
-            .and_then(|c| c.automation.as_ref())
-            .is_some_and(|a| a.webdriver)
-    {
-        tracing::info!(
-            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            "Automated browser detected (navigator.webdriver) — rejecting verification"
-        );
-        return Err(AppError::ValidationFailed {
-            reason: Some("automated_browser_detected".into()),
-        });
-    }
-
-    // Log the automation signal for real-traffic calibration. Privacy-first:
-    // only automation-framework artifacts (WebDriver flag + framework labels)
-    // are reported, never fingerprints or user data, and a privacy-hardened
-    // browser (Tor / RFP) reports no webdriver flag and is never rejected.
-    if state.automation_observe {
-        let signals = req.client_signals.as_ref();
-        match signals.and_then(|c| c.automation.as_ref()) {
-            Some(a) if a.webdriver || !a.tells.is_empty() => {
-                // Cap the logged labels so a malicious oversized payload can't
-                // bloat the log line; the full count is logged separately. `env`
-                // is attacker-controlled free text, so it is Debug-formatted
-                // (`?`) — like `tells` — to escape control chars and prevent
-                // log-line injection against the plaintext log subscriber.
-                let tells: Vec<&str> = a.tells.iter().take(16).map(String::as_str).collect();
-                tracing::info!(
-                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                    webdriver = a.webdriver,
-                    env = ?signals.and_then(|c| c.env.as_deref()).unwrap_or("unknown"),
-                    tell_count = a.tells.len(),
-                    tells = ?tells,
-                    schema = signals.map_or(0, |c| c.v),
-                    "Automation signal observed"
-                );
-            }
-            Some(_) => {
-                tracing::debug!(
-                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                    "Client signals present and clean"
-                );
-            }
-            None => tracing::debug!("No automation signals on request (older SDK or non-browser)"),
-        }
-        if let Some(c) = signals.and_then(|sig| sig.capture.as_ref()) {
-            if c.virtual_device || c.flatness.is_some() || c.centroid.is_some() {
-                tracing::info!(
-                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                    virtual_device = c.virtual_device,
-                    flatness = ?c.flatness,
-                    centroid = ?c.centroid,
-                    "Capture signals observed"
-                );
-            }
-        }
-    }
+    screen_client_signals(&state, &req.wallet_id, req.client_signals.as_ref())?;
 
     // Record each admitted wallet attempt atomically
     // under a single DashMap entry write lock — concurrent requests for
@@ -643,28 +919,7 @@ pub async fn validate_features_handler(
     //
     // Sequenced before integrator quota so a rate-limited wallet doesn't
     // burn the integrator's quota.
-    if let Err(retry_after_secs) = state.wallet_attempts.check_and_record_attempt(&wallet) {
-        tracing::info!(
-            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            retry_after_secs,
-            "Wallet rate limited"
-        );
-        return Err(AppError::WalletRateLimited { retry_after_secs });
-    }
-
-    // From this point on, the wallet attempt slot is consumed. Every
-    // early-return path that does NOT correspond to a real validation
-    // failure must refund the slot — otherwise legitimate users would be
-    // counted against their per-wallet budget for infrastructure issues
-    // (integrator quota exhausted, validator unreachable, etc.).
-    let remaining = match state.tracker.check_and_deduct(&api_key) {
-        Ok(r) => r,
-        Err(e) => {
-            // Integrator quota exhausted — not the wallet's fault.
-            state.wallet_attempts.refund_on_success(&wallet);
-            return Err(e);
-        }
-    };
+    let remaining = admit_attempt(&state, &api_key, &wallet, &req.wallet_id)?;
     let budget_guard = PreForwardBudgetGuard::new(&state, &api_key, &wallet);
 
     // Observe-only wallet reputation reads the
@@ -731,11 +986,6 @@ pub async fn validate_features_handler(
         }
     }
 
-    // Fetch user's verification timestamps from on-chain IdentityState
-    let (identity_pda, _) = Pubkey::find_program_address(
-        &[b"identity", wallet.as_ref()],
-        &state.validation_identity_program,
-    );
     if req
         .study
         .as_ref()
@@ -745,17 +995,8 @@ pub async fn validate_features_handler(
             "Study projection version does not match the validation request".into(),
         ));
     }
-    let identity_result = state
-        .relayer_tx
-        .client()
-        .get_owned_account_data(&identity_pda, &state.validation_identity_program)
-        .await;
-    let identity_data = identity_result?;
-    let projection_intent = derive_projection_intent(
-        identity_data.as_deref(),
-        projection_version,
-        req.baseline_reset,
-    )?;
+    let (projection_intent, recent_timestamps) =
+        identity_intent(&state, &wallet, projection_version, req.baseline_reset).await?;
     validate_projection_compatibility_evidence(
         projection_version,
         projection_intent,
@@ -781,40 +1022,6 @@ pub async fn validate_features_handler(
             study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
         }));
     };
-    let mut recent_timestamps = Vec::new();
-    if let Some(data) = identity_data {
-        if data.len() >= 8 && data[..8] == IDENTITY_DISCRIMINATOR {
-            // Offset for recent_timestamps is 127
-            // Struct layout: recent_timestamps is [i64; 52] = 416 bytes
-            if data.len() >= 127 + 52 * 8 {
-                for i in 0..52 {
-                    let offset = 127 + i * 8;
-                    let ts = i64::from_le_bytes(
-                        data[offset..offset + 8]
-                            .try_into()
-                            .expect("slice of 8 bytes is always convertible to [u8; 8]"),
-                    );
-                    if ts > 0 {
-                        recent_timestamps.push(ts);
-                    }
-                }
-            } else if data.len() > 127 {
-                // Support partial / legacy accounts if they were not realloc'd yet
-                let available_slots = (data.len() - 127) / 8;
-                for i in 0..available_slots {
-                    let offset = 127 + i * 8;
-                    let ts = i64::from_le_bytes(
-                        data[offset..offset + 8]
-                            .try_into()
-                            .expect("slice of 8 bytes is always convertible to [u8; 8]"),
-                    );
-                    if ts > 0 {
-                        recent_timestamps.push(ts);
-                    }
-                }
-            }
-        }
-    }
 
     // Build request to internal validation service. Forward time-series and
     // audio fields unchanged — the validation service handles absence of any
@@ -841,45 +1048,7 @@ pub async fn validate_features_handler(
 
     // Run the validator request and the wallet reputation fetch in parallel.
     // RPC fetch shares a semaphored concurrency limit.
-    let reputation_future = async {
-        if state.wallet_reputation_observe {
-            if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
-                let client = state.relayer_tx.client();
-                let _permit = permit;
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(1500),
-                    crate::reputation::fetch_wallet_reputation(&client, &wallet),
-                )
-                .await
-                {
-                    Ok(Ok(rep)) => Some(rep),
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            error = %e,
-                            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                            "Observe-only reputation fetch failed"
-                        );
-                        None
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                            "Observe-only reputation fetch timed out after 1500ms"
-                        );
-                        None
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                    "Reputation RPC gate saturated; skipping observe-only check"
-                );
-                None
-            }
-        } else {
-            None
-        }
-    };
+    let reputation_future = observe_reputation(&state, &wallet, &req.wallet_id);
 
     let (response_res, reputation_opt) = tokio::join!(request.send(), reputation_future);
 
@@ -906,122 +1075,10 @@ pub async fn validate_features_handler(
     state.metrics.increment_validations();
 
     // WebDriver and framework labels currently feed automation risk.
-    let mut automation_risk = 0.0;
-    if let Some(signals) = req.client_signals.as_ref() {
-        if let Some(a) = signals.automation.as_ref() {
-            if a.webdriver {
-                automation_risk = 1.0;
-            } else if !a.tells.is_empty() {
-                automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
-            }
-        }
-        // Client-reported acoustic realism is
-        // OBSERVE / TELEMETRY ONLY — spoofable (computed in the browser), so it
-        // MUST NOT feed the pass/fail decision. Log for calibration; do NOT add
-        // it to automation_risk. The un-forgeable acoustic check is computed
-        // server-side from the raw audio the validator already receives; wiring
-        // that into the composite requires separate calibration.
-        let acoustic_eval =
-            crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
-        if let Some(voice_isolation_applied) = signals
-            .capture
-            .as_ref()
-            .and_then(|capture| capture.voice_isolation_applied)
-        {
-            tracing::debug!(
-                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                voice_isolation_applied,
-                "CAPTURE_OBSERVATION: client-reported voice isolation state"
-            );
-        }
-        if acoustic_eval.risk_score > 0.0 {
-            tracing::info!(
-                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                virtual_device = acoustic_eval.virtual_device_detected,
-                flatness_out_of_bounds = acoustic_eval.flatness_out_of_bounds,
-                centroid_out_of_bounds = acoustic_eval.centroid_out_of_bounds,
-                acoustic_risk = acoustic_eval.risk_score,
-                "REALISM_OBSERVATION: client-reported acoustic anomaly (telemetry only, not scored)"
-            );
-        }
-    }
+    let automation_risk = automation_risk(req.client_signals.as_ref(), &req.wallet_id);
 
     // Reputation risk
-    let reputation_risk = if let Some(rep) = &reputation_opt {
-        let sol_score = (rep.sol_lamports as f64 / 100_000_000.0).min(1.0);
-        let activity_score = (rep.signature_count as f64 / 10.0).min(1.0);
-        let rep_prior = 0.5 * sol_score + 0.5 * activity_score;
-        let mut risk = 1.0 - rep_prior;
-        if rep.sybil_risk > 0.0 {
-            risk = (risk + 0.5).min(1.0);
-            tracing::warn!(
-                wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-                parent_wallet = ?rep.parent_wallet.map(|p| p.to_string()),
-                "Sybil wallet funding activity detected! Parent wallet registered within 24h."
-            );
-        }
-        risk
-    } else {
-        0.5
-    };
-
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct ValidatorSuccessBody {
-        valid: bool,
-        phrase_validation_status: PhraseValidationStatus,
-        #[serde(default)]
-        signed_receipt: Option<SignedReceiptDto>,
-        #[serde(default)]
-        commitment_hex: Option<String>,
-        #[serde(default)]
-        salt_hex: Option<String>,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        biometric_risk: f64,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        tts_risk: f64,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        temporal_risk: f64,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        audio_realism_risk: f64,
-        #[serde(default)]
-        probing_detected: Option<bool>,
-        #[serde(default)]
-        study_record_status: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct ValidatorErrorBody {
-        #[serde(default)]
-        reason: Option<String>,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        biometric_risk: f64,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        tts_risk: f64,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        temporal_risk: f64,
-        #[serde(deserialize_with = "deserialize_risk_score")]
-        audio_realism_risk: f64,
-        #[serde(default)]
-        probing_detected: Option<bool>,
-        #[serde(default)]
-        study_record_status: Option<String>,
-    }
-
-    fn deserialize_risk_score<'de, D>(deserializer: D) -> Result<f64, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        let value = <f64 as serde::Deserialize>::deserialize(deserializer)?;
-        if value.is_finite() && (0.0..=1.0).contains(&value) {
-            Ok(value)
-        } else {
-            Err(serde::de::Error::custom(
-                "risk score must be finite and between zero and one",
-            ))
-        }
-    }
+    let reputation_risk = reputation_risk(reputation_opt.as_ref(), &req.wallet_id);
 
     let upstream_status = response.status();
     if !upstream_status.is_success() {
@@ -1137,14 +1194,6 @@ pub async fn validate_features_handler(
         body.study_record_status,
     );
 
-    let composite_risk_score = state.scoring_config.score(&RiskComponents {
-        biometric: biometric_risk,
-        tts: tts_risk,
-        temporal: temporal_risk,
-        automation: automation_risk,
-        reputation: reputation_risk,
-    });
-
     tracing::info!(
         api_key = %crate::auth::redact::redact_api_key(&api_key),
         wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
@@ -1158,29 +1207,19 @@ pub async fn validate_features_handler(
         "Feature validation passed biometric checks"
     );
 
-    // Apply policy threshold: high risk rejects. Strict, so a score landing
-    // exactly on the threshold passes.
-    if state.scoring_config.rejects(composite_risk_score) {
-        tracing::warn!(
-            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            "Validation rejected: Composite risk score exceeds threshold"
-        );
-        return Err(validation_failure(None, study_record_status.as_deref()));
-    }
-
-    // Require another capture while the score remains in the suspicious range.
-    if state.scoring_config.requires_friction(composite_risk_score) {
-        tracing::warn!(
-            wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
-            "Validation flagged: Composite risk score requires another capture"
-        );
-        return Err(validation_failure(
-            Some("captcha_required".to_string()),
-            study_record_status.as_deref(),
-        ));
-    }
-
-    state.wallet_attempts.refund_on_success(&wallet);
+    score_success(
+        &state,
+        &wallet,
+        &req.wallet_id,
+        &RiskComponents {
+            biometric: biometric_risk,
+            tts: tts_risk,
+            temporal: temporal_risk,
+            automation: automation_risk,
+            reputation: reputation_risk,
+        },
+        study_record_status.as_deref(),
+    )?;
 
     Ok(PaddedJson(ValidateFeaturesResponse {
         valid: true,
@@ -1192,7 +1231,69 @@ pub async fn validate_features_handler(
     }))
 }
 
-fn validation_failure(reason: Option<String>, study_record_status: Option<&str>) -> AppError {
+/// Reads the wallet's identity account once, and returns what this validation may do with it
+/// and the wallet's recent verification timestamps.
+pub(crate) async fn identity_intent(
+    state: &AppState,
+    wallet: &Pubkey,
+    projection_version: u16,
+    baseline_reset: bool,
+) -> Result<(ProjectionIntent, Vec<i64>), AppError> {
+    let (identity_pda, _) = Pubkey::find_program_address(
+        &[b"identity", wallet.as_ref()],
+        &state.validation_identity_program,
+    );
+    let identity_data = state
+        .relayer_tx
+        .client()
+        .get_owned_account_data(&identity_pda, &state.validation_identity_program)
+        .await?;
+    let intent =
+        derive_projection_intent(identity_data.as_deref(), projection_version, baseline_reset)?;
+    Ok((intent, recent_timestamps(identity_data.as_deref())))
+}
+
+/// Applies the composite risk policy to a validator pass, and returns the wallet's attempt when
+/// the pass stands.
+pub(crate) fn score_success(
+    state: &AppState,
+    wallet: &Pubkey,
+    wallet_id: &str,
+    risks: &RiskComponents,
+    study_record_status: Option<&str>,
+) -> Result<(), AppError> {
+    let composite_risk_score = state.scoring_config.score(risks);
+
+    // Apply policy threshold: high risk rejects. Strict, so a score landing
+    // exactly on the threshold passes.
+    if state.scoring_config.rejects(composite_risk_score) {
+        tracing::warn!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+            "Validation rejected: Composite risk score exceeds threshold"
+        );
+        return Err(validation_failure(None, study_record_status));
+    }
+
+    // Require another capture while the score remains in the suspicious range.
+    if state.scoring_config.requires_friction(composite_risk_score) {
+        tracing::warn!(
+            wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+            "Validation flagged: Composite risk score requires another capture"
+        );
+        return Err(validation_failure(
+            Some("captcha_required".to_string()),
+            study_record_status,
+        ));
+    }
+
+    state.wallet_attempts.refund_on_success(wallet);
+    Ok(())
+}
+
+pub(crate) fn validation_failure(
+    reason: Option<String>,
+    study_record_status: Option<&str>,
+) -> AppError {
     match study_record_status {
         Some(status) => AppError::StudyValidationFailed {
             reason,
@@ -1202,7 +1303,7 @@ fn validation_failure(reason: Option<String>, study_record_status: Option<&str>)
     }
 }
 
-fn refund_infrastructure_failure(state: &AppState, api_key: &str, wallet: &Pubkey) {
+pub(crate) fn refund_infrastructure_failure(state: &AppState, api_key: &str, wallet: &Pubkey) {
     state.tracker.refund(api_key);
     state.wallet_attempts.refund_on_success(wallet);
 }
