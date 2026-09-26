@@ -443,10 +443,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_gate: Arc::new(tokio::sync::Semaphore::new(
             config.paired_session_concurrency,
         )),
+        paired_wallets: config.paired_wallets.clone().map(Arc::new),
     };
     tracing::info!(
         paired_enabled = config.paired_enabled,
         paired_session_concurrency = config.paired_session_concurrency,
+        paired_wallet_allowlist = ?config.paired_wallets.as_ref().map(|wallets| wallets.len()),
         "Paired session routes"
     );
 

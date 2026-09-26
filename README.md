@@ -38,6 +38,8 @@ A paired session runs three rounds of one word and one short path. The validator
 round state, so this service keeps none. Opening and committing are untimed, and the finalize
 request goes through the same timing floor, quota and admission checks as
 `/validate-features`. The paired routes answer 404 until `EXECUTOR_PAIRED_ENABLED` is set.
+With `EXECUTOR_PAIRED_WALLETS` set, only the listed wallets can open a session. Any other wallet
+gets the same 404, and clients fall back to the single capture.
 
 Paired rounds show that the client fixed each round's evidence before the next round was
 revealed. They show nothing more about where that evidence came from.
@@ -117,6 +119,7 @@ Production refuses the dev validator pass-through and permissive CORS mode.
 | `VALIDATION_CROSS_WALLET_COOLDOWN_ENFORCE` | `false` | Enforce the cooldown when enabled |
 | `EXECUTOR_PAIRED_ENABLED` | `false` | Serve the paired-session routes |
 | `EXECUTOR_PAIRED_SESSION_CONCURRENCY` | `16` | Paired finalize requests buffered at once. Allowed range: 1-128. |
+| `EXECUTOR_PAIRED_WALLETS` | unset | Comma-separated wallets allowed to open paired sessions. Unset admits every wallet. |
 
 Do not place keypairs or API credentials in source control.
 

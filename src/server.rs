@@ -80,6 +80,8 @@ pub struct AppState {
     pub paired_enabled: bool,
     /// Bounds paired finalize requests buffered at once.
     pub session_gate: Arc<tokio::sync::Semaphore>,
+    /// Wallets allowed to open paired sessions. `None` admits every wallet.
+    pub paired_wallets: Option<Arc<std::collections::HashSet<solana_sdk::pubkey::Pubkey>>>,
 }
 
 async fn auth_middleware(
@@ -543,6 +545,7 @@ pub fn build_test_state(
         probing_blocklist: Arc::new(dashmap::DashMap::new()),
         paired_enabled: false,
         session_gate: Arc::new(tokio::sync::Semaphore::new(16)),
+        paired_wallets: None,
     }
 }
 
