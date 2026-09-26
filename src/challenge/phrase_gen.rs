@@ -30,7 +30,7 @@ use super::word_dict;
 ///
 /// Uses `rand::thread_rng()` for unpredictable output (cryptographically
 /// adequate for challenge issuance; the phrase is bound to a fresh nonce
-/// with a 60s TTL, so the window for an attacker to exploit predicted
+/// with a bounded TTL, so the window for an attacker to exploit predicted
 /// output is narrow even without a CSPRNG).
 pub fn generate_phrase(word_count: usize) -> String {
     if word_count == 0 {

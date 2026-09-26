@@ -22,7 +22,9 @@ const VALIDATION_URL_AUTHORITY_BS58: &str = "GYm3f7DTvTZ6dN1Gfe7UowHRerxTU4FK2u1
 /// from another tool that happens to be signed by the same authority key
 /// from being a valid validator-URL signature here.
 const VALIDATION_URL_DOMAIN_PREFIX: &str = "Entros-VALIDATOR-URL-V1:";
-const DEFAULT_CHALLENGE_TTL_SECS: u64 = 60;
+/// Long enough that a client starting capture with two minutes of lifetime left can open
+/// capture on a fresh nonce. At 60 seconds every capture-start check would refuse.
+const DEFAULT_CHALLENGE_TTL_SECS: u64 = 180;
 /// Limits replay exposure and live nonce retention to five minutes.
 const MAX_CHALLENGE_TTL_SECS: u64 = 300;
 
@@ -892,7 +894,7 @@ mod tests {
 
     #[test]
     fn challenge_ttl_defaults_and_accepts_the_bounded_range() {
-        assert_eq!(parse_challenge_ttl_secs(None).unwrap(), 60);
+        assert_eq!(parse_challenge_ttl_secs(None).unwrap(), 180);
         assert_eq!(parse_challenge_ttl_secs(Some("1")).unwrap(), 1);
         assert_eq!(parse_challenge_ttl_secs(Some("300")).unwrap(), 300);
     }
