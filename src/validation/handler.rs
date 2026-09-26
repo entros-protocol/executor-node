@@ -263,7 +263,7 @@ pub enum StudyCaptureClass {
     NativeAndroid,
 }
 
-/// Coarse curve-trace outline payload (touch-curve Stage 1). Equal-time
+/// Coarse curve-trace outline payload, logged observe-only. Equal-time
 /// resampled `{x,y}` points in the client 200x200 viewBox frame plus the
 /// outline's wall-clock span. Optional/additive — older SDKs omit it.
 #[derive(Deserialize)]
@@ -745,12 +745,10 @@ pub(crate) fn automation_risk(client_signals: Option<&ClientSignals>, wallet_id:
                 automation_risk = (a.tells.len() as f64 * 0.5).min(1.0);
             }
         }
-        // Client-reported acoustic realism is
-        // OBSERVE / TELEMETRY ONLY — spoofable (computed in the browser), so it
-        // MUST NOT feed the pass/fail decision. Log for calibration; do NOT add
-        // it to automation_risk. The un-forgeable acoustic check is computed
-        // server-side from the raw audio the validator already receives; wiring
-        // that into the composite requires separate calibration.
+        // Client-reported acoustic realism is observe and telemetry only. It is
+        // computed in the browser, so it MUST NOT feed the pass/fail decision or
+        // automation_risk. Log it for calibration. The validation service
+        // computes its own acoustic check from the audio it receives.
         let acoustic_eval =
             crate::validation::audio::evaluate_acoustic_realism(signals.capture.as_ref());
         if let Some(voice_isolation_applied) = signals

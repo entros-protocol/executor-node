@@ -8,10 +8,6 @@
 //! It is not a precision check. The curve is a complexity and temporal-coupling
 //! prompt rather than a 1:1 tracing test, so traces that are near the lines,
 //! incomplete, and imperfect are expected and accepted by design.
-//!
-//! Calibration history, scoring status, and the reasoning behind each constant
-//! are recorded internally in `docs/reference/EXECUTOR-SCORING-INTERNALS.md`.
-//! This repository is public; keep comments here factual.
 
 use crate::challenge::lissajous::LissajousParams;
 
@@ -21,12 +17,11 @@ const CURVE_SIZE: f64 = 100.0;
 
 /// The five anchor positions the curve box can sit at (`registry::generate` /
 /// `pulse-challenge.tsx` `lissajousAnchor`). `region_score` takes the best fit
-/// across all five, so it never depends on knowing which anchor the client
-/// rendered — at the cost of also accepting a gesture made in the *wrong* box.
-/// The wallet-connected client does honour the server's anchor
-/// (`pulse-challenge.tsx`: `curve.anchorX` when present), and it is the only path
-/// that sends an outline, so `region_score_issued_anchor` measures the stricter
-/// alternative alongside it for Stage 1b to choose between.
+/// across all five, so it does not depend on knowing which anchor the client
+/// rendered. The wallet-connected client renders the server's anchor
+/// (`pulse-challenge.tsx`: `curve.anchorX` when present) and is the only path
+/// that sends an outline, so `region_score_issued_anchor` also scores the issued
+/// anchor alone.
 const ANCHORS: [(f64, f64); 5] = [
     (0.0, 0.0),
     (100.0, 0.0),
@@ -46,8 +41,7 @@ const PROXIMITY_BAND: f64 = 25.0;
 const MIN_PATH_LENGTH: f64 = 40.0;
 
 /// A single equal-time segment longer than this reads as a discontinuity rather
-/// than a continuous gesture. Calibration status and history:
-/// docs/reference/EXECUTOR-SCORING-INTERNALS.md
+/// than a continuous gesture.
 const TELEPORT_SEGMENT: f64 = 60.0;
 
 /// Minimum coefficient of variation of per-segment speed. Real tracing speeds up
@@ -58,27 +52,21 @@ const MIN_SPEED_COV: f64 = 0.15;
 /// consecutive trace samples, in reference-point indices — the load-bearing
 /// parameter of the alignment residual.
 ///
-/// It is swept rather than fixed because the parameter has a **cliff on the low
-/// side**, measured on live traffic 2026-07-26: the cursor advances at most
+/// The parameter has a **cliff on the low side**. The cursor advances at most
 /// `window` indices per sample, so once a genuine trace outruns it the lag
-/// compounds and can never be recovered. Windows 8 and 16 inverted outright — a
-/// fast honest trace scored 46.9/48.0 against 37.9/30.8 for a rapid in-region
-/// scribble — and window 24 inverted too (honest 34.1 vs scribble 23.5). Both were
-/// dropped from the sweep. Too small is not "stricter", it is *wrong*, so the
-/// window is chosen generously and the discrimination lives in the threshold.
+/// compounds and can never be recovered, and a fast honest trace scores worse than
+/// a slow one. A small window is not "stricter", it is *wrong*, so the window is
+/// chosen generously and the discrimination lives in the threshold.
 ///
-/// The top end is bounded by the same data. As the window widens the residual
-/// decays toward `median_deviation` — at the limit the cursor reaches any index and
-/// the metric degenerates into the plain proximity it exists to replace. Window 40
-/// is where the honest trace had already converged to its own proximity floor (8.9
-/// against a deviation of 8.1, a ratio of 1.10) while the scribbles were still far
-/// above theirs (17.1 against 4.8, a ratio of 3.55). Widening past the point where
-/// honest traces converge can only help an attacker. The assertions below keep the
-/// sweep ascending and at least 4x clear of the curve's own resolution.
+/// The top end is bounded too. As the window widens the residual decays toward
+/// `median_deviation`: at the limit the cursor reaches any index and the metric
+/// degenerates into the plain proximity it exists to replace. The window should
+/// sit where honest traces have converged to their own proximity floor and no
+/// wider. The assertions below keep the sweep ascending and at least 4x clear of
+/// the curve's own resolution.
 ///
-/// Stage 1 logs the whole sweep so the window and threshold come from real traces
-/// instead of from synthetic fixtures (which mispredicted the window). Stage 1b
-/// collapses this to the single chosen value.
+/// Every window in the sweep is scored and logged, so the window and threshold
+/// can be chosen from real traces rather than synthetic fixtures.
 const ALIGNMENT_WINDOW_SWEEP: [usize; 4] = [24, 32, 40, 48];
 
 /// Resolution the server issues curves at (`LissajousParams::generate`).
@@ -108,11 +96,11 @@ const _: () = {
 /// on the curve, so starts are swept; every 4th index is ample given the curve is
 /// sampled at 200 points and consecutive points sit ~1-2 units apart.
 ///
-/// Doubling this halves the scoring cost, but it is deliberately NOT done during
-/// calibration: at stride 8 two degenerate fixtures shift (48.4 -> 48.8, 29.6 ->
-/// 31.1), and every datapoint gathered so far was measured at stride 4. Comparable
-/// numbers across devices are worth more than a fraction of a millisecond of
-/// detached CPU. Revisit once Stage 1b collapses the sweep to one window.
+/// Doubling this halves the scoring cost but shifts the residual on some
+/// degenerate fixtures, and logged residuals are only comparable when they share
+/// a stride. Comparable numbers across devices are worth more than a fraction of
+/// a millisecond of detached CPU, so keep the stride fixed while the sweep is
+/// logged.
 const ALIGNMENT_START_STRIDE: usize = 4;
 
 /// Hard cap on the number of trace points scored. A real equal-time outline is
@@ -138,8 +126,8 @@ const _: () = assert!(ALIGNMENT_MAX_POINTS > 1);
 const CURVE_TRACE_ENVELOPE: f64 = 10_000.0;
 
 /// Scores plus raw sub-metrics for one curve-trace outline. The sub-metrics are
-/// logged for Stage 1 calibration; `region_score` and `kinematic_score` are the
-/// headline signals.
+/// logged for calibration; `region_score` and `kinematic_score` are the headline
+/// signals.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CurveTraceReport {
     /// [0,1] fraction of trace points within the proximity band of the curve, at
@@ -151,10 +139,9 @@ pub struct CurveTraceReport {
     /// Median nearest-distance to the curve, viewBox units, at the best anchor.
     pub median_deviation: f64,
     /// [0,1] fraction in band scored at the *issued* anchor only, rather than the
-    /// best-fitting of the five. Observe-only companion to `region_score`: the
-    /// wallet-connected client honours the server anchor, so if this tracks
-    /// `region_score` on real traffic the best-of-five search can be dropped, which
-    /// would restore the positional binding that the search currently gives away.
+    /// best-fitting of the five. Observe-only companion to `region_score` that
+    /// binds the trace to the issued position, since the wallet-connected client
+    /// renders the server's anchor.
     pub region_score_issued_anchor: f64,
     /// Median nearest-distance at the *issued* anchor, viewBox units. Shares a
     /// frame with `alignment_residuals`, so `residual - median_deviation_issued_anchor`
@@ -555,9 +542,9 @@ pub fn score_curve_trace(
 mod tests {
     use super::*;
 
-    /// Window the live 2026-07-26 calibration selected: the narrower ones inverted
-    /// on real traces, and honest traces had converged to their proximity floor by
-    /// this point. Assertions are written against it rather than a swept extreme.
+    /// A mid-sweep window, wide enough that honest traces have converged to their
+    /// proximity floor. Assertions are written against it rather than a swept
+    /// extreme.
     const TEST_WINDOW: usize = 40;
 
     /// Residual at [`TEST_WINDOW`], by position in the sweep.
@@ -861,15 +848,17 @@ mod tests {
             .collect()
     }
 
-    /// Manual calibration helper for Stage 1b. Answers the two questions any
-    /// enforcement threshold depends on:
-    ///   (1) does a *continuous* in-box scribble separate from an honest trace?
-    ///   (2) does `region_score` bind to the *issued* curve, or merely to "in the box"?
+    /// Manual calibration helper. Prints the scores any enforcement threshold
+    /// depends on:
+    ///   (1) a *continuous* in-box scribble against an honest trace,
+    ///   (2) `region_score` for a trace of one curve scored against another,
+    ///   (3) sensitivity to the issued phase offset,
+    ///   (4) scoring cost per verification.
     /// Run:
-    ///   cargo test print_stage1b_calibration -- --ignored --nocapture
+    ///   cargo test print_alignment_calibration -- --ignored --nocapture
     #[test]
     #[ignore = "manual calibration helper; run with --ignored --nocapture"]
-    fn print_stage1b_calibration() {
+    fn print_alignment_calibration() {
         const CAPTURE_MS: f64 = 12_000.0;
         let params = test_params((50, 50));
         let anchor = (50.0, 50.0);
@@ -894,9 +883,8 @@ mod tests {
                 scribble_trace(anchor, 64, cycles),
             ));
         }
-        // What does best-of-5-anchor region actually still reject? The four corner
-        // anchors tile the whole 200x200 frame, so a trace spread across the entire
-        // frame is the honest worst case for the check's remaining power.
+        // The four corner anchors tile the whole 200x200 frame, so a trace spread
+        // across the entire frame is the boundary case for best-of-five scoring.
         let full_frame: Vec<(f64, f64)> = (0..64)
             .map(|i| {
                 let a = ((i as f64) * 12.9898).sin() * 43758.5453;
@@ -905,7 +893,7 @@ mod tests {
             })
             .collect();
         cases.push(("scatter over whole frame".to_string(), full_frame));
-        // Concentrated in a box, but the WRONG anchor from the one issued.
+        // Concentrated in a box at an anchor other than the issued one.
         cases.push((
             "scribble in a different box".to_string(),
             scribble_trace((100.0, 100.0), 64, 3.0),
@@ -1180,9 +1168,9 @@ mod tests {
     #[test]
     fn honest_trace_stays_aligned_at_every_swept_window() {
         // The safety property: an honest trace must not depend on which window is
-        // chosen. Window 8 inverted on *live* traces (see ALIGNMENT_WINDOW_SWEEP),
-        // so the sweep exists to pick the window from data — but no window may
-        // false-reject a clean trace.
+        // chosen. Small windows penalise fast honest traces (see
+        // ALIGNMENT_WINDOW_SWEEP), so the sweep exists to pick the window from
+        // data, but no window may false-reject a clean trace.
         //
         // Note the residual is deliberately NOT asserted to fall monotonically with
         // a wider window. The cursor is greedy and path-dependent, so a wider reach
@@ -1227,15 +1215,14 @@ mod tests {
 
     #[test]
     fn issued_anchor_region_rejects_the_wrong_box() {
-        // Best-of-five anchoring accepts a gesture made in any box; scoring at the
-        // issued anchor alone is what would restore positional binding. Both are
-        // logged in Stage 1 so the choice can be made from real traffic.
+        // Best-of-five anchoring is position-free; scoring at the issued anchor
+        // alone binds the trace to the issued position. Both scores are logged.
         let params = test_params((50, 50));
         let trace = scribble_trace((100.0, 100.0), 64, 3.0);
         let report = score_curve_trace(&trace, 12_000.0, &params);
         assert!(
             report.region_score > 0.95,
-            "best-of-five accepts the wrong box, got {}",
+            "best-of-five region score, got {}",
             report.region_score
         );
         assert!(

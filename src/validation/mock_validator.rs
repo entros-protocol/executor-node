@@ -236,8 +236,8 @@ pub fn state_with_mock_validator(
     state
 }
 
-/// A success body shaped like `entros-validation`'s `ValidateResponse` with the
-/// given risk components. Optional fields are omitted, not nulled, exactly as
+/// A success body shaped like the validation service's `ValidateResponse` with
+/// the given risk components. Optional fields are omitted, not nulled, exactly as
 /// the real validator's `skip_serializing_if` produces.
 pub fn success_body(biometric: f64, tts: f64, temporal: f64) -> Value {
     serde_json::json!({
@@ -250,7 +250,7 @@ pub fn success_body(biometric: f64, tts: f64, temporal: f64) -> Value {
     })
 }
 
-/// A rejection body shaped like `entros-validation`'s `ErrorResponse`.
+/// A rejection body shaped like the validation service's `ErrorResponse`.
 pub fn error_body(reason: &str) -> Value {
     serde_json::json!({
         "error": "Verification failed",

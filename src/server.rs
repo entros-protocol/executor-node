@@ -66,7 +66,7 @@ pub struct AppState {
     /// Gates the detached on-chain reputation read in `validate_features_handler`;
     /// never affects the verification decision, quota, or latency.
     pub wallet_reputation_observe: bool,
-    /// Observe-only curve-trace region/kinematics logging (touch-curve Stage 1).
+    /// Observe-only curve-trace region/kinematics logging.
     /// Gates the curve-trace scoring log in `validate_features_handler`; never
     /// affects the verification decision.
     pub curve_trace_observe: bool,

@@ -1,13 +1,12 @@
-//! Curated real-word dictionary for phrase content binding (#89 v3).
+//! Curated real-word dictionary for phrase content binding.
 //!
-//! **Source of truth: `entros-validation/src/word_dict.rs`.** This is a
-//! verbatim vendored copy. If this file diverges from the entros-validation
-//! copy, the validation service will reject phrases that reference words
-//! it doesn't know. Regenerate both files simultaneously from the single
-//! curation script at `entros-validation/scripts/curate-dictionary.py`.
+//! Verbatim copy of the validation service's word dictionary, which is the
+//! source of truth. If the two copies diverge, the validation service rejects
+//! phrases that contain words it does not know. Must stay in sync with the
+//! validator's word dictionary; regenerate both from the shared curation script.
 //!
-//! Drift-detection lives in the tests at the bottom of this file — if they
-//! fail, the two copies are out of sync.
+//! Drift detection lives in the tests at the bottom of this file. If they fail,
+//! the two copies are out of sync.
 
 /// 1240 words, alphabetically sorted.
 pub const WORDS: &[&str] = &[

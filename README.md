@@ -2,7 +2,7 @@
 
 Authenticated gateway, challenge service, risk composer, SAS issuer, and Solana relayer for Entros.
 
-The executor does not contain proprietary behavioral models. It forwards validation requests to the separate private `entros-validation` HTTP service.
+The executor does not contain proprietary behavioral models. It forwards validation requests to a separate, private validation HTTP service.
 
 ## Responsibilities
 
