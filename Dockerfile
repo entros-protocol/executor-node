@@ -14,11 +14,11 @@ FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe6
 RUN apt-get update \
     && apt-get install -y ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
-RUN useradd --system --no-create-home iam
+RUN useradd --system --no-create-home entros
 
 COPY --from=builder /app/target/release/executor-node /usr/local/bin/executor-node
 
-USER iam
+USER entros
 
 # The service reads PORT first and uses LISTEN_ADDR for local development.
 EXPOSE 8080
