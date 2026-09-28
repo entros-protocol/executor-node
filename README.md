@@ -26,6 +26,7 @@ The private validator performs feature checks, phrase transcription, acoustic an
 | `POST /verify` | API key | Relay a walletless Groth16 verification transaction |
 | `POST /attest` | API key and wallet proof | Issue a SAS attestation when configured |
 | `POST /challenge/paired` | API key | Open a paired session when paired sessions are enabled |
+| `POST /paired/cue` | API key | Release the outstanding round cue |
 | `POST /paired/commit` | API key | Commit one paired round when paired sessions are enabled |
 | `POST /validate-session` | API key | Finalize a paired session when paired sessions are enabled |
 | `GET /health` | Public | Return service health |
@@ -35,7 +36,9 @@ The private validator performs feature checks, phrase transcription, acoustic an
 Walletless verification does not issue SAS attestations.
 
 A paired session runs three rounds of one word and one short path. The validator holds the
-round state, so this service keeps none. Opening and committing are untimed, and the finalize
+round state, so this service keeps none. The current source requires paired protocol version 2 at open.
+Cue responses bind the outstanding round. The validator enforces round and cue expiry.
+Open, cue and commit omit the finalize timing floor. The finalize
 request goes through the same timing floor, quota and admission checks as
 `/validate-features`. The paired routes answer 404 until `EXECUTOR_PAIRED_ENABLED` is set.
 With `EXECUTOR_PAIRED_WALLETS` set, only the listed wallets can open a session. Any other wallet

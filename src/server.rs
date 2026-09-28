@@ -429,6 +429,11 @@ pub fn create_router(state: AppState, cors_origins: &[axum::http::HeaderValue]) 
             post(crate::paired::commit_handler),
             crate::paired::COMMIT_BODY_BYTES,
         ))
+        .merge(paired(
+            "/paired/cue",
+            post(crate::paired::cue_handler),
+            crate::paired::COMMIT_BODY_BYTES,
+        ))
     } else {
         Router::new()
     };
@@ -1540,6 +1545,7 @@ mod route_limit_tests {
             (true, "/validate-session", crate::paired::SESSION_BODY_BYTES),
             (true, "/challenge/paired", crate::paired::OPEN_BODY_BYTES),
             (true, "/paired/commit", crate::paired::COMMIT_BODY_BYTES),
+            (true, "/paired/cue", crate::paired::COMMIT_BODY_BYTES),
         ] {
             assert_ne!(
                 status_of(state(paired), path, limit).await,
@@ -1556,7 +1562,12 @@ mod route_limit_tests {
 
     #[tokio::test]
     async fn paired_routes_do_not_exist_while_paired_sessions_are_off() {
-        for path in ["/challenge/paired", "/paired/commit", "/validate-session"] {
+        for path in [
+            "/challenge/paired",
+            "/paired/commit",
+            "/paired/cue",
+            "/validate-session",
+        ] {
             assert_eq!(
                 status_of(state(false), path, 2).await,
                 StatusCode::NOT_FOUND,
@@ -1621,7 +1632,12 @@ mod route_limit_tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_malformed_paired_body_is_refused_as_invalid_request() {
-        for path in ["/challenge/paired", "/paired/commit", "/validate-session"] {
+        for path in [
+            "/challenge/paired",
+            "/paired/commit",
+            "/paired/cue",
+            "/validate-session",
+        ] {
             let response = create_router(state(true), &[])
                 .oneshot(post(path, Body::from("{\"wallet\":1}")))
                 .await
@@ -1639,6 +1655,7 @@ mod route_limit_tests {
     async fn a_chunked_body_over_the_group_limit_is_refused() {
         for (path, limit) in [
             ("/paired/commit", crate::paired::COMMIT_BODY_BYTES),
+            ("/paired/cue", crate::paired::COMMIT_BODY_BYTES),
             ("/validate-session", crate::paired::SESSION_BODY_BYTES),
             ("/validate-features", MAX_REQUEST_BODY_BYTES),
         ] {
