@@ -89,6 +89,7 @@ impl MockValidator {
             .route("/validate", post(handle))
             .route("/paired/sessions", post(handle))
             .route("/paired/commit", post(handle))
+            .route("/paired/cue", post(handle))
             .route("/paired/validate", post(handle))
             .route("/", post(handle_rpc))
             .with_state(state);
