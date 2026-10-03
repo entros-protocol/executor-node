@@ -33,11 +33,22 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|integrator| integrator.api_key == *key)));
     assert!(config.validation_api_key.is_some());
-    assert!(config
-        .paired_wallets
-        .as_ref()
-        .is_some_and(|wallets| !wallets.is_empty()));
+    // Admission shape is the launcher's choice: an allowlist reproduces the
+    // 2026-09-27 campaign; none matches production, which admits every wallet.
+    match &config.paired_wallets {
+        Some(wallets) if !wallets.is_empty() => {
+            println!("paired admission: allowlist ({} wallets)", wallets.len());
+        }
+        _ => println!("paired admission: open (no EXECUTOR_PAIRED_WALLETS)"),
+    }
     assert!(config.paired_enabled);
+    // How long the fixture serves before its graceful shutdown. One hour covered
+    // the 2026-09-27 campaigns; longer isolated campaigns set the override.
+    let ttl_secs: u64 = std::env::var("EXECUTOR_FIXTURE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3600);
+    println!("fixture ttl: {ttl_secs}s");
     let solana_client = Arc::new(SolanaClient::new(&config.rpc_url, config.relayer_keypair));
     let state = AppState {
         validation_identity_program: config.validation_identity_program,
@@ -90,8 +101,8 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        tokio::time::sleep(Duration::from_secs(3600)).await;
+    .with_graceful_shutdown(async move {
+        tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
     })
     .await?;
     Ok(())
