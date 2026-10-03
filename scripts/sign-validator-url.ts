@@ -14,7 +14,7 @@
  *
  * Example:
  *   npx tsx sign-validator-url.ts ../../.config/admin-devnet.json \
- *     http://serene-possibility.railway.internal:8080
+ *     http://<validator-service>.railway.internal:8080
  */
 
 import { readFileSync } from "fs";

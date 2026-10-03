@@ -2,10 +2,10 @@
 //!
 //! Picks 5 random words from `word_dict::WORDS` — a curated dictionary of
 //! 1,240 neutral/positive English words (4-8 letters, 1-3 syllables, no
-//! homophones, no substring collisions, none the speech decoder confuses). The same dictionary is vendored
-//! into `entros-validation/src/word_dict.rs` so the validator knows what the
-//! executor could have issued; the two files are kept in sync by the
-//! shared curation script at `entros-validation/scripts/curate-dictionary.py`.
+//! homophones, no substring collisions, none the speech decoder confuses). The
+//! validation service holds an identical copy so it knows what the executor
+//! could have issued. Must stay in sync with the validator's word dictionary;
+//! regenerate both from the shared curation script.
 //!
 //! Why server-issued rather than client-issued: without server issuance,
 //! phrase content binding is trivially defeated — an attacker submits
@@ -90,10 +90,9 @@ mod tests {
 
     #[test]
     fn dictionary_has_expected_size() {
-        // Drift guard: the entros-validation and executor-node copies of
-        // word_dict.rs must stay identical. If this assertion fails, one
-        // was regenerated and the other wasn't. Rerun
-        // `entros-validation/scripts/curate-dictionary.py` to resync both.
+        // Drift guard: this dictionary and the validator's copy must stay
+        // identical. If this assertion fails, one was regenerated and the
+        // other was not. Regenerate both from the shared curation script.
         assert!(
             word_dict::WORDS.len() >= 900,
             "word dictionary shrunk below 900; drift likely"

@@ -96,15 +96,12 @@ pub enum AppError {
     #[error("Attestation processing failed")]
     AttestationServiceUnavailable,
 
-    /// Validation rejected the submission. The validator surfaces a single
-    /// whitelisted reason category over the wire (`phrase_content_mismatch`)
-    /// because the user already knows whether they said the assigned phrase
-    /// — that category exposes zero attacker-calibration value while
-    /// enabling the soft-reject retry UX on entros.io. All other safe_reason
-    /// categories (variance_floor, entropy_bounds, temporal_coupling_low,
-    /// and attack-signal categories like TtsDetected, SybilMatch) carry
-    /// directed-signal calibration value and stay opaque per the 2026-04-29
-    /// strip — `reason` stays `None` for those.
+    /// Validation rejected the submission. The validator sends at most one
+    /// whitelisted reason category over the wire (`phrase_content_mismatch`).
+    /// The user already knows whether they said the assigned phrase, so that
+    /// category gives nothing away, and it drives the soft-reject retry UX on
+    /// entros.io. Every other rejection stays opaque and `reason` is `None`,
+    /// so the response carries no signal to calibrate an attempt against.
     #[error("Validation failed")]
     ValidationFailed { reason: Option<String> },
 

@@ -36,8 +36,8 @@ pub async fn api_key_auth(
 /// with the length-equality bit so the length contribution is byte-wise
 /// rather than control-flow-wise.
 ///
-/// Mirrors the dummy-comparison pattern in entros-validation's auth
-/// middleware so both Rust services have identical timing characteristics.
+/// The validation service's auth middleware uses the same dummy-comparison
+/// pattern, so both services have identical timing characteristics.
 fn is_valid_api_key(provided: &[u8], api_keys: &[String]) -> bool {
     api_keys.iter().any(|k| {
         let expected = k.as_bytes();

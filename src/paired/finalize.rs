@@ -53,11 +53,16 @@ const MAX_ASSURANCE_TIER: u8 = 2;
 
 /// Verdict reasons a paired finalize may carry back. Each names a content rule the person can
 /// act on, and none carries a detection signal.
-const PAIRED_VERDICT_REASONS: &[&str] = &["phrase_content_mismatch", "trace_incomplete"];
+const PAIRED_VERDICT_REASONS: &[&str] = &[
+    "phrase_content_mismatch",
+    "trace_incomplete",
+    "audio_evidence_insufficient",
+];
 
 /// Protocol reasons a paired finalize may carry back. Each names a session rule, and none
 /// carries a detection signal.
 const PAIRED_PROTOCOL_REASONS: &[&str] = &[
+    "protocol_unsupported",
     "session_unknown",
     "session_expired",
     "session_superseded",

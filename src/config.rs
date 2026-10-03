@@ -1022,9 +1022,8 @@ pub struct Config {
     /// navigator.webdriver === true is rejected outright (prod only — no effect
     /// on the dev pass-through with no validator configured). Disable for the
     /// team's own E2E automation via `EXECUTOR_AUTOMATION_WEBDRIVER_REJECT`.
-    /// Default true. Client-reported, so it stops lazy automation, not a
-    /// determined attacker who hides the flag — the biometric pipeline is the
-    /// backstop.
+    /// Default true. The flag is client-reported, so this is a first filter;
+    /// the behavioral pipeline decides the verdict.
     pub automation_webdriver_reject: bool,
     /// Observe-only wallet-reputation logging.
     /// When true, the `/validate-features` handler reads the verifying wallet's
@@ -1033,7 +1032,7 @@ pub struct Config {
     /// quota, or latency. Configurable via `EXECUTOR_WALLET_REPUTATION_OBSERVE`.
     /// Default true (observe-first).
     pub wallet_reputation_observe: bool,
-    /// Observe-only curve-trace region/kinematics logging (touch-curve Stage 1).
+    /// Observe-only curve-trace region/kinematics logging.
     /// When true, `/validate-features` scores the client's coarse curve-trace
     /// outline against the issued curve (region proximity + gesture speed/nature)
     /// and logs it for calibration — it never affects the verification decision.

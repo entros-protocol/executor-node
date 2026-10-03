@@ -40,8 +40,8 @@
 //! - Per-API-key quota usage (would expose customer-specific data)
 //! - Wallet rate-limit hit count (similar — exposes per-wallet behavior)
 //!
-//! Added 2026-04-27 as MV implementation. Expand when scraping infrastructure
-//! is in place and we have a specific metric to action on.
+//! Add a metric here once there is a scraper for it and a specific action it
+//! informs.
 
 use axum::extract::State;
 use axum::http::header;

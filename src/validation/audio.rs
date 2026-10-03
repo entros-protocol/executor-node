@@ -12,14 +12,10 @@ pub struct AcousticEvaluation {
 /// Evaluates acoustic realism (spectral flatness Wiener entropy and spectral
 /// centroid in Hz) from `CaptureSignals`.
 ///
-/// OBSERVE / TELEMETRY ONLY — do not treat as an authoritative anti-spoof gate.
-/// These signals are computed client-side in the browser and reported by the
-/// SDK, so an adversary controlling the client can forge them (a bot simply
-/// reports in-range values). The un-forgeable acoustic check is computed
-/// server-side by the validation service from the raw audio it already
-/// receives. Wiring that server-side score into the composite is a tracked
-/// follow-up. Thresholds below are
-/// uncalibrated starting points.
+/// Observe and telemetry only. Do not treat this as an authoritative gate: the
+/// signals are computed client-side by the SDK and reported with the request.
+/// The validation service computes its own acoustic check from the audio it
+/// receives.
 ///
 /// Physical microphones picking up human speech in ambient room acoustics exhibit:
 /// - Spectral flatness between 0.015 and 0.85. Flatness < 0.015 indicates pure synthetic

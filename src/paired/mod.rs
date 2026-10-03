@@ -87,12 +87,15 @@ impl SessionSlot {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRequest {
+    #[serde(default)]
+    protocol_version: Option<u16>,
     wallet: String,
     tier: String,
 }
 
 #[derive(Serialize)]
 struct UpstreamOpen<'a> {
+    protocol_version: u16,
     wallet_id: &'a str,
     challenge_nonce: String,
     origin_ip: String,
@@ -117,6 +120,12 @@ pub async fn open_handler(
     {
         return Ok(StatusCode::NOT_FOUND.into_response());
     }
+    if request.protocol_version != Some(2) {
+        return Err(AppError::PairedRejected {
+            status: StatusCode::BAD_REQUEST,
+            reason: "protocol_unsupported".into(),
+        });
+    }
     if request.tier != "trace" {
         return Err(invalid_request());
     }
@@ -134,6 +143,7 @@ pub async fn open_handler(
         &state,
         "/paired/sessions",
         &UpstreamOpen {
+            protocol_version: 2,
             wallet_id: &request.wallet,
             challenge_nonce: nonce.iter().map(|byte| format!("{byte:02x}")).collect(),
             origin_ip: ip.to_string(),
@@ -174,6 +184,35 @@ pub async fn commit_handler(
     relay(&state, "/paired/commit", &request).await
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CueRequest {
+    wallet_id: String,
+    session_id: String,
+    round_index: u32,
+    round_nonce: String,
+    challenge_digest: String,
+}
+
+pub async fn cue_handler(
+    State(state): State<AppState>,
+    peer: Option<Extension<ConnectInfo<SocketAddr>>>,
+    headers: HeaderMap,
+    PairedJson(request): PairedJson<CueRequest>,
+) -> Result<Response, AppError> {
+    let wallet = Pubkey::from_str(&request.wallet_id).map_err(|_| invalid_request())?;
+    if state
+        .paired_wallets
+        .as_ref()
+        .is_some_and(|wallets| !wallets.contains(&wallet))
+    {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    }
+    let (ip, _) = request_origin(&headers, peer.map(|Extension(c)| c.0));
+    check_probing_block(&state, ip)?;
+    relay(&state, "/paired/cue", &request).await
+}
+
 /// Forwards to the validator and passes its status, JSON body and any `Retry-After` through.
 /// Every paired reason is a protocol rule the client acts on, so none is withheld. A reply that
 /// is not the validator's JSON, or a validator fault, is unavailability.
@@ -195,7 +234,12 @@ async fn relay<B: Serialize>(state: &AppState, path: &str, body: &B) -> Result<R
             return Err(AppError::PairedUnavailable);
         }
     };
-    let mut response = (reply.status, Json(body)).into_response();
+    let mut response = (
+        reply.status,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(body),
+    )
+        .into_response();
     if let Some(retry_after) = reply.retry_after {
         response.headers_mut().insert(RETRY_AFTER, retry_after);
     }
@@ -222,6 +266,7 @@ mod tests {
 
     fn open_request(wallet: &str, tier: &str) -> PairedJson<OpenRequest> {
         PairedJson(OpenRequest {
+            protocol_version: Some(2),
             wallet: wallet.into(),
             tier: tier.into(),
         })
@@ -277,11 +322,55 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["challenge_nonce", "origin_ip", "wallet_id"]);
+        assert_eq!(
+            keys,
+            [
+                "challenge_nonce",
+                "origin_ip",
+                "protocol_version",
+                "wallet_id"
+            ]
+        );
         assert_eq!(sent[0]["wallet_id"], WALLET);
         let nonce = sent[0]["challenge_nonce"].as_str().expect("nonce");
         assert_eq!(nonce.len(), 64);
         assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[tokio::test]
+    async fn unsupported_protocol_never_creates_a_session() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let state = state_with_mock_validator(tracker(), &mock);
+        for version in [None, Some(1), Some(3)] {
+            let mut request = open_request(WALLET, "trace");
+            request.0.protocol_version = version;
+            assert!(
+                matches!(open_handler(State(state.clone()),None,HeaderMap::new(),request).await,
+                Err(AppError::PairedRejected {ref reason,..}) if reason == "protocol_unsupported")
+            );
+        }
+        assert_eq!(mock.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cue_relay_preserves_the_bound_request_and_disables_caching() {
+        let expected = serde_json::json!({"wallet_id":WALLET,"session_id":"ab".repeat(16),"round_index":1,"round_nonce":"cd".repeat(32),"challenge_digest":"ef".repeat(32)});
+        let mock =
+            MockValidator::spawn(StatusCode::OK, serde_json::json!({"expires_in_ms":6000})).await;
+        let state = state_with_mock_validator(tracker(), &mock);
+        let response = cue_handler(
+            State(state),
+            None,
+            HeaderMap::new(),
+            PairedJson(serde_json::from_value(expected.clone()).expect("cue")),
+        )
+        .await
+        .expect("forwarded");
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        assert_eq!(mock.received(), vec![expected]);
     }
 
     #[tokio::test]
