@@ -28,7 +28,7 @@ use crate::validation::composite::RiskComponents;
 /// timeout must not become the thing that breaks when it is.
 const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 pub(crate) const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
-const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
+pub(crate) const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
 pub(crate) const FEATURE_VECTOR_WIDTH: usize = 308;
 const AUDIO_FEATURE_WIDTH: usize = 170;
 const NORMALIZED_TOUCH_PROJECTION_VERSION: u16 = 2;
@@ -44,6 +44,10 @@ pub(crate) enum ProjectionIntent {
 }
 
 impl ProjectionIntent {
+    pub(crate) fn writes_baseline(self) -> bool {
+        matches!(self, Self::Mint | Self::Rebaseline | Self::Reset)
+    }
+
     pub(crate) fn receipt_purpose(self, projection_version: u16) -> Option<&'static str> {
         match self {
             Self::Mint => Some("mint"),
@@ -937,19 +941,6 @@ pub async fn validate_features_handler(
     // reflects work that actually happened. Re-read remaining_quota after
     // the refund so the response reflects the restored balance.
     let validation_url = state.validation_url.as_deref();
-    if validation_url.is_none() && projection_version != NORMALIZED_TOUCH_PROJECTION_VERSION {
-        tracing::debug!("Validation service not configured, skipping");
-        budget_guard.refund();
-        let remaining_after_refund = state.tracker.get_remaining(&api_key);
-        return Ok(PaddedJson(ValidateFeaturesResponse {
-            valid: true,
-            remaining_quota: Some(remaining_after_refund),
-            signed_receipt: None,
-            commitment_hex: None,
-            salt_hex: None,
-            study_record_status: req.study.as_ref().map(|_| "disabled".to_string()),
-        }));
-    }
 
     // Score the coarse outline against the issued curve for observation only.
     // Run this outside the request path. Detached like `wallet_reputation_observe`,
@@ -1001,6 +992,9 @@ pub async fn validate_features_handler(
         &req.features,
         req.compatibility_evidence.as_ref(),
     )?;
+    if projection_intent.writes_baseline() {
+        return Err(AppError::PairedRequired);
+    }
     if let Some(nonce) = authorization_nonce {
         state
             .challenge_registry
@@ -1323,6 +1317,18 @@ mod tests {
         data[IDENTITY_PROJECTION_VERSION_OFFSET..IDENTITY_PROJECTION_VERSION_OFFSET + 2]
             .copy_from_slice(&version.to_le_bytes());
         data
+    }
+
+    async fn dev_reverification_state(
+        tracker: std::sync::Arc<crate::integrator::tracker::IntegratorTracker>,
+    ) -> (AppState, crate::validation::mock_validator::MockValidator) {
+        use crate::validation::mock_validator::{
+            state_with_mock_validator, success_body, MockValidator,
+        };
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.validation_url = None;
+        (state, mock)
     }
 
     #[test]
@@ -1932,9 +1938,11 @@ mod tests {
     #[tokio::test]
     async fn dev_skip_refunds_integrator_quota() {
         let tracker = tracker_with_quota("test-key", 10);
-        let state = build_test_state(tracker.clone(), None);
+        let (state, mock) = dev_reverification_state(tracker.clone()).await;
         let headers = headers_with_key("test-key");
         let req = baseline_request(random_wallet_id());
+        let wallet = Pubkey::from_str(&req.wallet_id).expect("test wallet");
+        mock.set_identity(&wallet, &crate::solana::pda::anchor_program_id(), 0);
 
         let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
@@ -1962,9 +1970,11 @@ mod tests {
         // that the observe-only logging branch is side-effect-free on quota.
         // The real gate contract is covered by the mock-validator tests below.
         let tracker = tracker_with_quota("test-key", 10);
-        let state = build_test_state(tracker.clone(), None);
+        let (state, mock) = dev_reverification_state(tracker.clone()).await;
         let headers = headers_with_key("test-key");
         let mut req = baseline_request(random_wallet_id());
+        let wallet = Pubkey::from_str(&req.wallet_id).expect("test wallet");
+        mock.set_identity(&wallet, &crate::solana::pda::anchor_program_id(), 0);
         req.client_signals = Some(ClientSignals {
             v: 1,
             env: Some("browser".into()),
@@ -1995,9 +2005,11 @@ mod tests {
         // log-injection attempt) must neither panic nor alter the outcome; the
         // handler Debug-formats `env`, which escapes control chars in the log.
         let tracker = tracker_with_quota("test-key", 10);
-        let state = build_test_state(tracker.clone(), None);
+        let (state, mock) = dev_reverification_state(tracker.clone()).await;
         let headers = headers_with_key("test-key");
         let mut req = baseline_request(random_wallet_id());
+        let wallet = Pubkey::from_str(&req.wallet_id).expect("test wallet");
+        mock.set_identity(&wallet, &crate::solana::pda::anchor_program_id(), 0);
         req.client_signals = Some(ClientSignals {
             v: 1,
             env: Some("browser\n2099-01-01 INFO forged-admin-login".into()),
@@ -2025,13 +2037,16 @@ mod tests {
         // endpoint is unreachable, so the spawned read fails and logs
         // "unavailable" — the handler outcome is unchanged either way.
         let tracker = tracker_with_quota("test-key", 10);
-        let state = build_test_state(tracker.clone(), None);
+        let (mut state, mock) = dev_reverification_state(tracker.clone()).await;
+        state.wallet_reputation_observe = true;
         assert!(
             state.wallet_reputation_observe,
             "observe flag on by default in tests"
         );
         let headers = headers_with_key("test-key");
         let req = baseline_request(random_wallet_id());
+        let wallet = Pubkey::from_str(&req.wallet_id).expect("test wallet");
+        mock.set_identity(&wallet, &crate::solana::pda::anchor_program_id(), 0);
 
         let result = validate_features_handler(State(state), None, headers, Json(req)).await;
 
@@ -2186,6 +2201,47 @@ mod validator_reached_tests {
 
     const DEFAULT_REPUTATION_RISK: f64 = 0.5;
 
+    fn reverification_request(mock: &MockValidator, wallet_id: String) -> ValidateFeaturesRequest {
+        let wallet = Pubkey::from_str(&wallet_id).expect("test wallet");
+        mock.set_identity(&wallet, &crate::solana::pda::anchor_program_id(), 0);
+        baseline_request(wallet_id)
+    }
+
+    #[tokio::test]
+    async fn every_single_capture_baseline_write_refuses_and_refunds_once() {
+        for (existing, reset) in [(None, false), (Some(0), false), (Some(1), true)] {
+            let tracker = tracker_with_quota("test-key", 10);
+            let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+            let wallet = Pubkey::new_unique();
+            if let Some(version) = existing {
+                mock.set_identity(&wallet, &state.validation_identity_program, version);
+            }
+            state
+                .wallet_attempts
+                .check_and_record_attempt(&wallet)
+                .expect("prior attempt");
+            tracker
+                .check_and_deduct("test-key")
+                .expect("prior quota usage");
+            let mut request = baseline_request(wallet.to_string());
+            request.projection_version = Some(1);
+            request.baseline_reset = reset;
+            let result = validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(request),
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::PairedRequired)));
+            assert_eq!(mock.request_count(), 0);
+            assert_eq!(tracker.get_remaining("test-key"), 9);
+            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+            assert_eq!(state.metrics.validations_performed(), 0);
+        }
+    }
+
     struct LogWriter(Arc<Mutex<Vec<u8>>>);
 
     impl Write for LogWriter {
@@ -2281,7 +2337,7 @@ mod validator_reached_tests {
     }
 
     #[tokio::test]
-    async fn isolated_identity_selects_mint_then_update_without_client_receipt_override() {
+    async fn isolated_identity_refuses_mint_then_allows_update_without_client_receipt_override() {
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let mut state = state_with_mock_validator(tracker_with_quota("test-key", 10), &mock);
         let wallet = Pubkey::new_unique();
@@ -2296,27 +2352,25 @@ mod validator_reached_tests {
         data[IDENTITY_PROJECTION_VERSION_OFFSET..IDENTITY_PROJECTION_VERSION_OFFSET + 2]
             .copy_from_slice(&1u16.to_le_bytes());
         mock.set_account(&official_address, &official, &data, false);
-        for (index, expected_mint) in [true, false].into_iter().enumerate() {
+        for expected_mint in [true, false] {
             let mut request = baseline_request(wallet.to_string());
             request.projection_version = Some(1);
             request._request_receipt = Some(!expected_mint);
-            validate_features_handler(
+            let result = validate_features_handler(
                 State(state.clone()),
                 None,
                 headers_with_key("test-key"),
                 Json(request),
             )
-            .await
-            .expect("validation");
-            assert_eq!(mock.received()[index]["request_receipt"], expected_mint);
-            assert_eq!(
-                mock.received()[index]["receipt_purpose"],
-                if expected_mint {
-                    serde_json::json!("mint")
-                } else {
-                    serde_json::Value::Null
-                }
-            );
+            .await;
+            if expected_mint {
+                assert!(matches!(result, Err(AppError::PairedRequired)));
+                assert_eq!(mock.request_count(), 0);
+            } else {
+                assert!(result.expect("ordinary update").0.valid);
+                assert_eq!(mock.received()[0]["request_receipt"], false);
+                assert!(mock.received()[0]["receipt_purpose"].is_null());
+            }
             mock.set_account(&isolated_address, &alternate, &data, false);
         }
     }
@@ -2362,7 +2416,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
@@ -2384,12 +2438,12 @@ mod validator_reached_tests {
             "metrics must count work that actually happened"
         );
         let sent = mock.received();
-        assert_eq!(sent[0]["receipt_purpose"], "mint");
-        assert_eq!(sent[0]["request_receipt"], true);
+        assert!(sent[0]["receipt_purpose"].is_null());
+        assert_eq!(sent[0]["request_receipt"], false);
     }
 
     #[tokio::test]
-    async fn projection_two_mint_forwards_compatibility_evidence_unchanged() {
+    async fn legacy_projection_two_mint_is_refused_before_forwarding_or_nonce_consumption() {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let state = state_with_mock_validator(tracker, &mock);
@@ -2401,27 +2455,20 @@ mod validator_reached_tests {
         request.compatibility_evidence = Some(evidence);
         let nonce = authorize_projection_two_request(&state, &keypair, &mut request);
 
-        validate_features_handler(
+        let result = validate_features_handler(
             State(state.clone()),
             None,
             headers_with_key("test-key"),
             Json(request),
         )
-        .await
-        .expect("a projection 2 mint with compatibility evidence must reach the validator");
-
-        let sent = mock.received();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].get("compatibility_evidence"), Some(&expected));
-        assert_eq!(
-            sent[0].get("receipt_purpose"),
-            Some(&serde_json::json!("mint"))
-        );
-        assert!(sent[0].get("wallet_authorization").is_none());
+        .await;
+        assert!(matches!(result, Err(AppError::PairedRequired)));
+        assert_eq!(mock.request_count(), 0);
+        assert!(expected.is_object());
         assert!(state
             .challenge_registry
             .validate_and_consume(&keypair.pubkey(), &nonce)
-            .is_err());
+            .is_ok());
     }
 
     #[tokio::test]
@@ -2488,16 +2535,15 @@ mod validator_reached_tests {
         request.compatibility_evidence = Some(evidence);
         authorize_projection_two_request(&state, &keypair, &mut request);
 
-        validate_features_handler(
+        let result = validate_features_handler(
             State(state),
             None,
             headers_with_key("test-key"),
             Json(request),
         )
-        .await
-        .expect("the compatibility touch block may differ from the primary projection");
-
-        assert_eq!(mock.request_count(), 1);
+        .await;
+        assert!(matches!(result, Err(AppError::PairedRequired)));
+        assert_eq!(mock.request_count(), 0);
     }
 
     #[tokio::test]
@@ -2506,9 +2552,9 @@ mod validator_reached_tests {
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let state = state_with_mock_validator(tracker, &mock);
         let keypair = Keypair::new();
+        mock.set_identity(&keypair.pubkey(), &state.validation_identity_program, 2);
         let mut request = baseline_request(keypair.pubkey().to_string());
         request.projection_version = Some(2);
-        request.compatibility_evidence = Some(projection_one_compatibility_evidence());
         authorize_projection_two_request(&state, &keypair, &mut request);
         let authorization = request
             .wallet_authorization
@@ -2526,7 +2572,6 @@ mod validator_reached_tests {
 
         let mut replay = baseline_request(keypair.pubkey().to_string());
         replay.projection_version = Some(2);
-        replay.compatibility_evidence = Some(projection_one_compatibility_evidence());
         replay.wallet_authorization = Some(authorization);
         let result = validate_features_handler(
             State(state),
@@ -2547,9 +2592,9 @@ mod validator_reached_tests {
         let mut state = state_with_mock_validator(tracker, &mock);
         state.validation_url = None;
         let keypair = Keypair::new();
+        mock.set_identity(&keypair.pubkey(), &state.validation_identity_program, 2);
         let mut request = baseline_request(keypair.pubkey().to_string());
         request.projection_version = Some(2);
-        request.compatibility_evidence = Some(projection_one_compatibility_evidence());
         let nonce = authorize_projection_two_request(&state, &keypair, &mut request);
         let authorization = request
             .wallet_authorization
@@ -2571,7 +2616,6 @@ mod validator_reached_tests {
             .is_err());
         let mut replay = baseline_request(keypair.pubkey().to_string());
         replay.projection_version = Some(2);
-        replay.compatibility_evidence = Some(projection_one_compatibility_evidence());
         replay.wallet_authorization = Some(authorization);
         let result = validate_features_handler(
             State(state),
@@ -2591,10 +2635,10 @@ mod validator_reached_tests {
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let state = state_with_mock_validator(tracker, &mock);
         let keypair = Keypair::new();
+        mock.set_identity(&keypair.pubkey(), &state.validation_identity_program, 2);
         let (signed_nonce, signed_phrase, _) = state.challenge_registry.issue(keypair.pubkey());
         let mut request = baseline_request(keypair.pubkey().to_string());
         request.projection_version = Some(2);
-        request.compatibility_evidence = Some(projection_one_compatibility_evidence());
         set_projection_two_authorization(&keypair, signed_nonce, &mut request);
         loop {
             let (_, later_phrase, _) = state.challenge_registry.issue(keypair.pubkey());
@@ -2621,8 +2665,15 @@ mod validator_reached_tests {
     async fn projections_zero_and_one_dev_skip_leave_the_challenge_unchanged() {
         for projection_version in [0, 1] {
             let tracker = tracker_with_quota("test-key", 10);
-            let state = crate::server::build_test_state(tracker, None);
+            let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+            let mut state = state_with_mock_validator(tracker, &mock);
+            state.validation_url = None;
             let keypair = Keypair::new();
+            mock.set_identity(
+                &keypair.pubkey(),
+                &state.validation_identity_program,
+                projection_version,
+            );
             let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
             let mut request = baseline_request(keypair.pubkey().to_string());
             request.projection_version = Some(projection_version);
@@ -2671,6 +2722,11 @@ mod validator_reached_tests {
             let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
             let state = state_with_mock_validator(tracker, &mock);
             let keypair = Keypair::new();
+            mock.set_identity(
+                &keypair.pubkey(),
+                &state.validation_identity_program,
+                projection_version,
+            );
             let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
             let mut request = baseline_request(keypair.pubkey().to_string());
             request.projection_version = Some(projection_version);
@@ -2701,7 +2757,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await
         .expect("a clean request must pass")
@@ -2736,7 +2792,7 @@ mod validator_reached_tests {
                 State(state),
                 None,
                 headers_with_key("test-key"),
-                Json(baseline_request(random_wallet_id())),
+                Json(reverification_request(&mock, random_wallet_id())),
             )
             .await
             .expect("recognized status must preserve the existing pass")
@@ -2815,7 +2871,7 @@ mod validator_reached_tests {
                 let mock = MockValidator::spawn(StatusCode::OK, body).await;
                 let mut state = state_with_mock_validator(tracker, &mock);
                 state.automation_webdriver_reject = false;
-                let mut request = baseline_request(random_wallet_id());
+                let mut request = reverification_request(&mock, random_wallet_id());
                 if automation > 0.0 {
                     request.client_signals = Some(webdriver_signals());
                 }
@@ -2846,6 +2902,7 @@ mod validator_reached_tests {
         const PRIVATE_DETAIL: &str = "private-model-path";
 
         let _log_capture_guard = crate::server::LOG_CAPTURE_LOCK.lock().await;
+        crate::server::enable_test_tracing();
         let tracker = tracker_with_quota("test-key", 10);
         let mut body = success_body(0.0, 0.0, 0.0);
         body["phrase_validation_status"] = serde_json::json!("unvalidated");
@@ -2863,16 +2920,16 @@ mod validator_reached_tests {
             .with_max_level(tracing::Level::INFO)
             .with_writer(move || LogWriter(Arc::clone(&writer_logs)))
             .finish();
-        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        use tracing::instrument::WithSubscriber;
         validate_features_handler(
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id.clone())),
+            Json(reverification_request(&mock, wallet_id.clone())),
         )
+        .with_subscriber(subscriber)
         .await
         .expect("unvalidated status must preserve the existing pass");
-        drop(subscriber_guard);
 
         let log_bytes = logs.lock().expect("log buffer lock").clone();
         let log_text = String::from_utf8(log_bytes).expect("trace output must be UTF-8");
@@ -2890,6 +2947,7 @@ mod validator_reached_tests {
         const UNKNOWN_STATUS: &str = "secret-validator-state";
 
         let _log_capture_guard = crate::server::LOG_CAPTURE_LOCK.lock().await;
+        crate::server::enable_test_tracing();
         for invalid_status in [
             None,
             Some(serde_json::Value::Null),
@@ -2920,15 +2978,15 @@ mod validator_reached_tests {
                 .with_max_level(tracing::Level::INFO)
                 .with_writer(move || LogWriter(Arc::clone(&writer_logs)))
                 .finish();
-            let subscriber_guard = tracing::subscriber::set_default(subscriber);
+            use tracing::instrument::WithSubscriber;
             let result = validate_features_handler(
                 State(state.clone()),
                 None,
                 headers_with_key(API_KEY),
-                Json(baseline_request(wallet_id.clone())),
+                Json(reverification_request(&mock, wallet_id.clone())),
             )
+            .with_subscriber(subscriber)
             .await;
-            drop(subscriber_guard);
 
             let error = match result.map(|_| ()) {
                 Err(error @ AppError::ValidationServiceUnavailable) => error,
@@ -3014,13 +3072,14 @@ mod validator_reached_tests {
             let mut tasks = Vec::with_capacity(concurrency);
 
             for wallet_id in wallet_ids.iter().cloned() {
+                let request = reverification_request(&mock, wallet_id.clone());
                 let state = state.clone();
                 tasks.push(tokio::spawn(async move {
                     let result = validate_features_handler(
                         State(state),
                         None,
                         headers_with_key("test-key"),
-                        Json(baseline_request(wallet_id.clone())),
+                        Json(request),
                     )
                     .await;
                     (wallet_id, result)
@@ -3151,7 +3210,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await
         .expect("normal validation must pass");
@@ -3178,7 +3237,7 @@ mod validator_reached_tests {
             "feature_schema_version": 3,
             "projection_version": 0,
         });
-        let mut request = baseline_request(random_wallet_id());
+        let mut request = reverification_request(&mock, random_wallet_id());
         request.study =
             Some(serde_json::from_value(expected.clone()).expect("valid study context fixture"));
 
@@ -3207,7 +3266,7 @@ mod validator_reached_tests {
         let mut state = state_with_mock_validator(tracker, &mock);
         state.automation_webdriver_reject = false;
 
-        let mut request = baseline_request(random_wallet_id());
+        let mut request = reverification_request(&mock, random_wallet_id());
         request.client_signals = Some(webdriver_signals());
         request.study = Some(StudyRequestContext {
             token: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
@@ -3323,7 +3382,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
@@ -3355,7 +3414,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3412,7 +3471,7 @@ mod validator_reached_tests {
                 .expect("the automation-isolating policy must be valid"),
         );
 
-        let mut req = baseline_request(random_wallet_id());
+        let mut req = reverification_request(&mock, random_wallet_id());
         req.client_signals = Some(webdriver_signals());
 
         let result =
@@ -3439,7 +3498,7 @@ mod validator_reached_tests {
         let mut state = state_with_mock_validator(tracker.clone(), &mock);
         state.automation_webdriver_reject = false;
 
-        let mut req = baseline_request(random_wallet_id());
+        let mut req = reverification_request(&mock, random_wallet_id());
         req.client_signals = Some(webdriver_signals());
 
         let result =
@@ -3474,7 +3533,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
@@ -3509,7 +3568,7 @@ mod validator_reached_tests {
                 State(state.clone()),
                 None,
                 headers_with_key("test-key"),
-                Json(baseline_request(wallet_id.clone())),
+                Json(reverification_request(&mock, wallet_id.clone())),
             )
             .await;
 
@@ -3546,7 +3605,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
@@ -3577,7 +3636,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
@@ -3611,7 +3670,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3654,7 +3713,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3684,7 +3743,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3721,7 +3780,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
@@ -3746,7 +3805,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3774,7 +3833,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3802,7 +3861,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3828,7 +3887,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3854,7 +3913,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await;
 
@@ -3883,7 +3942,7 @@ mod validator_reached_tests {
                 State(state.clone()),
                 None,
                 headers_with_key("test-key"),
-                Json(baseline_request(wallet_id)),
+                Json(reverification_request(&mock, wallet_id)),
             )
             .await;
 
@@ -3919,7 +3978,7 @@ mod validator_reached_tests {
             State(state.clone()),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(wallet_id)),
+            Json(reverification_request(&mock, wallet_id)),
         )
         .await
         .expect("a clean request with an issued challenge must pass");
@@ -3967,7 +4026,7 @@ mod validator_reached_tests {
             State(state),
             None,
             headers_with_key("test-key"),
-            Json(baseline_request(random_wallet_id())),
+            Json(reverification_request(&mock, random_wallet_id())),
         )
         .await;
 
