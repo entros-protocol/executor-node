@@ -579,6 +579,22 @@ pub fn headers_with_key(api_key: &str) -> axum::http::HeaderMap {
 pub(crate) static LOG_CAPTURE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
+pub(crate) fn enable_test_tracing() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        // Parallel tests register callsites outside the capture subscriber.
+        // Keep their interest enabled; scoped subscribers still own the captured output.
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+        .expect("one test tracing initializer");
+    });
+}
+
+#[cfg(test)]
 mod proof_generation_pressure_tests {
     use super::*;
     use axum::body::Body;
