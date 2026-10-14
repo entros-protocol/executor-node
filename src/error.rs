@@ -121,6 +121,8 @@ pub enum AppError {
 
     #[error("Projection update required")]
     ProjectionUpdateRequired,
+    #[error("Paired capture required")]
+    PairedRequired,
 
     /// Cross-wallet verification cooldown active.
     /// Surfaces as `429 Too Many Requests` with a `Retry-After` header.
@@ -277,6 +279,10 @@ impl IntoResponse for AppError {
                 StatusCode::CONFLICT,
                 "This verification client must update before continuing.".into(),
             ),
+            AppError::PairedRequired => (
+                StatusCode::CONFLICT,
+                "Use paired capture to set or replace your baseline.".into(),
+            ),
             AppError::PairedRejected { .. } | AppError::PairedBusy => {
                 unreachable!("handled above")
             }
@@ -324,6 +330,9 @@ impl IntoResponse for AppError {
                     "error": message,
                     "reason": "projection_update_required",
                 })
+            }
+            AppError::PairedRequired => {
+                json!({ "error": message, "reason": "paired_required" })
             }
             AppError::RateLimited => {
                 json!({

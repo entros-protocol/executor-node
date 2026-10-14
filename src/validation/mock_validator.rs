@@ -131,6 +131,24 @@ impl MockValidator {
         self.accounts.lock().expect("mock accounts lock").insert(address.to_string(), serde_json::json!({"lamports":1,"owner":owner.to_string(),"executable":executable,"rentEpoch":0,"data":[base64::engine::general_purpose::STANDARD.encode(data),"base64"]}));
     }
 
+    pub fn set_identity(
+        &self,
+        wallet: &solana_sdk::pubkey::Pubkey,
+        program: &solana_sdk::pubkey::Pubkey,
+        projection: u16,
+    ) {
+        use super::handler::{IDENTITY_DISCRIMINATOR, IDENTITY_PROJECTION_VERSION_OFFSET};
+        let (address, _) = solana_sdk::pubkey::Pubkey::find_program_address(
+            &[b"identity", wallet.as_ref()],
+            program,
+        );
+        let mut data = vec![0; 593];
+        data[..8].copy_from_slice(&IDENTITY_DISCRIMINATOR);
+        data[IDENTITY_PROJECTION_VERSION_OFFSET..IDENTITY_PROJECTION_VERSION_OFFSET + 2]
+            .copy_from_slice(&projection.to_le_bytes());
+        self.set_account(&address, program, &data, false);
+    }
+
     pub fn url(&self) -> String {
         format!("http://{}", self.addr)
     }

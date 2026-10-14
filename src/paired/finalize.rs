@@ -57,6 +57,7 @@ const PAIRED_VERDICT_REASONS: &[&str] = &[
     "phrase_content_mismatch",
     "trace_incomplete",
     "audio_evidence_insufficient",
+    "anchor_retry",
 ];
 
 /// Protocol reasons a paired finalize may carry back. Each names a session rule, and none
@@ -371,6 +372,15 @@ pub async fn validate_session_handler(
             let reason = rejection
                 .reason
                 .filter(|reason| PAIRED_VERDICT_REASONS.contains(&reason.as_str()));
+            if reason.as_deref() == Some("anchor_retry") {
+                // Trust only a quality verdict for the executor-derived action,
+                // never a label attached to probing or ordinary reverification.
+                if !projection_intent.writes_baseline() || rejection.probing_detected == Some(true)
+                {
+                    return Err(AppError::ValidationFailed { reason: None });
+                }
+                state.wallet_attempts.refund_on_success(&wallet);
+            }
             tracing::info!(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&request.wallet_id),
                 reason = ?reason,
@@ -592,6 +602,129 @@ mod tests {
             ));
             assert_eq!(tracker.get_remaining("key"), 9);
         }
+    }
+
+    #[tokio::test]
+    async fn a_quality_verdict_refunds_one_wallet_slot_for_each_baseline_purpose_only() {
+        for (existing, reset, purpose) in [
+            (None, false, "mint"),
+            (Some(0), false, "rebaseline"),
+            (Some(1), true, "reset"),
+        ] {
+            let mock =
+                MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("anchor_retry")).await;
+            let tracker = tracker_with_quota("key", 10);
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+            let mut request = fresh_request();
+            request.baseline_reset = reset;
+            let wallet = Pubkey::from_str(&request.wallet_id).expect("wallet");
+            if let Some(version) = existing {
+                mock.set_identity(&wallet, &state.validation_identity_program, version);
+            }
+            for _ in 0..2 {
+                state
+                    .wallet_attempts
+                    .check_and_record_attempt(&wallet)
+                    .expect("prior failure");
+            }
+            tracker.check_and_deduct("key").expect("prior quota");
+            let result = validate_session_handler(
+                State(state.clone()),
+                None,
+                None,
+                headers_with_key("key"),
+                PairedJson(request),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::ValidationFailed { reason: Some(ref reason) })
+                if reason == "anchor_retry")
+            );
+            assert_eq!(mock.received()[0]["receipt_purpose"], purpose);
+            assert_eq!(tracker.get_remaining("key"), 8);
+            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 2);
+            assert_eq!(state.metrics.validations_performed(), 1);
+            assert_eq!(state.metrics.attestations_issued(), 0);
+
+            let consumed = MockValidator::spawn(
+                StatusCode::CONFLICT,
+                serde_json::json!({ "reason": "session_consumed" }),
+            )
+            .await;
+            let mut replay_state = state.clone();
+            replay_state.validation_url = Some(consumed.url());
+            let mut replay = fresh_request();
+            replay.wallet_id = wallet.to_string();
+            replay.baseline_reset = reset;
+            let replay_result = validate_session_handler(
+                State(replay_state),
+                None,
+                None,
+                headers_with_key("key"),
+                PairedJson(replay),
+            )
+            .await;
+            assert!(matches!(replay_result,
+                Err(AppError::PairedRejected { reason, .. }) if reason == "session_consumed"));
+            assert_eq!(tracker.get_remaining("key"), 8);
+            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_quality_label_on_reverification_or_probing_keeps_the_slot_and_stays_opaque() {
+        for probing in [false, true] {
+            let mut body = error_body("anchor_retry");
+            body["probing_detected"] = serde_json::json!(probing);
+            let mock = MockValidator::spawn(StatusCode::BAD_REQUEST, body).await;
+            let tracker = tracker_with_quota("key", 10);
+            let state = state_with_mock_validator(tracker.clone(), &mock);
+            let request = fresh_request();
+            let wallet = Pubkey::from_str(&request.wallet_id).expect("wallet");
+            if !probing {
+                mock.set_identity(&wallet, &state.validation_identity_program, 1);
+            }
+            let result = validate_session_handler(
+                State(state.clone()),
+                None,
+                None,
+                headers_with_key("key"),
+                PairedJson(request),
+            )
+            .await;
+            assert!(matches!(
+                result,
+                Err(AppError::ValidationFailed { reason: None })
+            ));
+            assert_eq!(tracker.get_remaining("key"), 9);
+            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_quality_verdict_refunds_as_an_upstream_fault() {
+        let mut body = error_body("anchor_retry");
+        body["tts_risk"] = serde_json::json!(2.0);
+        let mock = MockValidator::spawn(StatusCode::BAD_REQUEST, body).await;
+        let tracker = tracker_with_quota("key", 10);
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let request = fresh_request();
+        let wallet = Pubkey::from_str(&request.wallet_id).expect("wallet");
+        state
+            .wallet_attempts
+            .check_and_record_attempt(&wallet)
+            .expect("prior failure");
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(request),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::PairedUnavailable)));
+        assert_eq!(tracker.get_remaining("key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
     }
 
     #[tokio::test]
