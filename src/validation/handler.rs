@@ -31,8 +31,8 @@ pub(crate) const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 24
 pub(crate) const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
 pub(crate) const FEATURE_VECTOR_WIDTH: usize = 308;
 const AUDIO_FEATURE_WIDTH: usize = 170;
-const NORMALIZED_TOUCH_PROJECTION_VERSION: u16 = 2;
-const COMPATIBILITY_PROJECTION_VERSION: u16 = 1;
+pub(crate) const NORMALIZED_TOUCH_PROJECTION_VERSION: u16 = 2;
+pub(crate) const COMPATIBILITY_PROJECTION_VERSION: u16 = 1;
 const COMPATIBILITY_FEATURE_SCHEMA_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,12 +48,12 @@ impl ProjectionIntent {
         matches!(self, Self::Mint | Self::Rebaseline | Self::Reset)
     }
 
-    pub(crate) fn receipt_purpose(self, projection_version: u16) -> Option<&'static str> {
+    pub(crate) fn receipt_purpose(self, _projection_version: u16) -> Option<&'static str> {
         match self {
             Self::Mint => Some("mint"),
             Self::Rebaseline => Some("rebaseline"),
-            Self::Reset if projection_version > 0 => Some("reset"),
-            Self::Reset | Self::Update => None,
+            Self::Reset => Some("reset"),
+            Self::Update => Some("update"),
         }
     }
 }
@@ -1352,10 +1352,11 @@ mod tests {
     }
 
     #[test]
-    fn projection_zero_reset_keeps_the_legacy_no_receipt_path() {
-        assert_eq!(ProjectionIntent::Reset.receipt_purpose(0), None);
+    fn every_projection_intent_requests_its_purpose_bound_receipt() {
+        assert_eq!(ProjectionIntent::Reset.receipt_purpose(0), Some("reset"));
         assert_eq!(ProjectionIntent::Reset.receipt_purpose(1), Some("reset"));
         assert_eq!(ProjectionIntent::Mint.receipt_purpose(0), Some("mint"));
+        assert_eq!(ProjectionIntent::Update.receipt_purpose(1), Some("update"));
     }
 
     #[test]
@@ -2333,7 +2334,7 @@ mod validator_reached_tests {
         .await
         .expect("validation");
         assert_eq!(mock.received()[0]["request_receipt"], false);
-        assert!(mock.received()[0]["receipt_purpose"].is_null());
+        assert_eq!(mock.received()[0]["receipt_purpose"], "update");
     }
 
     #[tokio::test]
@@ -2369,7 +2370,7 @@ mod validator_reached_tests {
             } else {
                 assert!(result.expect("ordinary update").0.valid);
                 assert_eq!(mock.received()[0]["request_receipt"], false);
-                assert!(mock.received()[0]["receipt_purpose"].is_null());
+                assert_eq!(mock.received()[0]["receipt_purpose"], "update");
             }
             mock.set_account(&isolated_address, &alternate, &data, false);
         }
@@ -2438,7 +2439,7 @@ mod validator_reached_tests {
             "metrics must count work that actually happened"
         );
         let sent = mock.received();
-        assert!(sent[0]["receipt_purpose"].is_null());
+        assert_eq!(sent[0]["receipt_purpose"], "update");
         assert_eq!(sent[0]["request_receipt"], false);
     }
 

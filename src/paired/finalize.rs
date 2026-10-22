@@ -24,11 +24,16 @@ use crate::validation::handler::{
     admit_attempt, automation_risk, check_cross_wallet_cooldown, check_probing_block,
     identity_intent, observe_reputation, refund_infrastructure_failure, reputation_risk,
     request_origin, score_success, screen_client_signals, ClientSignals, PreForwardBudgetGuard,
-    SignedReceiptDto, ValidatorErrorBody, ValidatorSuccessBody, FEATURE_VECTOR_WIDTH,
+    SignedReceiptDto, ValidatorErrorBody, ValidatorSuccessBody, COMPATIBILITY_PROJECTION_VERSION,
+    FEATURE_VECTOR_WIDTH, NORMALIZED_TOUCH_PROJECTION_VERSION,
 };
 
-/// Paired sessions run under this projection only.
-const PAIRED_PROJECTION_VERSION: u16 = 1;
+fn is_supported_paired_projection(projection_version: u16) -> bool {
+    matches!(
+        projection_version,
+        COMPATIBILITY_PROJECTION_VERSION | NORMALIZED_TOUCH_PROJECTION_VERSION
+    )
+}
 
 /// Rounds in a paired session.
 const ROUNDS: usize = 3;
@@ -234,7 +239,7 @@ pub async fn validate_session_handler(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("authenticated")
         .to_string();
-    if request.projection_version != PAIRED_PROJECTION_VERSION {
+    if !is_supported_paired_projection(request.projection_version) {
         return Err(AppError::PairedRejected {
             status: StatusCode::BAD_REQUEST,
             reason: "projection_not_supported".into(),
@@ -696,6 +701,10 @@ mod tests {
                 result,
                 Err(AppError::ValidationFailed { reason: None })
             ));
+            assert_eq!(
+                mock.received()[0]["receipt_purpose"],
+                if probing { "mint" } else { "update" }
+            );
             assert_eq!(tracker.get_remaining("key"), 9);
             assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
         }
@@ -773,12 +782,14 @@ mod tests {
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let tracker = tracker_with_quota("key", 10);
 
-        let mut projection_two = fresh_request();
-        projection_two.projection_version = 2;
-        assert!(matches!(
-            finalize(&mock, tracker.clone(), projection_two).await,
-            Err(AppError::PairedRejected { ref reason, .. }) if reason == "projection_not_supported"
-        ));
+        for unsupported in [0, 3] {
+            let mut bad_projection = fresh_request();
+            bad_projection.projection_version = unsupported;
+            assert!(matches!(
+                finalize(&mock, tracker.clone(), bad_projection).await,
+                Err(AppError::PairedRejected { ref reason, .. }) if reason == "projection_not_supported"
+            ));
+        }
 
         let mut short = fresh_request();
         short.features.pop();
@@ -788,5 +799,18 @@ mod tests {
         ));
         assert_eq!(mock.request_count(), 0);
         assert_eq!(tracker.get_remaining("key"), 10);
+    }
+
+    #[tokio::test]
+    async fn projection_two_session_reaches_the_validator() {
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let tracker = tracker_with_quota("key", 10);
+        let mut projection_two = fresh_request();
+        projection_two.projection_version = NORMALIZED_TOUCH_PROJECTION_VERSION;
+        let PaddedJson(response) = finalize(&mock, tracker.clone(), projection_two)
+            .await
+            .expect("projection 2 finalize succeeds");
+        assert!(response.valid);
+        assert_eq!(mock.request_count(), 1);
     }
 }
