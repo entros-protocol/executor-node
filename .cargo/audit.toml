@@ -1,0 +1,24 @@
+# cargo-audit configuration.
+#
+# Run `cargo audit` to scan Cargo.lock against the RustSec advisory database.
+
+[advisories]
+
+# Ignore advisories that are flagged in Cargo.lock but not reachable in this binary.
+# Each entry cites the advisory ID and records why the affected dependency path
+# is not exercised. Re-evaluate on every Solana SDK upgrade.
+ignore = [
+    # RUSTSEC-2026-0387 — timing variability in `crypto-bigint` (< 0.7.6).
+    #
+    # Path: crypto-bigint 0.5.5 <- elliptic-curve 0.13.8 <- k256 0.13.4
+    #   <- solana-secp256k1-recover 3.3.0 <- solana-program 3.0.0
+    #   <- solana-sdk 3.0.0 <- executor-node.
+    #
+    # `solana-sdk` depends unconditionally on `solana-program`, which pulls in
+    # `solana-secp256k1-recover`. `executor-node` uses Ed25519 signatures and
+    # SHA-256 hashing only and never invokes secp256k1 recovery or `k256`.
+    #
+    # Re-evaluate when `solana-sdk` / `solana-secp256k1-recover` upgrades `k256`
+    # to a release built on `crypto-bigint >= 0.7.6`.
+    "RUSTSEC-2026-0387",
+]
