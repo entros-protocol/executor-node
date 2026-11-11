@@ -7,7 +7,9 @@ use solana_sdk::pubkey::Pubkey;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use crate::challenge::registry::PointerSource;
 use crate::error::AppError;
+use crate::integrator::wallet_attempts::AttemptSubject;
 use crate::padding::PaddedJson;
 use crate::server::AppState;
 use crate::validation::authorization::{verify_wallet_authorization, WalletAuthorization};
@@ -30,6 +32,9 @@ const VALIDATOR_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from
 pub(crate) const IDENTITY_DISCRIMINATOR: [u8; 8] = [156, 32, 87, 93, 52, 155, 248, 207];
 pub(crate) const IDENTITY_PROJECTION_VERSION_OFFSET: usize = 583;
 pub(crate) const FEATURE_VECTOR_WIDTH: usize = 308;
+/// The longest contour either route accepts. A 10 ms hop over the longest paired session
+/// is 3,600 frames, and over the longest single capture 2,000.
+pub(crate) const MAX_CONTOUR_FRAMES: usize = 4_096;
 const AUDIO_FEATURE_WIDTH: usize = 170;
 pub(crate) const NORMALIZED_TOUCH_PROJECTION_VERSION: u16 = 2;
 pub(crate) const COMPATIBILITY_PROJECTION_VERSION: u16 = 1;
@@ -103,7 +108,7 @@ pub struct ProjectionCompatibilityEvidence {
     pub features: Vec<f64>,
 }
 
-fn validate_projection_compatibility_evidence(
+pub(crate) fn validate_projection_compatibility_evidence(
     projection_version: u16,
     intent: ProjectionIntent,
     primary_features: &[f64],
@@ -174,6 +179,11 @@ pub struct ValidateFeaturesRequest {
     /// server-issued challenge nonce.
     #[serde(default)]
     pub wallet_authorization: Option<WalletAuthorization>,
+    /// Nonce of the challenge this capture answers, as 32 bytes. A request that names it
+    /// is checked against exactly that challenge, whatever network it arrives from. A
+    /// signed request must name the nonce its authorization covers.
+    #[serde(default)]
+    pub challenge_nonce: Option<Vec<u8>>,
     /// Requests a reset-scoped validator receipt for an existing identity.
     /// The executor still derives the identity and projection state from chain.
     #[serde(default)]
@@ -400,16 +410,16 @@ impl PhraseValidationStatus {
 pub(crate) struct PreForwardBudgetGuard<'a> {
     state: &'a AppState,
     api_key: &'a str,
-    wallet: &'a Pubkey,
+    subject: &'a AttemptSubject,
     refund_pending: bool,
 }
 
 impl<'a> PreForwardBudgetGuard<'a> {
-    pub(crate) fn new(state: &'a AppState, api_key: &'a str, wallet: &'a Pubkey) -> Self {
+    pub(crate) fn new(state: &'a AppState, api_key: &'a str, subject: &'a AttemptSubject) -> Self {
         Self {
             state,
             api_key,
-            wallet,
+            subject,
             refund_pending: true,
         }
     }
@@ -424,7 +434,7 @@ impl<'a> PreForwardBudgetGuard<'a> {
 
     fn refund_once(&mut self) {
         if self.refund_pending {
-            refund_infrastructure_failure(self.state, self.api_key, self.wallet);
+            refund_infrastructure_failure(self.state, self.api_key, self.subject);
             self.refund_pending = false;
         }
     }
@@ -472,6 +482,11 @@ fn validator_request_body(
     Ok(body)
 }
 
+/// The client network of a request that carries no peer address. Axum supplies a
+/// peer in production. Handler-level tests call handlers without one.
+pub(crate) const FALLBACK_ORIGIN: std::net::IpAddr =
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1));
+
 /// The client IP and a bounded user agent.
 ///
 /// The user agent is bounded before it is used or forwarded. It is the one attacker-controlled
@@ -484,8 +499,7 @@ pub(crate) fn request_origin(
     peer: Option<SocketAddr>,
 ) -> (std::net::IpAddr, &str) {
     const MAX_USER_AGENT_BYTES: usize = 512;
-    let ip = crate::auth::client_ip::extract_client_ip(headers, peer)
-        .unwrap_or_else(|| std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)));
+    let ip = crate::auth::client_ip::extract_client_ip(headers, peer).unwrap_or(FALLBACK_ORIGIN);
     let user_agent_raw = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|h| h.to_str().ok())
@@ -620,15 +634,15 @@ pub(crate) fn screen_client_signals(
     Ok(())
 }
 
-/// Records one wallet attempt, then deducts integrator quota. A wallet over its attempt cap
-/// fails first, so it never burns quota. The caller owns the refund from here on.
+/// Records one attempt against `subject`, then deducts integrator quota. A subject over its
+/// attempt cap fails first, so it never burns quota. The caller owns the refund from here on.
 pub(crate) fn admit_attempt(
     state: &AppState,
     api_key: &str,
-    wallet: &Pubkey,
+    subject: &AttemptSubject,
     wallet_id: &str,
 ) -> Result<u64, AppError> {
-    if let Err(retry_after_secs) = state.wallet_attempts.check_and_record_attempt(wallet) {
+    if let Err(retry_after_secs) = state.wallet_attempts.check_and_record_attempt(subject) {
         tracing::info!(
             wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
             retry_after_secs,
@@ -646,7 +660,7 @@ pub(crate) fn admit_attempt(
         Ok(remaining) => Ok(remaining),
         Err(e) => {
             // Integrator quota exhausted — not the wallet's fault.
-            state.wallet_attempts.refund_on_success(wallet);
+            state.wallet_attempts.refund_on_success(subject);
             Err(e)
         }
     }
@@ -700,11 +714,10 @@ pub(crate) async fn observe_reputation(
 ) -> Option<crate::reputation::WalletReputation> {
     if state.wallet_reputation_observe {
         if let Ok(permit) = crate::reputation::REPUTATION_RPC_GATE.try_acquire() {
-            let client = state.relayer_tx.client();
             let _permit = permit;
             match tokio::time::timeout(
                 std::time::Duration::from_millis(1500),
-                crate::reputation::fetch_wallet_reputation(&client, wallet),
+                crate::reputation::fetch_wallet_reputation(&state.solana, wallet),
             )
             .await
             {
@@ -780,12 +793,15 @@ pub(crate) fn automation_risk(client_signals: Option<&ClientSignals>, wallet_id:
     automation_risk
 }
 
-/// Reputation risk from the public balance and activity. An unread wallet scores the middle.
+/// Reputation risk from the public balance and activity. `None` when the wallet was not
+/// read. The scorer then leaves the reputation weight out and rescales the rest, because any
+/// fixed stand-in is wrong for someone: the middle is free to a caller that can make the
+/// read fail, and the maximum rejects honest wallets whenever the RPC is slow.
 pub(crate) fn reputation_risk(
     reputation: Option<&crate::reputation::WalletReputation>,
     wallet_id: &str,
-) -> f64 {
-    if let Some(rep) = reputation {
+) -> Option<f64> {
+    reputation.map(|rep| {
         let sol_score = (rep.sol_lamports as f64 / 100_000_000.0).min(1.0);
         let activity_score = (rep.signature_count as f64 / 10.0).min(1.0);
         let rep_prior = 0.5 * sol_score + 0.5 * activity_score;
@@ -799,9 +815,7 @@ pub(crate) fn reputation_risk(
             );
         }
         risk
-    } else {
-        0.5
-    }
+    })
 }
 
 #[derive(serde::Deserialize)]
@@ -862,6 +876,28 @@ where
     }
 }
 
+/// The nonce a request is checked against, if it names one. A signed request names the
+/// nonce its authorization covers, and a separate `challenge_nonce` must agree with it.
+fn named_challenge_nonce(
+    req: &ValidateFeaturesRequest,
+    signed: Option<&[u8; 32]>,
+) -> Result<Option<[u8; 32]>, AppError> {
+    let named = req
+        .challenge_nonce
+        .as_deref()
+        .map(|bytes| {
+            <[u8; 32]>::try_from(bytes)
+                .map_err(|_| AppError::InvalidRequest("Challenge nonce must be 32 bytes".into()))
+        })
+        .transpose()?;
+    match (named, signed) {
+        (Some(named), Some(signed)) if named != *signed => Err(AppError::InvalidRequest(
+            "Challenge nonce does not match the wallet authorization".into(),
+        )),
+        (named, signed) => Ok(signed.copied().or(named)),
+    }
+}
+
 pub async fn validate_features_handler(
     State(state): State<AppState>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -874,10 +910,23 @@ pub async fn validate_features_handler(
         .unwrap_or("authenticated")
         .to_string();
 
+    // With updates refused, this route has nothing left to serve: it already refuses every
+    // baseline write. Answer before any work.
+    if state.single_capture_updates_refused {
+        return Err(AppError::PairedRequired);
+    }
+
     // Parse the wallet once. Valid wallets proceed; malformed inputs are
     // rejected before touching the rate limiter or validation service.
     let wallet = Pubkey::from_str(&req.wallet_id)
         .map_err(|_| AppError::InvalidRequest(format!("invalid wallet_id: {}", req.wallet_id)))?;
+    if [&req.f0_contour, &req.accel_magnitude]
+        .into_iter()
+        .flatten()
+        .any(|contour| contour.len() > MAX_CONTOUR_FRAMES)
+    {
+        return Err(AppError::InvalidRequest("A contour is too long".into()));
+    }
     let projection_version = req.projection_version.unwrap_or(0);
     if req.study.as_ref().is_some_and(|study| !study.validate()) {
         return Err(AppError::InvalidRequest(
@@ -890,21 +939,33 @@ pub async fn validate_features_handler(
         req.compatibility_evidence.as_ref(),
     )?;
 
-    let issued_challenge = match authorization_nonce.as_ref() {
-        Some(nonce) => state
-            .challenge_registry
-            .peek_exact_challenge(&wallet, nonce),
-        None => state.challenge_registry.peek_challenge(&wallet),
-    };
+    // Extract the client network and user agent. The network selects the challenge of
+    // an unsigned request and keys the cross-wallet cooldown check.
+    let (ip, user_agent) = request_origin(&headers, peer.map(|Extension(c)| c.0));
+
+    // A request that names its nonce is checked against exactly that challenge. Otherwise
+    // the challenge its own network asked for decides, and only a network that asked for
+    // none is checked against the wallet's latest challenge.
+    let issued_challenge =
+        match named_challenge_nonce(&req, authorization_nonce.as_ref())? {
+            Some(nonce) => state
+                .challenge_registry
+                .peek_exact_challenge(&wallet, &nonce),
+            None => state.challenge_registry.peek_challenge(&wallet, ip).map(
+                |(phrase, curve, source)| {
+                    if source == PointerSource::Wallet {
+                        state.metrics.increment_challenge_pointer_fallback();
+                    }
+                    (phrase, curve)
+                },
+            ),
+        };
     if state.challenge_required && issued_challenge.is_none() {
         return Err(AppError::InvalidRequest(
             "Verification challenge expired. Start verification again.".into(),
         ));
     }
     let expected_phrase = issued_challenge.as_ref().map(|(phrase, _)| phrase.clone());
-
-    // Extract the client IP and user agent for the cross-wallet cooldown check.
-    let (ip, user_agent) = request_origin(&headers, peer.map(|Extension(c)| c.0));
 
     // Reject an active probing block before allocating validation resources.
     check_probing_block(&state, ip)?;
@@ -921,8 +982,12 @@ pub async fn validate_features_handler(
     //
     // Sequenced before integrator quota so a rate-limited wallet doesn't
     // burn the integrator's quota.
-    let remaining = admit_attempt(&state, &api_key, &wallet, &req.wallet_id)?;
-    let budget_guard = PreForwardBudgetGuard::new(&state, &api_key, &wallet);
+    //
+    // A signed request proved its wallet, so the wallet is charged. An unsigned request
+    // names a wallet it may not hold, so it is charged as that wallet seen from its network.
+    let subject = AttemptSubject::of(wallet, ip, authorization_nonce.is_some());
+    let remaining = admit_attempt(&state, &api_key, &subject, &req.wallet_id)?;
+    let budget_guard = PreForwardBudgetGuard::new(&state, &api_key, &subject);
 
     // Observe-only wallet reputation reads the
     // verifying wallet's PUBLIC on-chain reputation (balance + recent activity)
@@ -1080,7 +1145,7 @@ pub async fn validate_features_handler(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream returned an infrastructure status"
             );
-            refund_infrastructure_failure(&state, &api_key, &wallet);
+            refund_infrastructure_failure(&state, &api_key, &subject);
             return Err(AppError::ValidationServiceUnavailable);
         }
 
@@ -1097,14 +1162,21 @@ pub async fn validate_features_handler(
                     wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                     "Validation upstream returned an invalid rejection response"
                 );
-                refund_infrastructure_failure(&state, &api_key, &wallet);
+                refund_infrastructure_failure(&state, &api_key, &subject);
                 return Err(AppError::ValidationServiceUnavailable);
             }
         };
 
         if err_body.reason.as_deref() == Some("projection_update_required") {
-            refund_infrastructure_failure(&state, &api_key, &wallet);
+            refund_infrastructure_failure(&state, &api_key, &subject);
             return Err(AppError::ProjectionUpdateRequired);
+        }
+        // A route refusal, not a verdict on the capture, so the attempt is returned.
+        if upstream_status == StatusCode::CONFLICT
+            && err_body.reason.as_deref() == Some("paired_required")
+        {
+            refund_infrastructure_failure(&state, &api_key, &subject);
+            return Err(AppError::PairedRequired);
         }
 
         // If probing was detected, insert into state.probing_blocklist
@@ -1129,7 +1201,7 @@ pub async fn validate_features_handler(
             tts_risk = err_body.tts_risk,
             temporal_risk = err_body.temporal_risk,
             automation_risk,
-            reputation_risk,
+            reputation_risk = ?reputation_risk,
             audio_realism_risk = err_body.audio_realism_risk,
             "Feature validation rejected"
         );
@@ -1151,7 +1223,7 @@ pub async fn validate_features_handler(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream returned a contradictory success response"
             );
-            refund_infrastructure_failure(&state, &api_key, &wallet);
+            refund_infrastructure_failure(&state, &api_key, &subject);
             return Err(AppError::ValidationServiceUnavailable);
         }
         Err(_) => {
@@ -1159,7 +1231,7 @@ pub async fn validate_features_handler(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&req.wallet_id),
                 "Validation upstream returned an invalid success response"
             );
-            refund_infrastructure_failure(&state, &api_key, &wallet);
+            refund_infrastructure_failure(&state, &api_key, &subject);
             return Err(AppError::ValidationServiceUnavailable);
         }
     };
@@ -1193,7 +1265,7 @@ pub async fn validate_features_handler(
         tts_risk,
         temporal_risk,
         automation_risk,
-        reputation_risk,
+        reputation_risk = ?reputation_risk,
         audio_realism_risk,
         phrase_validation_status = phrase_validation_status.as_str(),
         "Feature validation passed biometric checks"
@@ -1201,7 +1273,7 @@ pub async fn validate_features_handler(
 
     score_success(
         &state,
-        &wallet,
+        &subject,
         &req.wallet_id,
         &RiskComponents {
             biometric: biometric_risk,
@@ -1236,8 +1308,7 @@ pub(crate) async fn identity_intent(
         &state.validation_identity_program,
     );
     let identity_data = state
-        .relayer_tx
-        .client()
+        .solana
         .get_owned_account_data(&identity_pda, &state.validation_identity_program)
         .await?;
     let intent =
@@ -1245,11 +1316,11 @@ pub(crate) async fn identity_intent(
     Ok((intent, recent_timestamps(identity_data.as_deref())))
 }
 
-/// Applies the composite risk policy to a validator pass, and returns the wallet's attempt when
-/// the pass stands.
+/// Applies the composite risk policy to a validator pass, and returns the subject's attempt
+/// when the pass stands.
 pub(crate) fn score_success(
     state: &AppState,
-    wallet: &Pubkey,
+    subject: &AttemptSubject,
     wallet_id: &str,
     risks: &RiskComponents,
     study_record_status: Option<&str>,
@@ -1278,7 +1349,7 @@ pub(crate) fn score_success(
         ));
     }
 
-    state.wallet_attempts.refund_on_success(wallet);
+    state.wallet_attempts.refund_on_success(subject);
     Ok(())
 }
 
@@ -1295,9 +1366,13 @@ pub(crate) fn validation_failure(
     }
 }
 
-pub(crate) fn refund_infrastructure_failure(state: &AppState, api_key: &str, wallet: &Pubkey) {
+pub(crate) fn refund_infrastructure_failure(
+    state: &AppState,
+    api_key: &str,
+    subject: &AttemptSubject,
+) {
     state.tracker.refund(api_key);
-    state.wallet_attempts.refund_on_success(wallet);
+    state.wallet_attempts.refund_on_success(subject);
 }
 
 #[cfg(test)]
@@ -1594,6 +1669,7 @@ mod tests {
             projection_version: None,
             compatibility_evidence: None,
             wallet_authorization: None,
+            challenge_nonce: None,
             baseline_reset: false,
             f0_contour: None,
             accel_magnitude: None,
@@ -2105,17 +2181,17 @@ mod tests {
     #[test]
     fn wallet_attempts_counter_tracks_increments() {
         let tracker = WalletAttemptTracker::new(5, std::time::Duration::from_secs(3600));
-        let wallet = Pubkey::new_unique();
-        assert_eq!(tracker.get_attempts(&wallet), 0);
+        let subject = AttemptSubject::Wallet(Pubkey::new_unique());
+        assert_eq!(tracker.get_attempts(&subject), 0);
 
-        tracker.check_and_record_attempt(&wallet).unwrap();
-        assert_eq!(tracker.get_attempts(&wallet), 1);
+        tracker.check_and_record_attempt(&subject).unwrap();
+        assert_eq!(tracker.get_attempts(&subject), 1);
 
-        tracker.check_and_record_attempt(&wallet).unwrap();
-        assert_eq!(tracker.get_attempts(&wallet), 2);
+        tracker.check_and_record_attempt(&subject).unwrap();
+        assert_eq!(tracker.get_attempts(&subject), 2);
 
-        tracker.refund_on_success(&wallet);
-        assert_eq!(tracker.get_attempts(&wallet), 1);
+        tracker.refund_on_success(&subject);
+        assert_eq!(tracker.get_attempts(&subject), 1);
     }
 
     #[tokio::test]
@@ -2200,7 +2276,11 @@ mod validator_reached_tests {
     // a second copy would drift the moment `ValidateFeaturesRequest` changes.
     use super::tests::{baseline_request, projection_one_compatibility_evidence};
 
-    const DEFAULT_REPUTATION_RISK: f64 = 0.5;
+    /// The subject of a request that proves nothing, as these tests send it: no wallet
+    /// signature and no peer address.
+    fn unproven(wallet: &Pubkey) -> AttemptSubject {
+        AttemptSubject::WalletAtOrigin(*wallet, FALLBACK_ORIGIN)
+    }
 
     fn reverification_request(mock: &MockValidator, wallet_id: String) -> ValidateFeaturesRequest {
         let wallet = Pubkey::from_str(&wallet_id).expect("test wallet");
@@ -2220,7 +2300,7 @@ mod validator_reached_tests {
             }
             state
                 .wallet_attempts
-                .check_and_record_attempt(&wallet)
+                .check_and_record_attempt(&unproven(&wallet))
                 .expect("prior attempt");
             tracker
                 .check_and_deduct("test-key")
@@ -2238,7 +2318,7 @@ mod validator_reached_tests {
             assert!(matches!(result, Err(AppError::PairedRequired)));
             assert_eq!(mock.request_count(), 0);
             assert_eq!(tracker.get_remaining("test-key"), 9);
-            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+            assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 1);
             assert_eq!(state.metrics.validations_performed(), 0);
         }
     }
@@ -2277,7 +2357,8 @@ mod validator_reached_tests {
             tts,
             temporal: 0.0,
             automation,
-            reputation: DEFAULT_REPUTATION_RISK,
+            // These tests switch the reputation read off, so the score leaves it out.
+            reputation: None,
         })
     }
 
@@ -2290,7 +2371,9 @@ mod validator_reached_tests {
         keypair: &Keypair,
         request: &mut ValidateFeaturesRequest,
     ) -> [u8; 32] {
-        let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
+        let (nonce, _, _) = state
+            .challenge_registry
+            .issue(keypair.pubkey(), FALLBACK_ORIGIN);
         set_projection_two_authorization(keypair, nonce, request);
         nonce
     }
@@ -2468,7 +2551,7 @@ mod validator_reached_tests {
         assert!(expected.is_object());
         assert!(state
             .challenge_registry
-            .validate_and_consume(&keypair.pubkey(), &nonce)
+            .validate_and_consume_exact(&keypair.pubkey(), &nonce)
             .is_ok());
     }
 
@@ -2494,7 +2577,7 @@ mod validator_reached_tests {
         assert!(mock.received().is_empty());
         assert!(state
             .challenge_registry
-            .validate_and_consume(&keypair.pubkey(), &nonce)
+            .validate_and_consume_exact(&keypair.pubkey(), &nonce)
             .is_ok());
     }
 
@@ -2613,7 +2696,7 @@ mod validator_reached_tests {
 
         assert!(state
             .challenge_registry
-            .validate_and_consume(&keypair.pubkey(), &nonce)
+            .validate_and_consume_exact(&keypair.pubkey(), &nonce)
             .is_err());
         let mut replay = baseline_request(keypair.pubkey().to_string());
         replay.projection_version = Some(2);
@@ -2637,12 +2720,16 @@ mod validator_reached_tests {
         let state = state_with_mock_validator(tracker, &mock);
         let keypair = Keypair::new();
         mock.set_identity(&keypair.pubkey(), &state.validation_identity_program, 2);
-        let (signed_nonce, signed_phrase, _) = state.challenge_registry.issue(keypair.pubkey());
+        let (signed_nonce, signed_phrase, _) = state
+            .challenge_registry
+            .issue(keypair.pubkey(), FALLBACK_ORIGIN);
         let mut request = baseline_request(keypair.pubkey().to_string());
         request.projection_version = Some(2);
         set_projection_two_authorization(&keypair, signed_nonce, &mut request);
         loop {
-            let (_, later_phrase, _) = state.challenge_registry.issue(keypair.pubkey());
+            let (_, later_phrase, _) = state
+                .challenge_registry
+                .issue(keypair.pubkey(), FALLBACK_ORIGIN);
             if later_phrase != signed_phrase {
                 break;
             }
@@ -2675,7 +2762,9 @@ mod validator_reached_tests {
                 &state.validation_identity_program,
                 projection_version,
             );
-            let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
+            let (nonce, _, _) = state
+                .challenge_registry
+                .issue(keypair.pubkey(), FALLBACK_ORIGIN);
             let mut request = baseline_request(keypair.pubkey().to_string());
             request.projection_version = Some(projection_version);
 
@@ -2690,7 +2779,7 @@ mod validator_reached_tests {
 
             assert!(state
                 .challenge_registry
-                .validate_and_consume(&keypair.pubkey(), &nonce)
+                .validate_and_consume_exact(&keypair.pubkey(), &nonce)
                 .is_ok());
         }
     }
@@ -2728,7 +2817,9 @@ mod validator_reached_tests {
                 &state.validation_identity_program,
                 projection_version,
             );
-            let (nonce, _, _) = state.challenge_registry.issue(keypair.pubkey());
+            let (nonce, _, _) = state
+                .challenge_registry
+                .issue(keypair.pubkey(), FALLBACK_ORIGIN);
             let mut request = baseline_request(keypair.pubkey().to_string());
             request.projection_version = Some(projection_version);
 
@@ -2743,7 +2834,7 @@ mod validator_reached_tests {
 
             assert!(state
                 .challenge_registry
-                .validate_and_consume(&keypair.pubkey(), &nonce)
+                .validate_and_consume_exact(&keypair.pubkey(), &nonce)
                 .is_ok());
         }
     }
@@ -2994,7 +3085,7 @@ mod validator_reached_tests {
                 other => panic!("expected ValidationServiceUnavailable, got {other:?}"),
             };
             assert_eq!(tracker.get_remaining(API_KEY), 10);
-            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+            assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
 
             let response = error.into_response();
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
@@ -3116,7 +3207,7 @@ mod validator_reached_tests {
                 }
 
                 assert_eq!(
-                    state.wallet_attempts.get_attempts(&wallet),
+                    state.wallet_attempts.attempts_naming(&wallet),
                     0,
                     "{case:?} must not retain a wallet attempt"
                 );
@@ -3159,16 +3250,11 @@ mod validator_reached_tests {
         let tracker = tracker_with_quota("test-key", 10);
         let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
         let mut state = state_with_mock_validator(tracker.clone(), &mock);
-        state.relayer_tx = std::sync::Arc::new(
-            crate::relayer::transaction::RelayerTransaction::new(std::sync::Arc::new(
-                crate::solana::client::SolanaClient::new("http://127.0.0.1:1", Keypair::new()),
-            )),
-        );
-        let rpc_probe = state
-            .relayer_tx
-            .client()
-            .get_account_data(&Pubkey::new_unique())
-            .await;
+        state.solana = std::sync::Arc::new(crate::solana::client::SolanaClient::new(
+            "http://127.0.0.1:1",
+            Keypair::new(),
+        ));
+        let rpc_probe = state.solana.get_account_data(&Pubkey::new_unique()).await;
         assert!(
             matches!(rpc_probe, Err(AppError::SolanaRpcUnavailable)),
             "closed RPC port returned {rpc_probe:?}"
@@ -3181,7 +3267,7 @@ mod validator_reached_tests {
             .expect("seed integrator usage");
         state
             .wallet_attempts
-            .check_and_record_attempt(&wallet)
+            .check_and_record_attempt(&unproven(&wallet))
             .expect("seed wallet usage");
 
         let result = validate_features_handler(
@@ -3198,7 +3284,7 @@ mod validator_reached_tests {
         }
         assert!(mock.received().is_empty());
         assert_eq!(tracker.get_remaining("test-key"), 9);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 1);
     }
 
     #[tokio::test]
@@ -3309,7 +3395,7 @@ mod validator_reached_tests {
             .expect("seed integrator usage");
         state
             .wallet_attempts
-            .check_and_record_attempt(&wallet)
+            .check_and_record_attempt(&unproven(&wallet))
             .expect("seed wallet usage");
         let mut request = baseline_request(wallet_id);
         request.study = Some(StudyRequestContext {
@@ -3337,7 +3423,7 @@ mod validator_reached_tests {
         }
         assert!(mock.received().is_empty());
         assert_eq!(tracker.get_remaining("test-key"), 9);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 1);
     }
 
     #[tokio::test]
@@ -3352,7 +3438,7 @@ mod validator_reached_tests {
             .expect("seed integrator usage");
         state
             .wallet_attempts
-            .check_and_record_attempt(&wallet)
+            .check_and_record_attempt(&unproven(&wallet))
             .expect("seed wallet usage");
         let mut request = baseline_request(wallet_id);
         request.baseline_reset = true;
@@ -3368,7 +3454,7 @@ mod validator_reached_tests {
         assert!(matches!(result, Err(AppError::InvalidRequest(_))));
         assert!(mock.received().is_empty());
         assert_eq!(tracker.get_remaining("test-key"), 9);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 1);
     }
 
     #[tokio::test]
@@ -3421,7 +3507,53 @@ mod validator_reached_tests {
 
         assert!(matches!(result, Err(AppError::ProjectionUpdateRequired)));
         assert_eq!(tracker.get_remaining("test-key"), 10);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
+    }
+
+    /// The validator refuses a capture it may only accept from paired capture. That refusal
+    /// says nothing about the person, so it spends no attempt.
+    #[tokio::test]
+    async fn a_validator_paired_requirement_is_refused_as_paired_required_and_refunded() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::CONFLICT, error_body("paired_required")).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, wallet_id)),
+        )
+        .await;
+
+        assert!(matches!(result, Err(AppError::PairedRequired)));
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
+    }
+
+    /// The reason maps only on the status the validator uses for it.
+    #[tokio::test]
+    async fn a_paired_required_reason_on_a_rejection_status_stays_a_rejection() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("paired_required")).await;
+        let state = state_with_mock_validator(tracker, &mock);
+
+        let result = validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, random_wallet_id())),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationFailed { reason: None })
+        ));
     }
 
     #[tokio::test]
@@ -3580,7 +3712,7 @@ mod validator_reached_tests {
                 }) if reason == "captcha_required"
             ));
             assert_eq!(
-                state.wallet_attempts.get_attempts(&wallet),
+                state.wallet_attempts.attempts_naming(&wallet),
                 expected_attempts,
                 "each rejected capture must consume one wallet attempt"
             );
@@ -3686,7 +3818,7 @@ mod validator_reached_tests {
             "an unreachable validator must refund the integrator quota"
         );
         assert_eq!(
-            state.wallet_attempts.get_attempts(&wallet),
+            state.wallet_attempts.attempts_naming(&wallet),
             0,
             "an unreachable validator must refund the wallet attempt slot"
         );
@@ -3725,7 +3857,7 @@ mod validator_reached_tests {
             "a validator-reached rejection must still consume integrator quota"
         );
         assert_eq!(
-            state.wallet_attempts.get_attempts(&wallet),
+            state.wallet_attempts.attempts_naming(&wallet),
             1,
             "a genuine failure must accumulate against the per-wallet budget"
         );
@@ -3758,7 +3890,7 @@ mod validator_reached_tests {
             "the validator did the work, so integrator quota stays spent"
         );
         assert_eq!(
-            state.wallet_attempts.get_attempts(&wallet),
+            state.wallet_attempts.attempts_naming(&wallet),
             1,
             "a policy rejection must consume the wallet attempt"
         );
@@ -3816,7 +3948,7 @@ mod validator_reached_tests {
         ));
         assert_eq!(tracker.get_remaining("test-key"), 10);
         assert_eq!(
-            state.wallet_attempts.get_attempts(&wallet),
+            state.wallet_attempts.attempts_naming(&wallet),
             0,
             "an upstream contract failure must not spend a wallet attempt"
         );
@@ -3843,7 +3975,7 @@ mod validator_reached_tests {
             Err(AppError::ValidationServiceUnavailable)
         ));
         assert_eq!(tracker.get_remaining("test-key"), 10);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
     }
 
     #[tokio::test]
@@ -3871,7 +4003,7 @@ mod validator_reached_tests {
             Err(AppError::ValidationServiceUnavailable)
         ));
         assert_eq!(tracker.get_remaining("test-key"), 10);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
     }
 
     #[tokio::test]
@@ -3897,7 +4029,7 @@ mod validator_reached_tests {
             Err(AppError::ValidationServiceUnavailable)
         ));
         assert_eq!(tracker.get_remaining("test-key"), 10);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
     }
 
     #[tokio::test]
@@ -3923,7 +4055,7 @@ mod validator_reached_tests {
             Err(AppError::ValidationServiceUnavailable)
         ));
         assert_eq!(tracker.get_remaining("test-key"), 10);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
     }
 
     #[tokio::test]
@@ -3952,7 +4084,7 @@ mod validator_reached_tests {
                 Err(AppError::ValidationServiceUnavailable)
             ));
             assert_eq!(tracker.get_remaining("test-key"), 10);
-            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 0);
+            assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
         }
     }
 
@@ -3969,10 +4101,10 @@ mod validator_reached_tests {
 
         let wallet_id = random_wallet_id();
         let wallet = Pubkey::from_str(&wallet_id).expect("generated wallet id parses");
-        state.challenge_registry.issue(wallet);
-        let (issued_phrase, _) = state
+        state.challenge_registry.issue(wallet, FALLBACK_ORIGIN);
+        let (issued_phrase, _, _) = state
             .challenge_registry
-            .peek_challenge(&wallet)
+            .peek_challenge(&wallet, FALLBACK_ORIGIN)
             .expect("a freshly issued challenge is within its TTL");
 
         validate_features_handler(
@@ -4036,5 +4168,353 @@ mod validator_reached_tests {
             Err(AppError::ValidationServiceUnavailable)
         ));
         assert_eq!(tracker.get_remaining("test-key"), 10);
+    }
+
+    fn peer(address: &str) -> Option<Extension<ConnectInfo<SocketAddr>>> {
+        Some(Extension(ConnectInfo(
+            address.parse().expect("socket address"),
+        )))
+    }
+
+    /// `/challenge` takes no wallet signature. A call for the same wallet from another
+    /// network must not change the phrase an unsigned capture is checked against.
+    #[tokio::test]
+    async fn a_challenge_issued_to_another_network_leaves_the_phrase_alone() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.challenge_required = true;
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("wallet");
+        let elsewhere: std::net::IpAddr = "198.51.100.9".parse().expect("address");
+
+        let (_, owner_phrase, _) = state.challenge_registry.issue(wallet, FALLBACK_ORIGIN);
+        let (_, other_phrase, _) = state.challenge_registry.issue(wallet, elsewhere);
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, wallet_id.clone())),
+        )
+        .await
+        .map(|_| ())
+        .expect("the capture is checked against its own challenge");
+        assert_eq!(mock.received()[0]["expected_phrase"], owner_phrase);
+
+        // The other network's capture is checked against its own phrase too.
+        validate_features_handler(
+            State(state),
+            peer("198.51.100.9:4000"),
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, wallet_id)),
+        )
+        .await
+        .map(|_| ())
+        .expect("the other network holds its own challenge");
+        assert_eq!(mock.received()[1]["expected_phrase"], other_phrase);
+    }
+
+    /// A client whose network changed between the challenge and the capture still finds its
+    /// challenge, and the executor counts each such fallback.
+    #[tokio::test]
+    async fn a_network_that_asked_for_no_challenge_is_checked_against_the_wallets_latest() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.challenge_required = true;
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("wallet");
+        let (_, phrase, _) = state
+            .challenge_registry
+            .issue(wallet, "198.51.100.9".parse().expect("address"));
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, wallet_id)),
+        )
+        .await
+        .map(|_| ())
+        .expect("the wallet's latest challenge answers a network with none");
+        assert_eq!(mock.received()[0]["expected_phrase"], phrase);
+        assert_eq!(state.metrics.challenge_pointer_fallback(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_named_challenge_is_checked_from_any_network() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker, &mock);
+        state.challenge_required = true;
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("wallet");
+        let (named_nonce, named_phrase, _) = state
+            .challenge_registry
+            .issue(wallet, "198.51.100.9".parse().expect("address"));
+        loop {
+            let (_, local_phrase, _) = state.challenge_registry.issue(wallet, FALLBACK_ORIGIN);
+            if local_phrase != named_phrase {
+                break;
+            }
+        }
+        let mut request = reverification_request(&mock, wallet_id);
+        request.challenge_nonce = Some(named_nonce.to_vec());
+
+        validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .map(|_| ())
+        .expect("a named challenge is found on any network");
+        assert_eq!(mock.received()[0]["expected_phrase"], named_phrase);
+        assert_eq!(state.metrics.challenge_pointer_fallback(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_named_challenge_that_was_never_issued_is_refused() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.challenge_required = true;
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("wallet");
+        state.challenge_registry.issue(wallet, FALLBACK_ORIGIN);
+        let mut request = reverification_request(&mock, wallet_id);
+        request.challenge_nonce = Some(vec![7; 32]);
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(message)) if message.contains("challenge expired"))
+        );
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 0);
+    }
+
+    #[tokio::test]
+    async fn a_challenge_nonce_of_the_wrong_length_is_refused() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        for length in [0, 31, 33] {
+            let mut request = reverification_request(&mock, random_wallet_id());
+            request.challenge_nonce = Some(vec![7; length]);
+
+            let result = validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(request),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(AppError::InvalidRequest(message)) if message.contains("32 bytes")),
+                "a {length}-byte nonce must be refused"
+            );
+        }
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+    }
+
+    #[tokio::test]
+    async fn a_signed_request_must_name_the_nonce_it_signed() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+        let keypair = Keypair::new();
+        mock.set_identity(&keypair.pubkey(), &state.validation_identity_program, 2);
+        let (other_nonce, _, _) = state
+            .challenge_registry
+            .issue(keypair.pubkey(), FALLBACK_ORIGIN);
+        let signed_request = |named: Option<[u8; 32]>| {
+            let mut request = baseline_request(keypair.pubkey().to_string());
+            request.projection_version = Some(2);
+            let signed_nonce = authorize_projection_two_request(&state, &keypair, &mut request);
+            request.challenge_nonce = Some(named.unwrap_or(signed_nonce).to_vec());
+            request
+        };
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(signed_request(Some(other_nonce))),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(AppError::InvalidRequest(message)) if message.contains("does not match"))
+        );
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+
+        let request = signed_request(None);
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(request),
+        )
+        .await
+        .map(|_| ())
+        .expect("a signed request that names its own nonce passes");
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    /// An unsigned request names a wallet it may not hold. Its failures count against that
+    /// wallet as seen from its own network, never against the owner on another network.
+    #[tokio::test]
+    async fn failures_from_another_network_do_not_spend_the_owners_attempts() {
+        let tracker = tracker_with_quota("test-key", 100);
+        let mock = MockValidator::spawn(
+            StatusCode::BAD_REQUEST,
+            error_body("phrase_content_mismatch"),
+        )
+        .await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let wallet_id = random_wallet_id();
+        let wallet = Pubkey::from_str(&wallet_id).expect("wallet");
+
+        let mut third_party_refused = 0;
+        for _ in 0..8 {
+            let result = validate_features_handler(
+                State(state.clone()),
+                peer("198.51.100.9:4000"),
+                headers_with_key("test-key"),
+                Json(reverification_request(&mock, wallet_id.clone())),
+            )
+            .await;
+            match result.map(|_| ()) {
+                Err(AppError::ValidationFailed { .. }) => {}
+                Err(AppError::WalletRateLimited { .. }) => third_party_refused += 1,
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+        // The test state allows five attempts. The other three were refused.
+        assert_eq!(third_party_refused, 3);
+
+        let owner = validate_features_handler(
+            State(state.clone()),
+            peer("203.0.113.7:4000"),
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, wallet_id)),
+        )
+        .await;
+        assert!(
+            matches!(owner.map(|_| ()), Err(AppError::ValidationFailed { .. })),
+            "the owner's request was judged, not rate limited"
+        );
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 6);
+    }
+
+    #[tokio::test]
+    async fn a_signed_request_is_charged_to_the_wallet_on_every_network() {
+        let tracker = tracker_with_quota("test-key", 100);
+        let mock = MockValidator::spawn(
+            StatusCode::BAD_REQUEST,
+            error_body("phrase_content_mismatch"),
+        )
+        .await;
+        let state = state_with_mock_validator(tracker, &mock);
+        let keypair = Keypair::new();
+        let wallet = keypair.pubkey();
+        mock.set_identity(&wallet, &state.validation_identity_program, 2);
+
+        for address in ["198.51.100.9:4000", "203.0.113.7:4000"] {
+            let mut request = baseline_request(wallet.to_string());
+            request.projection_version = Some(2);
+            authorize_projection_two_request(&state, &keypair, &mut request);
+            let result = validate_features_handler(
+                State(state.clone()),
+                peer(address),
+                headers_with_key("test-key"),
+                Json(request),
+            )
+            .await;
+            assert!(matches!(
+                result.map(|_| ()),
+                Err(AppError::ValidationFailed { .. })
+            ));
+        }
+        assert_eq!(
+            state
+                .wallet_attempts
+                .get_attempts(&AttemptSubject::Wallet(wallet)),
+            2
+        );
+        assert_eq!(state.wallet_attempts.attempts_naming(&wallet), 2);
+    }
+
+    #[tokio::test]
+    async fn refused_updates_answer_paired_required_before_any_work() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        state.single_capture_updates_refused = true;
+        let wallet_id = random_wallet_id();
+
+        let result = validate_features_handler(
+            State(state.clone()),
+            None,
+            headers_with_key("test-key"),
+            Json(reverification_request(&mock, wallet_id)),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::PairedRequired)));
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.tracked_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_contour_over_the_frame_limit_is_refused_before_any_charge() {
+        let tracker = tracker_with_quota("test-key", 10);
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        type Lengthen = fn(&mut ValidateFeaturesRequest, usize);
+        let contours: [Lengthen; 2] = [
+            |request, frames| request.f0_contour = Some(vec![120.0; frames]),
+            |request, frames| request.accel_magnitude = Some(vec![0.1; frames]),
+        ];
+        for lengthen in contours {
+            let mut over = reverification_request(&mock, random_wallet_id());
+            lengthen(&mut over, MAX_CONTOUR_FRAMES + 1);
+            let result = validate_features_handler(
+                State(state.clone()),
+                None,
+                headers_with_key("test-key"),
+                Json(over),
+            )
+            .await;
+            assert!(matches!(result, Err(AppError::InvalidRequest(_))));
+        }
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("test-key"), 10);
+        assert_eq!(state.wallet_attempts.tracked_count(), 0);
+
+        let mut at_limit = reverification_request(&mock, random_wallet_id());
+        at_limit.f0_contour = Some(vec![120.0; MAX_CONTOUR_FRAMES]);
+        at_limit.accel_magnitude = Some(vec![0.1; MAX_CONTOUR_FRAMES]);
+        validate_features_handler(
+            State(state),
+            None,
+            headers_with_key("test-key"),
+            Json(at_limit),
+        )
+        .await
+        .map(|_| ())
+        .expect("a contour at the limit is accepted");
+        assert_eq!(mock.request_count(), 1);
     }
 }

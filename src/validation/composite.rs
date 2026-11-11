@@ -23,6 +23,8 @@ pub enum ScoringConfigError {
     FrictionThresholdUnreachable,
     #[error("the rejection threshold is unreachable under the active weight budget")]
     RejectThresholdUnreachable,
+    #[error("the biometric, tts and automation weights must not all be zero")]
+    NoMeasuredWeight,
 }
 
 /// Immutable weights and policy boundaries resolved during startup.
@@ -70,6 +72,11 @@ impl ScoringConfig {
             + u64::from(reputation_weight_ppm);
         if weight_budget != u64::from(PARTS_PER_MILLION) {
             return Err(ScoringConfigError::WeightBudgetMismatch);
+        }
+        // An unread reputation drops out of the score, so a policy with no weight on what is
+        // always measured would score every such capture zero.
+        if biometric_weight_ppm == 0 && tts_weight_ppm == 0 && automation_weight_ppm == 0 {
+            return Err(ScoringConfigError::NoMeasuredWeight);
         }
 
         for (field, value) in [
@@ -147,11 +154,26 @@ impl ScoringConfig {
     }
 
     /// Calculate the weighted score after bounding each untrusted component.
+    ///
+    /// When the reputation was not read, its weight is left out and the rest is scaled back
+    /// to the range the thresholds were set against. The score then depends only on what was
+    /// measured, and a failed read gains or costs nothing.
     pub fn score(&self, components: &RiskComponents) -> f64 {
-        self.biometric_weight * bounded(components.biometric)
+        let measured = self.biometric_weight * bounded(components.biometric)
             + self.tts_weight * bounded(components.tts)
-            + self.automation_weight * bounded(components.automation)
-            + self.reputation_weight * bounded(components.reputation)
+            + self.automation_weight * bounded(components.automation);
+        match components.reputation {
+            Some(reputation) => measured + self.reputation_weight * bounded(reputation),
+            None => {
+                let measured_weight =
+                    self.biometric_weight + self.tts_weight + self.automation_weight;
+                if measured_weight > 0.0 {
+                    measured * (measured_weight + self.reputation_weight) / measured_weight
+                } else {
+                    0.0
+                }
+            }
+        }
     }
 
     /// Return true only when the score is above the rejection threshold.
@@ -182,8 +204,8 @@ pub struct RiskComponents {
     pub temporal: f64,
     /// Locally computed automation risk from client-reported signals.
     pub automation: f64,
-    /// Locally computed wallet-reputation prior.
-    pub reputation: f64,
+    /// Locally computed wallet-reputation prior. `None` when the wallet was not read.
+    pub reputation: Option<f64>,
 }
 
 /// Constrain one component to `[0, 1]`, mapping anything non-finite to maximum risk.
@@ -209,13 +231,13 @@ mod tests {
             tts: 0.0,
             temporal: 0.0,
             automation: 0.0,
-            reputation: 0.5,
+            reputation: Some(0.5),
         }
     }
 
     fn silent() -> RiskComponents {
         RiskComponents {
-            reputation: 0.0,
+            reputation: Some(0.0),
             ..quiet()
         }
     }
@@ -290,7 +312,7 @@ mod tests {
             tts: 1.0,
             temporal: 1.0,
             automation: 1.0,
-            reputation: 1.0,
+            reputation: Some(1.0),
         };
         let score = policy.score(&maximum);
 
@@ -308,7 +330,7 @@ mod tests {
             ("biometric", |c| c.biometric = 1.0, 0.29),
             ("tts", |c| c.tts = 1.0, 0.21),
             ("automation", |c| c.automation = 1.0, 0.16),
-            ("reputation", |c| c.reputation = 1.0, 0.16),
+            ("reputation", |c| c.reputation = Some(1.0), 0.16),
         ];
 
         for (label, raise, expected) in cases {
@@ -341,9 +363,42 @@ mod tests {
             tts: 1.0,
             temporal: 1.0,
             automation: 1.0,
-            reputation: 1.0,
+            reputation: Some(1.0),
         });
         assert!((score - 0.82).abs() < 1e-12);
+    }
+
+    #[test]
+    fn an_unread_reputation_is_left_out_and_the_rest_keeps_the_full_range() {
+        let policy = synthetic_policy();
+        let unread = |biometric: f64, tts: f64, automation: f64| RiskComponents {
+            biometric,
+            tts,
+            temporal: 0.0,
+            automation,
+            reputation: None,
+        };
+
+        // Nothing measured, nothing scored. The old stand-in of one half scored 0.08 here.
+        assert_eq!(policy.score(&unread(0.0, 0.0, 0.0)), 0.0);
+        // Everything measured at its maximum reaches the same maximum as a full read.
+        assert!((policy.score(&unread(1.0, 1.0, 1.0)) - 0.82).abs() < 1e-12);
+        // One component keeps its share of what was measured: 0.29 of 0.66, scaled to 0.82.
+        let biometric_alone = policy.score(&unread(1.0, 0.0, 0.0));
+        assert!((biometric_alone - 0.29 * 0.82 / 0.66).abs() < 1e-12);
+        // More measured risk never scores lower.
+        assert!(policy.score(&unread(1.0, 1.0, 0.0)) > biometric_alone);
+    }
+
+    /// Such a policy would score every capture zero whenever the reputation read is missing.
+    #[test]
+    fn a_policy_with_no_measured_weight_is_refused() {
+        assert_eq!(
+            ScoringConfig::try_new(0, 0, 500_000, 0, 500_000, 100_000, 400_000).err(),
+            Some(ScoringConfigError::NoMeasuredWeight)
+        );
+        assert!(ScoringConfig::try_new(1, 0, 499_999, 0, 500_000, 100_000, 400_000).is_ok());
+        assert!(ScoringConfig::try_new(0, 0, 499_999, 1, 500_000, 100_000, 400_000).is_ok());
     }
 
     #[test]

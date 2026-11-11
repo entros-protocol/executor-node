@@ -140,6 +140,7 @@ mod tests {
             api_key: "key_abc".into(),
             name: "TestApp".into(),
             quota: 100,
+            public: false,
         }]);
 
         let remaining = tracker.check_and_deduct("key_abc").unwrap();
@@ -159,6 +160,7 @@ mod tests {
             api_key: "key_known".into(),
             name: "Known".into(),
             quota: 100,
+            public: false,
         }]);
 
         assert!(tracker.check_and_deduct("unknown_key").is_err());
@@ -170,6 +172,7 @@ mod tests {
             api_key: "key_limited".into(),
             name: "Limited".into(),
             quota: 1,
+            public: false,
         }]);
 
         tracker.check_and_deduct("key_limited").unwrap();
@@ -182,6 +185,7 @@ mod tests {
             api_key: "key_unlimited".into(),
             name: "Unlimited".into(),
             quota: 0,
+            public: false,
         }]);
 
         for _ in 0..100 {
@@ -195,6 +199,7 @@ mod tests {
             api_key: "key_refund".into(),
             name: "Refund".into(),
             quota: 2,
+            public: false,
         }]);
 
         tracker.check_and_deduct("key_refund").unwrap();

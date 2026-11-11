@@ -4,9 +4,14 @@
 //! WebDriver refusal, the wallet attempt cap and integrator quota all apply, and the 4-second
 //! floor wraps the route. It never touches the single-capture challenge registry, because the
 //! paired session is the challenge.
+//!
+//! The wallet's authorization is checked before an attempt is charged. Otherwise a caller
+//! with no key could hold a wallet's attempts with requests that name unknown sessions, for
+//! as long as each one takes to reach the validator and come back.
 
 use std::net::SocketAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::{ConnectInfo, State};
@@ -15,7 +20,9 @@ use axum::Extension;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
 
-use super::{invalid_request, PairedJson, SessionSlot};
+use super::authorization::{AuthorizationPayload, Step};
+use super::uploads::UploadPass;
+use super::{invalid_request, PairedJson};
 use crate::error::AppError;
 use crate::padding::PaddedJson;
 use crate::server::AppState;
@@ -23,9 +30,11 @@ use crate::validation::composite::RiskComponents;
 use crate::validation::handler::{
     admit_attempt, automation_risk, check_cross_wallet_cooldown, check_probing_block,
     identity_intent, observe_reputation, refund_infrastructure_failure, reputation_risk,
-    request_origin, score_success, screen_client_signals, ClientSignals, PreForwardBudgetGuard,
-    SignedReceiptDto, ValidatorErrorBody, ValidatorSuccessBody, COMPATIBILITY_PROJECTION_VERSION,
-    FEATURE_VECTOR_WIDTH, NORMALIZED_TOUCH_PROJECTION_VERSION,
+    request_origin, score_success, screen_client_signals,
+    validate_projection_compatibility_evidence, ClientSignals, PreForwardBudgetGuard,
+    ProjectionCompatibilityEvidence, SignedReceiptDto, ValidatorErrorBody, ValidatorSuccessBody,
+    COMPATIBILITY_PROJECTION_VERSION, FEATURE_VECTOR_WIDTH, MAX_CONTOUR_FRAMES,
+    NORMALIZED_TOUCH_PROJECTION_VERSION,
 };
 
 fn is_supported_paired_projection(projection_version: u16) -> bool {
@@ -41,8 +50,6 @@ const ROUNDS: usize = 3;
 const MAX_SEGMENT_AUDIO_B64: usize = (192_000 * 2usize).div_ceil(3) * 4;
 /// The longest coarse path: a three-byte header and 64 four-byte points, in hex.
 const MAX_COARSE_PATH_HEX: usize = (3 + 64 * 4) * 2;
-/// A 10 ms hop over the longest session is 3,600 frames.
-const MAX_CONTOUR_FRAMES: usize = 4_096;
 /// Integrity tokens are a few kilobytes.
 const MAX_ATTESTATION_TOKEN: usize = 16 * 1_024;
 
@@ -121,6 +128,13 @@ pub struct ValidateSessionRequest {
     baseline_reset: bool,
     #[serde(default)]
     attestation: Option<AttestationPayload>,
+    /// Projection 1 feature summary from the same capture as a projection 2 baseline change.
+    /// The validator uses it for the uniqueness check that projection 1 baselines are held to.
+    #[serde(default)]
+    compatibility_evidence: Option<ProjectionCompatibilityEvidence>,
+    /// The wallet-signed authorization from `GET /paired/authorization`.
+    #[serde(default)]
+    authorization: Option<AuthorizationPayload>,
 }
 
 impl ValidateSessionRequest {
@@ -146,6 +160,10 @@ impl ValidateSessionRequest {
             && self.attestation.as_ref().is_none_or(|attestation| {
                 attestation.platform.len() <= 32 && attestation.token.len() <= MAX_ATTESTATION_TOKEN
             })
+            && self
+                .compatibility_evidence
+                .as_ref()
+                .is_none_or(|evidence| evidence.features.len() == FEATURE_VECTOR_WIDTH)
     }
 }
 
@@ -196,6 +214,8 @@ struct ValidatorSessionBody<'a> {
     origin_ua: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     attestation: Option<&'a AttestationPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compatibility_evidence: Option<&'a ProjectionCompatibilityEvidence>,
 }
 
 impl<'a> ValidatorSessionBody<'a> {
@@ -222,15 +242,21 @@ impl<'a> ValidatorSessionBody<'a> {
             origin_ip,
             origin_ua,
             attestation: request.attestation.as_ref(),
+            compatibility_evidence: request.compatibility_evidence.as_ref(),
         }
     }
 }
 
+/// How long an admitted finalize waits for a processing slot before it is refused. A slot
+/// turns over in the time one handler takes, so a burst queues briefly instead of failing.
+const PROCESSING_SLOT_WAIT: Duration = Duration::from_secs(2);
+
 pub async fn validate_session_handler(
     State(state): State<AppState>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
-    // Held until this handler returns, so the timing floor that follows holds no slot.
-    _slot: Option<Extension<SessionSlot>>,
+    // Held until this handler returns, so the parsed body stays within the upload bound and
+    // the timing floor that follows holds no place.
+    _upload: Option<Extension<UploadPass>>,
     headers: HeaderMap,
     PairedJson(request): PairedJson<ValidateSessionRequest>,
 ) -> Result<PaddedJson<ValidateSessionResponse>, AppError> {
@@ -252,11 +278,26 @@ pub async fn validate_session_handler(
 
     let (ip, user_agent) = request_origin(&headers, peer.map(|Extension(c)| c.0));
     check_probing_block(&state, ip)?;
+    // Decided once. The charge and every refund below use this one subject.
+    let subject = state
+        .paired_authorizer
+        .attempt_subject(&wallet, request.authorization.as_ref(), Step::Finalize, ip)?
+        .subject;
+    // Taken once the body is read and the authorization holds, so an upload that never
+    // completes, or a request that no wallet signed, holds no processing slot.
+    let _slot = tokio::time::timeout(
+        PROCESSING_SLOT_WAIT,
+        Arc::clone(&state.session_gate).acquire_owned(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .ok_or(AppError::PairedBusy)?;
     check_cross_wallet_cooldown(&state, ip, user_agent, &request.wallet_id)?;
     screen_client_signals(&state, &request.wallet_id, request.client_signals.as_ref())?;
 
-    let remaining = admit_attempt(&state, &api_key, &wallet, &request.wallet_id)?;
-    let budget_guard = PreForwardBudgetGuard::new(&state, &api_key, &wallet);
+    let remaining = admit_attempt(&state, &api_key, &subject, &request.wallet_id)?;
+    let budget_guard = PreForwardBudgetGuard::new(&state, &api_key, &subject);
 
     let (projection_intent, timestamps) = identity_intent(
         &state,
@@ -265,6 +306,15 @@ pub async fn validate_session_handler(
         request.baseline_reset,
     )
     .await?;
+    // The validator applies the same rule. Refusing here keeps the session alive for a
+    // corrected request and spends no round trip.
+    validate_projection_compatibility_evidence(
+        request.projection_version,
+        projection_intent,
+        &request.features,
+        request.compatibility_evidence.as_ref(),
+    )
+    .map_err(|_| invalid_request())?;
     let origin_ip = ip.to_string();
     let body = ValidatorSessionBody::new(
         &request,
@@ -305,7 +355,7 @@ pub async fn validate_session_handler(
     let status = reply.status;
     let Some(payload) = reply.body else {
         tracing::error!(status = %status, "Paired validation upstream returned an invalid body");
-        refund_infrastructure_failure(&state, &api_key, &wallet);
+        refund_infrastructure_failure(&state, &api_key, &subject);
         return Err(AppError::PairedUnavailable);
     };
 
@@ -315,7 +365,7 @@ pub async fn validate_session_handler(
             serde_json::from_value::<PairedSuccessExtras>(payload),
         ) else {
             tracing::error!("Paired validation upstream returned an invalid success body");
-            refund_infrastructure_failure(&state, &api_key, &wallet);
+            refund_infrastructure_failure(&state, &api_key, &subject);
             return Err(AppError::PairedUnavailable);
         };
         if !body.valid || extras.assurance_tier > MAX_ASSURANCE_TIER {
@@ -324,7 +374,7 @@ pub async fn validate_session_handler(
                 assurance_tier = extras.assurance_tier,
                 "Paired validation upstream returned a contradictory success body"
             );
-            refund_infrastructure_failure(&state, &api_key, &wallet);
+            refund_infrastructure_failure(&state, &api_key, &subject);
             return Err(AppError::PairedUnavailable);
         }
         tracing::info!(
@@ -332,7 +382,7 @@ pub async fn validate_session_handler(
             biometric_risk = body.biometric_risk,
             tts_risk = body.tts_risk,
             automation_risk,
-            reputation_risk,
+            reputation_risk = ?reputation_risk,
             audio_realism_risk = body.audio_realism_risk,
             phrase_validation_status = body.phrase_validation_status.as_str(),
             assurance_tier = extras.assurance_tier,
@@ -340,7 +390,7 @@ pub async fn validate_session_handler(
         );
         score_success(
             &state,
-            &wallet,
+            &subject,
             &request.wallet_id,
             &RiskComponents {
                 biometric: body.biometric_risk,
@@ -384,14 +434,14 @@ pub async fn validate_session_handler(
                 {
                     return Err(AppError::ValidationFailed { reason: None });
                 }
-                state.wallet_attempts.refund_on_success(&wallet);
+                state.wallet_attempts.refund_on_success(&subject);
             }
             tracing::info!(
                 wallet_id = %crate::auth::redact::redact_wallet_id(&request.wallet_id),
                 reason = ?reason,
                 biometric_risk = rejection.biometric_risk,
                 automation_risk,
-                reputation_risk,
+                reputation_risk = ?reputation_risk,
                 "Paired session rejected"
             );
             return Err(AppError::ValidationFailed { reason });
@@ -402,7 +452,7 @@ pub async fn validate_session_handler(
         .ok()
         .and_then(|body| body.reason);
     // No verdict was rendered on any path below, so the attempt and the quota come back.
-    refund_infrastructure_failure(&state, &api_key, &wallet);
+    refund_infrastructure_failure(&state, &api_key, &subject);
     match (status, reason) {
         (StatusCode::SERVICE_UNAVAILABLE, Some(reason)) if reason == "technical_failure" => {
             Err(AppError::PairedTechnicalFailure)
@@ -425,11 +475,25 @@ pub async fn validate_session_handler(
 
 #[cfg(test)]
 mod tests {
+    use super::super::authorization::{
+        authorization_signed_by, signed_authorization, AuthorizationMode, NetworkMode,
+        PairedAuthorizer,
+    };
     use super::*;
+    use crate::integrator::wallet_attempts::AttemptSubject;
     use crate::server::{headers_with_key, tracker_with_quota};
+    use crate::validation::handler::FALLBACK_ORIGIN;
     use crate::validation::mock_validator::{
         error_body, state_with_mock_validator, success_body, MockValidator,
     };
+    use solana_sdk::signature::Keypair;
+    use solana_sdk::signer::Signer;
+    use std::sync::Arc;
+
+    /// The subject of a finalize that carries no authorization, as these tests send it.
+    fn unproven(wallet: &Pubkey) -> AttemptSubject {
+        AttemptSubject::WalletAtOrigin(*wallet, FALLBACK_ORIGIN)
+    }
 
     fn request_value() -> serde_json::Value {
         let segment = |round: u32| {
@@ -502,6 +566,45 @@ mod tests {
         assert_eq!(body["segments"][2]["round_index"], 3);
         assert!(body.get("client_signals").is_none());
         assert!(body.get("baseline_reset").is_none());
+        assert!(body.get("compatibility_evidence").is_none());
+        assert!(body.get("authorization").is_none());
+    }
+
+    #[test]
+    fn compatibility_evidence_is_forwarded_and_the_authorization_never_is() {
+        let mut value = request_value();
+        value["compatibility_evidence"] = serde_json::json!({
+            "projection_version": 1,
+            "feature_schema_version": 4,
+            "features": vec![0.5; FEATURE_VECTOR_WIDTH],
+        });
+        value["authorization"] = serde_json::json!({
+            "challenge": "22".repeat(32),
+            "expires_at": 1_800_000_000_i64,
+            "origin": "33".repeat(16),
+            "mac": "44".repeat(32),
+            "signature_hex": "55".repeat(64),
+        });
+        let request: ValidateSessionRequest =
+            serde_json::from_value(value).expect("request parses");
+        assert!(request.within_bounds());
+        let body = serde_json::to_value(ValidatorSessionBody::new(
+            &request,
+            Some("mint"),
+            &[],
+            "203.0.113.4",
+            "agent",
+        ))
+        .expect("serializes");
+        assert_eq!(body["compatibility_evidence"]["projection_version"], 1);
+        assert_eq!(
+            body["compatibility_evidence"]["features"]
+                .as_array()
+                .expect("features")
+                .len(),
+            FEATURE_VECTOR_WIDTH
+        );
+        assert!(body.get("authorization").is_none());
     }
 
     #[test]
@@ -514,7 +617,7 @@ mod tests {
     #[test]
     fn every_bound_is_checked_before_forwarding() {
         assert!(request().within_bounds());
-        let mutations: [fn(&mut serde_json::Value); 9] = [
+        let mutations: [fn(&mut serde_json::Value); 10] = [
             |value| value["capture_protocol"] = "single".into(),
             |value| value["session_id"] = "00".into(),
             |value| value["final_digest"] = "ab".into(),
@@ -530,6 +633,13 @@ mod tests {
             },
             |value| value["f0_contour"] = serde_json::json!(vec![0.0; MAX_CONTOUR_FRAMES + 1]),
             |value| value["attestation"]["token"] = "t".repeat(MAX_ATTESTATION_TOKEN + 1).into(),
+            |value| {
+                value["compatibility_evidence"] = serde_json::json!({
+                    "projection_version": 1,
+                    "feature_schema_version": 4,
+                    "features": [0.5],
+                });
+            },
         ];
         for mutate in mutations {
             let mut value = request_value();
@@ -629,7 +739,7 @@ mod tests {
             for _ in 0..2 {
                 state
                     .wallet_attempts
-                    .check_and_record_attempt(&wallet)
+                    .check_and_record_attempt(&unproven(&wallet))
                     .expect("prior failure");
             }
             tracker.check_and_deduct("key").expect("prior quota");
@@ -647,7 +757,7 @@ mod tests {
             );
             assert_eq!(mock.received()[0]["receipt_purpose"], purpose);
             assert_eq!(tracker.get_remaining("key"), 8);
-            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 2);
+            assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 2);
             assert_eq!(state.metrics.validations_performed(), 1);
             assert_eq!(state.metrics.attestations_issued(), 0);
 
@@ -672,7 +782,7 @@ mod tests {
             assert!(matches!(replay_result,
                 Err(AppError::PairedRejected { reason, .. }) if reason == "session_consumed"));
             assert_eq!(tracker.get_remaining("key"), 8);
-            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 2);
+            assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 2);
         }
     }
 
@@ -706,7 +816,7 @@ mod tests {
                 if probing { "mint" } else { "update" }
             );
             assert_eq!(tracker.get_remaining("key"), 9);
-            assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+            assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 1);
         }
     }
 
@@ -721,7 +831,7 @@ mod tests {
         let wallet = Pubkey::from_str(&request.wallet_id).expect("wallet");
         state
             .wallet_attempts
-            .check_and_record_attempt(&wallet)
+            .check_and_record_attempt(&unproven(&wallet))
             .expect("prior failure");
         let result = validate_session_handler(
             State(state.clone()),
@@ -733,7 +843,7 @@ mod tests {
         .await;
         assert!(matches!(result, Err(AppError::PairedUnavailable)));
         assert_eq!(tracker.get_remaining("key"), 10);
-        assert_eq!(state.wallet_attempts.get_attempts(&wallet), 1);
+        assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 1);
     }
 
     #[tokio::test]
@@ -807,10 +917,360 @@ mod tests {
         let tracker = tracker_with_quota("key", 10);
         let mut projection_two = fresh_request();
         projection_two.projection_version = NORMALIZED_TOUCH_PROJECTION_VERSION;
+        // An update. A projection 2 baseline write also needs compatibility evidence.
+        mock.set_identity(
+            &Pubkey::from_str(&projection_two.wallet_id).expect("wallet"),
+            &crate::solana::pda::anchor_program_id(),
+            NORMALIZED_TOUCH_PROJECTION_VERSION,
+        );
         let PaddedJson(response) = finalize(&mock, tracker.clone(), projection_two)
             .await
             .expect("projection 2 finalize succeeds");
         assert!(response.valid);
         assert_eq!(mock.request_count(), 1);
+    }
+
+    fn require_authorization(state: &mut AppState) {
+        state.paired_authorizer = Arc::new(
+            PairedAuthorizer::new(
+                &[0x11; 32],
+                900,
+                AuthorizationMode::Required,
+                NetworkMode::Enforce,
+            )
+            .expect("authorizer"),
+        );
+    }
+
+    fn require_authorization_observing(state: &mut AppState) {
+        state.paired_authorizer = Arc::new(
+            PairedAuthorizer::new(
+                &[0x11; 32],
+                900,
+                AuthorizationMode::Required,
+                NetworkMode::Observe,
+            )
+            .expect("authorizer"),
+        );
+    }
+
+    /// A request whose authorization was granted to another network than the finalize's.
+    fn authorized_elsewhere(state: &AppState) -> (Keypair, ValidateSessionRequest) {
+        let owner = Keypair::new();
+        let mut request = request_for(&owner.pubkey());
+        let elsewhere: std::net::IpAddr = "198.51.100.9".parse().expect("address");
+        request.authorization = Some(signed_authorization(
+            &state.paired_authorizer,
+            &owner,
+            elsewhere,
+        ));
+        (owner, request)
+    }
+
+    fn request_for(wallet: &Pubkey) -> ValidateSessionRequest {
+        let mut request = fresh_request();
+        request.wallet_id = wallet.to_string();
+        request
+    }
+
+    fn refusal(
+        result: Result<PaddedJson<ValidateSessionResponse>, AppError>,
+    ) -> (StatusCode, String) {
+        match result {
+            Err(AppError::PairedRejected { status, reason }) => (status, reason),
+            Err(other) => panic!("expected a paired refusal, got {other:?}"),
+            Ok(_) => panic!("expected a paired refusal, got a pass"),
+        }
+    }
+
+    /// A finalize that names an unknown session reaches the validator and comes back refused.
+    /// Until it does, it holds one of the wallet's attempts. Without the authorization check a
+    /// caller with no key could hold all of them, one concurrent request each.
+    #[tokio::test]
+    async fn a_finalize_without_the_wallets_authorization_charges_nothing() {
+        let mock = MockValidator::spawn(
+            StatusCode::NOT_FOUND,
+            serde_json::json!({ "error": "refused", "reason": "session_unknown" }),
+        )
+        .await;
+        let tracker = tracker_with_quota("key", 10);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        require_authorization(&mut state);
+        let victim = Keypair::new();
+        let wallet = victim.pubkey();
+
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(request_for(&wallet)),
+        )
+        .await;
+        assert_eq!(
+            refusal(result),
+            (StatusCode::UNAUTHORIZED, "authorization_required".into())
+        );
+
+        let attacker = Keypair::new();
+        let mut forged = request_for(&wallet);
+        forged.authorization = Some(authorization_signed_by(
+            &state.paired_authorizer,
+            &wallet,
+            &attacker,
+            FALLBACK_ORIGIN,
+        ));
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(forged),
+        )
+        .await;
+        assert_eq!(
+            refusal(result),
+            (StatusCode::UNAUTHORIZED, "authorization_invalid".into())
+        );
+
+        assert_eq!(mock.request_count(), 0, "nothing reached the validator");
+        assert_eq!(tracker.get_remaining("key"), 10);
+        assert_eq!(state.wallet_attempts.tracked_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_authorized_finalize_is_charged_to_the_wallet() {
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("trace_incomplete")).await;
+        let tracker = tracker_with_quota("key", 10);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        require_authorization(&mut state);
+        let owner = Keypair::new();
+        let wallet = owner.pubkey();
+        let mut request = request_for(&wallet);
+        request.authorization = Some(signed_authorization(
+            &state.paired_authorizer,
+            &owner,
+            FALLBACK_ORIGIN,
+        ));
+
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(request),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationFailed { reason: Some(ref reason) }) if reason == "trace_incomplete"
+        ));
+        assert_eq!(
+            state
+                .wallet_attempts
+                .get_attempts(&AttemptSubject::Wallet(wallet)),
+            1
+        );
+        assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 0);
+        assert!(mock.received()[0].get("authorization").is_none());
+    }
+
+    /// A session survives a change of network, so the finalize is accepted. Under enforce
+    /// only the grant network can have opened the session, so the wallet is charged.
+    #[tokio::test]
+    async fn a_finalize_from_another_network_is_charged_to_the_wallet_under_enforce() {
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("trace_incomplete")).await;
+        let tracker = tracker_with_quota("key", 10);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        require_authorization(&mut state);
+        let (owner, request) = authorized_elsewhere(&state);
+        let wallet = owner.pubkey();
+
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(request),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationFailed { reason: Some(ref reason) }) if reason == "trace_incomplete"
+        ));
+        assert_eq!(
+            state
+                .wallet_attempts
+                .get_attempts(&AttemptSubject::Wallet(wallet)),
+            1
+        );
+        assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 0);
+        assert_eq!(state.metrics.paired_authorization_network_mismatch(), 0);
+    }
+
+    /// Under observe an open can come from any network, so a finalize from another network
+    /// is charged to the wallet as seen from that network.
+    #[tokio::test]
+    async fn a_finalize_from_another_network_is_charged_to_that_network_under_observe() {
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("trace_incomplete")).await;
+        let tracker = tracker_with_quota("key", 10);
+        let mut state = state_with_mock_validator(tracker.clone(), &mock);
+        require_authorization_observing(&mut state);
+        let (owner, request) = authorized_elsewhere(&state);
+        let wallet = owner.pubkey();
+
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(request),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(AppError::ValidationFailed { reason: Some(ref reason) }) if reason == "trace_incomplete"
+        ));
+        assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 1);
+        assert_eq!(
+            state
+                .wallet_attempts
+                .get_attempts(&AttemptSubject::Wallet(wallet)),
+            0
+        );
+    }
+
+    /// Under enforce the wallet's attempt bound holds across every network a finalize uses.
+    #[tokio::test]
+    async fn finalizes_from_several_networks_spend_one_wallet_budget_under_enforce() {
+        let mock =
+            MockValidator::spawn(StatusCode::BAD_REQUEST, error_body("trace_incomplete")).await;
+        let tracker = tracker_with_quota("key", 100);
+        let mut state = state_with_mock_validator(tracker, &mock);
+        require_authorization(&mut state);
+        let owner = Keypair::new();
+        let wallet = owner.pubkey();
+        let authorization = signed_authorization(&state.paired_authorizer, &owner, FALLBACK_ORIGIN);
+
+        let mut refused = 0;
+        for network in 1..=8u8 {
+            let mut request = request_for(&wallet);
+            request.authorization = Some(authorization.clone());
+            let peer = std::net::SocketAddr::from(([198, 51, 100, network], 4_000));
+            let result = validate_session_handler(
+                State(state.clone()),
+                Some(Extension(ConnectInfo(peer))),
+                None,
+                headers_with_key("key"),
+                PairedJson(request),
+            )
+            .await;
+            match result {
+                Err(AppError::ValidationFailed { .. }) => {}
+                Err(AppError::WalletRateLimited { .. }) => refused += 1,
+                other => panic!("unexpected finalize result: {:?}", other.err()),
+            }
+        }
+        // The test state allows five attempts per wallet.
+        assert_eq!(refused, 3);
+        assert_eq!(
+            state
+                .wallet_attempts
+                .get_attempts(&AttemptSubject::Wallet(wallet)),
+            5
+        );
+    }
+
+    #[tokio::test]
+    async fn a_projection_two_baseline_write_needs_compatibility_evidence() {
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let tracker = tracker_with_quota("key", 10);
+        let state = state_with_mock_validator(tracker.clone(), &mock);
+
+        // No identity on chain, so the request is a mint.
+        let mut without = fresh_request();
+        without.projection_version = NORMALIZED_TOUCH_PROJECTION_VERSION;
+        let wallet = Pubkey::from_str(&without.wallet_id).expect("wallet");
+        let result = validate_session_handler(
+            State(state.clone()),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(without),
+        )
+        .await;
+        assert_eq!(
+            refusal(result),
+            (StatusCode::BAD_REQUEST, "invalid_request".into())
+        );
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(tracker.get_remaining("key"), 10);
+        assert_eq!(state.wallet_attempts.get_attempts(&unproven(&wallet)), 0);
+
+        let mut with = fresh_request();
+        with.projection_version = NORMALIZED_TOUCH_PROJECTION_VERSION;
+        with.compatibility_evidence = Some(ProjectionCompatibilityEvidence {
+            projection_version: COMPATIBILITY_PROJECTION_VERSION,
+            feature_schema_version: 4,
+            features: with.features.clone(),
+        });
+        let PaddedJson(response) = validate_session_handler(
+            State(state),
+            None,
+            None,
+            headers_with_key("key"),
+            PairedJson(with),
+        )
+        .await
+        .expect("a mint with evidence passes");
+        assert!(response.valid);
+        assert_eq!(
+            mock.received()[0]["compatibility_evidence"]["feature_schema_version"],
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn compatibility_evidence_is_refused_where_no_baseline_is_written() {
+        let mock = MockValidator::spawn(StatusCode::OK, success_body(0.0, 0.0, 0.0)).await;
+        let state = state_with_mock_validator(tracker_with_quota("key", 10), &mock);
+        let evidence = |features: &[f64]| ProjectionCompatibilityEvidence {
+            projection_version: COMPATIBILITY_PROJECTION_VERSION,
+            feature_schema_version: 4,
+            features: features.to_vec(),
+        };
+
+        // Projection 1 never takes evidence.
+        let mut projection_one = fresh_request();
+        projection_one.compatibility_evidence = Some(evidence(&projection_one.features));
+        // A projection 2 update writes no baseline.
+        let mut update = fresh_request();
+        update.projection_version = NORMALIZED_TOUCH_PROJECTION_VERSION;
+        update.compatibility_evidence = Some(evidence(&update.features));
+        let wallet = Pubkey::from_str(&update.wallet_id).expect("wallet");
+        mock.set_identity(
+            &wallet,
+            &state.validation_identity_program,
+            NORMALIZED_TOUCH_PROJECTION_VERSION,
+        );
+
+        for request in [projection_one, update] {
+            let result = validate_session_handler(
+                State(state.clone()),
+                None,
+                None,
+                headers_with_key("key"),
+                PairedJson(request),
+            )
+            .await;
+            assert_eq!(
+                refusal(result),
+                (StatusCode::BAD_REQUEST, "invalid_request".into())
+            );
+        }
+        assert_eq!(mock.request_count(), 0);
     }
 }

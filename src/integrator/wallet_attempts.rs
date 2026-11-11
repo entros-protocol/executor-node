@@ -1,7 +1,8 @@
-//! Per-wallet validation-attempt counter.
+//! Validation-attempt counter.
 //!
-//! Bounds how many times a single wallet can attempt validation within a
-//! sliding window. Pairs with the client-side soft-reject UX in
+//! Bounds how many times one subject can attempt validation within a
+//! sliding window. A subject is a wallet whose owner the request proved, or a
+//! wallet as named from one client network. See [`AttemptSubject`]. Pairs with the client-side soft-reject UX in
 //! `entros.io/src/components/sections/verify-wallet-connected.tsx`: the
 //! client offers up to N retries within a session, the server enforces the
 //! same cap per-wallet across browser refreshes / new sessions.
@@ -26,13 +27,39 @@
 //! ## Memory
 //!
 //! In-memory map; resets on Railway restart. `evict_expired` runs from a
-//! background task in main.rs (5min interval) to drop stale entries —
-//! prevents unbounded growth from many distinct wallets over time. The
-//! per-attempt cost stays O(1).
+//! background task in main.rs (5min interval) and drops every entry whose
+//! window has ended, so the map holds at most the subjects seen in one window.
+//! The per-attempt cost stays O(1).
 
 use dashmap::DashMap;
 use solana_sdk::pubkey::Pubkey;
+use std::net::IpAddr;
 use std::time::{Duration, Instant};
+
+/// Who an attempt is charged to.
+///
+/// A request that proves control of its wallet is charged to the wallet. Any other
+/// request names a wallet it may not hold, so it is charged to that wallet as seen
+/// from its own client network. A third party then spends its own budget, never the
+/// budget of the wallet's owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttemptSubject {
+    /// The request carried a valid signature from this wallet.
+    Wallet(Pubkey),
+    /// The request named this wallet without proof, from this client network.
+    WalletAtOrigin(Pubkey, IpAddr),
+}
+
+impl AttemptSubject {
+    /// The subject of a request, from whether it proved control of `wallet`.
+    pub fn of(wallet: Pubkey, origin: IpAddr, wallet_proved: bool) -> Self {
+        if wallet_proved {
+            Self::Wallet(wallet)
+        } else {
+            Self::WalletAtOrigin(wallet, origin)
+        }
+    }
+}
 
 #[derive(Debug)]
 struct WalletState {
@@ -45,7 +72,7 @@ struct WalletState {
 }
 
 pub struct WalletAttemptTracker {
-    state: DashMap<Pubkey, WalletState>,
+    state: DashMap<AttemptSubject, WalletState>,
     /// Maximum validation attempts per wallet per window. Configured at
     /// startup via `VALIDATION_WALLET_MAX_ATTEMPTS` env var (default 5).
     /// Each call to `check_and_record_attempt` consumes one slot;
@@ -86,9 +113,9 @@ impl WalletAttemptTracker {
     /// Caller MUST follow up with `refund_on_success` if the validation
     /// succeeds. Failures leave the slot consumed, which is what binds
     /// the per-wallet retry budget.
-    pub fn check_and_record_attempt(&self, wallet: &Pubkey) -> Result<(), u64> {
+    pub fn check_and_record_attempt(&self, subject: &AttemptSubject) -> Result<(), u64> {
         let now = Instant::now();
-        let mut entry = self.state.entry(*wallet).or_insert_with(|| WalletState {
+        let mut entry = self.state.entry(*subject).or_insert_with(|| WalletState {
             attempts: 0,
             window_start: now,
         });
@@ -112,10 +139,10 @@ impl WalletAttemptTracker {
         Ok(())
     }
 
-    /// Whether the wallet has cap room, without recording an attempt. Returns
+    /// Whether the subject has cap room, without recording an attempt. Returns
     /// `Err(retry_after_secs)` when its window budget is spent.
-    pub fn check(&self, wallet: &Pubkey) -> Result<(), u64> {
-        let Some(entry) = self.state.get(wallet) else {
+    pub fn check(&self, subject: &AttemptSubject) -> Result<(), u64> {
+        let Some(entry) = self.state.get(subject) else {
             return Ok(());
         };
         let elapsed = Instant::now().duration_since(entry.window_start);
@@ -128,25 +155,46 @@ impl WalletAttemptTracker {
     /// Refund a slot consumed by `check_and_record_attempt`. Call after a
     /// successful validation so the wallet's budget is restored. Idempotent
     /// safety: never decrements below zero.
-    pub fn refund_on_success(&self, wallet: &Pubkey) {
-        if let Some(mut entry) = self.state.get_mut(wallet) {
+    pub fn refund_on_success(&self, subject: &AttemptSubject) {
+        if let Some(mut entry) = self.state.get_mut(subject) {
             entry.attempts = entry.attempts.saturating_sub(1);
         }
     }
 
     #[cfg(test)]
-    pub fn get_attempts(&self, wallet: &Pubkey) -> u8 {
-        self.state.get(wallet).map(|e| e.attempts).unwrap_or(0)
+    pub fn get_attempts(&self, subject: &AttemptSubject) -> u8 {
+        self.state.get(subject).map(|e| e.attempts).unwrap_or(0)
     }
 
-    /// Remove expired entries with no consumed attempts.
+    #[cfg(test)]
+    pub fn tracked_count(&self) -> usize {
+        self.state.len()
+    }
+
+    /// Attempts held against `wallet` by every subject that names it. A test that asserts
+    /// on this sees a charge that went to the wrong subject as well as one that was kept.
+    #[cfg(test)]
+    pub fn attempts_naming(&self, wallet: &Pubkey) -> u8 {
+        self.state
+            .iter()
+            .filter(|entry| match entry.key() {
+                AttemptSubject::Wallet(named) | AttemptSubject::WalletAtOrigin(named, _) => {
+                    named == wallet
+                }
+            })
+            .map(|entry| entry.attempts)
+            .sum()
+    }
+
+    /// Remove every entry whose window has ended. The next attempt from that subject
+    /// starts a new window, exactly as the reset in `check_and_record_attempt` does,
+    /// so an ended window carries nothing worth keeping, consumed attempts included.
     /// The approximate count avoids synchronization on this maintenance path.
     pub fn evict_expired(&self) -> usize {
         let now = Instant::now();
         let before = self.state.len();
-        self.state.retain(|_, state| {
-            now.duration_since(state.window_start) < self.window_duration || state.attempts > 0
-        });
+        self.state
+            .retain(|_, state| now.duration_since(state.window_start) < self.window_duration);
         before.saturating_sub(self.state.len())
     }
 }
@@ -156,8 +204,8 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    fn dummy_wallet(byte: u8) -> Pubkey {
-        Pubkey::new_from_array([byte; 32])
+    fn dummy_wallet(byte: u8) -> AttemptSubject {
+        AttemptSubject::Wallet(Pubkey::new_from_array([byte; 32]))
     }
 
     /// Test-default cap (matches `default_for_tests()`).
@@ -304,21 +352,69 @@ mod tests {
     }
 
     #[test]
-    fn evict_expired_drops_zero_count_stale_entries() {
+    fn eviction_keeps_entries_inside_their_window() {
         let tracker = WalletAttemptTracker::default_for_tests();
-        // Add a wallet with active count — should NOT be evicted even if window expired.
-        let active = dummy_wallet(9);
         tracker
-            .check_and_record_attempt(&active)
+            .check_and_record_attempt(&dummy_wallet(9))
             .expect("attempt within cap");
-        // Add a wallet at zero count — eligible for eviction once window expires.
-        let zero = dummy_wallet(10);
+        let refunded = dummy_wallet(10);
         tracker
-            .check_and_record_attempt(&zero)
-            .expect("zero-window attempt allowed");
-        tracker.refund_on_success(&zero);
+            .check_and_record_attempt(&refunded)
+            .expect("attempt within cap");
+        tracker.refund_on_success(&refunded);
 
-        // Without forcing time, neither is window-expired → nothing evicted.
         assert_eq!(tracker.evict_expired(), 0);
+        assert_eq!(tracker.tracked_count(), 2);
+    }
+
+    /// An entry that holds attempts must go once its window ends. Kept entries would
+    /// grow the map by one for every subject that ever failed.
+    #[test]
+    fn eviction_drops_an_ended_window_that_still_holds_attempts() {
+        let tracker = WalletAttemptTracker::new(3, Duration::from_millis(20));
+        let failed = dummy_wallet(11);
+        tracker
+            .check_and_record_attempt(&failed)
+            .expect("attempt within cap");
+        assert_eq!(tracker.get_attempts(&failed), 1);
+
+        std::thread::sleep(Duration::from_millis(40));
+        assert_eq!(tracker.evict_expired(), 1);
+        assert_eq!(tracker.tracked_count(), 0);
+        assert!(tracker.check_and_record_attempt(&failed).is_ok());
+    }
+
+    #[test]
+    fn a_wallet_named_from_two_networks_has_two_budgets() {
+        let tracker = WalletAttemptTracker::default_for_tests();
+        let wallet = Pubkey::new_from_array([12; 32]);
+        let here: IpAddr = "203.0.113.7".parse().expect("address");
+        let elsewhere: IpAddr = "198.51.100.9".parse().expect("address");
+        let third_party = AttemptSubject::of(wallet, elsewhere, false);
+        for _ in 0..TEST_MAX {
+            tracker
+                .check_and_record_attempt(&third_party)
+                .expect("attempt within cap");
+        }
+        assert!(tracker.check_and_record_attempt(&third_party).is_err());
+
+        // Neither the owner's proven budget nor another network's is touched.
+        assert!(tracker
+            .check(&AttemptSubject::of(wallet, here, true))
+            .is_ok());
+        assert!(tracker
+            .check(&AttemptSubject::of(wallet, here, false))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_proven_wallet_has_one_budget_on_every_network() {
+        let wallet = Pubkey::new_from_array([13; 32]);
+        let here: IpAddr = "203.0.113.7".parse().expect("address");
+        let elsewhere: IpAddr = "198.51.100.9".parse().expect("address");
+        assert_eq!(
+            AttemptSubject::of(wallet, here, true),
+            AttemptSubject::of(wallet, elsewhere, true)
+        );
     }
 }

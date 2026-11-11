@@ -4,10 +4,10 @@ use serde::Deserialize;
 use solana_sdk::hash::hashv;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::{read_keypair_file, Keypair, Signature};
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::str::FromStr;
 
+use crate::paired::authorization::{self, AuthorizationMode, NetworkMode};
 use crate::validation::composite::ScoringConfig;
 
 /// Protocol authority pubkey that signs `VALIDATION_SERVICE_URL` for
@@ -315,22 +315,78 @@ fn parse_bool(value: Option<&str>, default: bool) -> bool {
 const DEFAULT_PAIRED_SESSION_CONCURRENCY: usize = 16;
 const MAX_PAIRED_SESSION_CONCURRENCY: usize = 128;
 
-/// Wallets allowed to open paired sessions, from a comma-separated list. Unset or empty admits
-/// every wallet.
-fn parse_paired_wallets(value: Option<&str>) -> Result<Option<HashSet<Pubkey>>, String> {
-    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+/// The service key for paired authorizations: 32 bytes as 64 hex characters. Unset yields
+/// `None`, and the caller decides whether a key drawn at start is acceptable.
+fn parse_paired_authorization_key(value: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    const INVALID: &str = "EXECUTOR_PAIRED_AUTHORIZATION_KEY_HEX must be 64 hex characters";
+    let Some(value) = value.map(str::trim) else {
         return Ok(None);
     };
+    let bytes = value.as_bytes();
+    if bytes.len() != 64 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return Err(INVALID.into());
+    }
+    let mut key = [0u8; 32];
+    for (slot, pair) in key.iter_mut().zip(bytes.chunks_exact(2)) {
+        let text = std::str::from_utf8(pair).map_err(|_| INVALID.to_string())?;
+        *slot = u8::from_str_radix(text, 16).map_err(|_| INVALID.to_string())?;
+    }
+    if key.iter().all(|byte| *byte == key[0]) {
+        return Err("EXECUTOR_PAIRED_AUTHORIZATION_KEY_HEX must come from a random source".into());
+    }
+    Ok(Some(key))
+}
+
+fn parse_paired_authorization_ttl_secs(value: Option<&str>) -> Result<u64, String> {
+    let Some(value) = value else {
+        return Ok(authorization::DEFAULT_TTL_SECS);
+    };
     value
-        .split(',')
-        .map(str::trim)
-        .filter(|wallet| !wallet.is_empty())
-        .map(|wallet| {
-            Pubkey::from_str(wallet)
-                .map_err(|_| format!("EXECUTOR_PAIRED_WALLETS holds an invalid wallet: {wallet}"))
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|secs| (authorization::MIN_TTL_SECS..=authorization::MAX_TTL_SECS).contains(secs))
+        .ok_or_else(|| {
+            format!(
+                "EXECUTOR_PAIRED_AUTHORIZATION_TTL_SECS must be {}-{}",
+                authorization::MIN_TTL_SECS,
+                authorization::MAX_TTL_SECS
+            )
         })
-        .collect::<Result<HashSet<_>, _>>()
-        .map(Some)
+}
+
+/// Whether the single-capture route refuses updates. Unset allows them. An unknown value
+/// is an error, so a typo never leaves the route in the state the operator did not ask for.
+/// Refusing them needs paired sessions, the only other route that verifies anyone.
+fn parse_single_capture_updates_refused(
+    value: Option<&str>,
+    paired_enabled: bool,
+) -> Result<bool, String> {
+    match value.map(str::trim) {
+        None | Some("allow") => Ok(false),
+        Some("refuse") if paired_enabled => Ok(true),
+        Some("refuse") => Err(
+            "EXECUTOR_SINGLE_CAPTURE_UPDATES=refuse requires EXECUTOR_PAIRED_ENABLED=true".into(),
+        ),
+        Some(other) => Err(format!(
+            "EXECUTOR_SINGLE_CAPTURE_UPDATES must be allow or refuse, got {other:?}"
+        )),
+    }
+}
+
+/// A public key ships to every browser, so a finite quota on it is one budget that any
+/// visitor can spend for all the others.
+fn validate_integrators(integrators: &[IntegratorConfig]) -> Result<(), String> {
+    match integrators
+        .iter()
+        .find(|integrator| integrator.public && integrator.quota != 0)
+    {
+        Some(integrator) => Err(format!(
+            "INTEGRATORS entry {:?} is public and must have quota 0",
+            integrator.name
+        )),
+        None => Ok(()),
+    }
 }
 
 fn parse_paired_session_concurrency(value: Option<&str>) -> Result<usize, String> {
@@ -938,14 +994,95 @@ mod tests {
     }
 
     #[test]
-    fn paired_wallets_admit_everyone_when_unset_and_reject_invalid_entries() {
-        assert_eq!(parse_paired_wallets(None).unwrap(), None);
-        assert_eq!(parse_paired_wallets(Some("  ")).unwrap(), None);
-        let first = Pubkey::new_from_array([1; 32]);
-        let second = Pubkey::new_from_array([2; 32]);
-        let listed = parse_paired_wallets(Some(&format!(" {first} ,{second},"))).unwrap();
-        assert_eq!(listed, Some(HashSet::from([first, second])));
-        assert!(parse_paired_wallets(Some(&format!("{first},not-a-wallet"))).is_err());
+    fn paired_authorization_key_needs_64_hex_characters_from_a_random_source() {
+        assert_eq!(parse_paired_authorization_key(None).unwrap(), None);
+        let key = parse_paired_authorization_key(Some(&format!(" {} ", "0aF1".repeat(16))))
+            .unwrap()
+            .expect("key");
+        assert_eq!(key[..2], [0x0a, 0xf1]);
+        let multi_byte = format!("a\u{e9}{}", "0".repeat(61));
+        assert_eq!(multi_byte.len(), 64);
+        for invalid in [
+            String::new(),
+            "abcd".to_owned(),
+            "0".repeat(63),
+            "0".repeat(65),
+            "zz".repeat(32),
+            multi_byte,
+            "00".repeat(32),
+            "ab".repeat(32),
+        ] {
+            assert!(
+                parse_paired_authorization_key(Some(&invalid)).is_err(),
+                "{} characters",
+                invalid.len()
+            );
+        }
+    }
+
+    #[test]
+    fn paired_authorization_key_errors_never_echo_the_key() {
+        let rejected = "ab".repeat(32);
+        let error = parse_paired_authorization_key(Some(&rejected)).unwrap_err();
+        assert!(!error.contains(&rejected));
+    }
+
+    #[test]
+    fn paired_authorization_lifetime_defaults_and_stays_in_range() {
+        assert_eq!(parse_paired_authorization_ttl_secs(None).unwrap(), 900);
+        assert_eq!(
+            parse_paired_authorization_ttl_secs(Some("300")).unwrap(),
+            300
+        );
+        assert_eq!(
+            parse_paired_authorization_ttl_secs(Some("3600")).unwrap(),
+            3600
+        );
+        // Clients drop an authorization with under 120 s left, so a shorter lifetime would
+        // leave them almost no time to use it.
+        for value in ["60", "299", "3601", "soon", ""] {
+            assert!(parse_paired_authorization_ttl_secs(Some(value)).is_err());
+        }
+    }
+
+    #[test]
+    fn single_capture_updates_are_allowed_unless_refused() {
+        assert!(!parse_single_capture_updates_refused(None, true).unwrap());
+        assert!(!parse_single_capture_updates_refused(Some("allow"), true).unwrap());
+        assert!(parse_single_capture_updates_refused(Some(" refuse "), true).unwrap());
+        for value in ["", "off", "Refuse", "true"] {
+            assert!(parse_single_capture_updates_refused(Some(value), true).is_err());
+        }
+    }
+
+    /// With paired sessions off and updates refused, no route could verify anyone.
+    #[test]
+    fn refusing_updates_requires_paired_sessions() {
+        assert!(parse_single_capture_updates_refused(Some("refuse"), false).is_err());
+        assert!(!parse_single_capture_updates_refused(Some("allow"), false).unwrap());
+        assert!(!parse_single_capture_updates_refused(None, false).unwrap());
+    }
+
+    #[test]
+    fn integrators_default_to_private_and_a_public_key_needs_an_unlimited_quota() {
+        let parsed: Vec<IntegratorConfig> = serde_json::from_str(
+            r#"[{"api_key":"a","name":"site","quota":0,"public":true},
+                {"api_key":"b","name":"server","quota":25}]"#,
+        )
+        .unwrap();
+        assert!(parsed[0].public);
+        assert!(!parsed[1].public);
+        assert!(validate_integrators(&parsed).is_ok());
+
+        let limited: Vec<IntegratorConfig> =
+            serde_json::from_str(r#"[{"api_key":"a","name":"site","quota":1,"public":true}]"#)
+                .unwrap();
+        let error = validate_integrators(&limited).unwrap_err();
+        assert!(error.contains("site"));
+        assert!(
+            !error.contains("\"a\""),
+            "the key must stay out of the error"
+        );
     }
 
     #[test]
@@ -971,6 +1108,10 @@ pub struct IntegratorConfig {
     pub api_key: String,
     pub name: String,
     pub quota: u64,
+    /// True for a key that ships in a public client, such as the site's browser bundle.
+    /// Its requests are limited per client network, never by one bucket for all holders.
+    #[serde(default)]
+    pub public: bool,
 }
 
 pub struct Config {
@@ -1051,10 +1192,27 @@ pub struct Config {
     /// Paired finalize requests buffered at once. Each body may reach 2 MiB, so this bounds
     /// their memory. Configurable via `EXECUTOR_PAIRED_SESSION_CONCURRENCY`. Default 16.
     pub paired_session_concurrency: usize,
-    /// Wallets allowed to open paired sessions. Any other wallet gets the 404 that clients read
-    /// as paired sessions being off. `None` admits every wallet. Configurable via
-    /// `EXECUTOR_PAIRED_WALLETS`, a comma-separated list.
-    pub paired_wallets: Option<HashSet<Pubkey>>,
+    /// The service key for paired authorizations, from `EXECUTOR_PAIRED_AUTHORIZATION_KEY_HEX`.
+    /// Production with paired sessions on requires it: a key drawn at start would void every
+    /// authorization at each deploy, in the middle of a capture.
+    pub paired_authorization_key: Option<[u8; 32]>,
+    /// Lifetime of a paired authorization in seconds. Configurable via
+    /// `EXECUTOR_PAIRED_AUTHORIZATION_TTL_SECS`. Default 900.
+    pub paired_authorization_ttl_secs: u64,
+    /// Whether a paired open and finalize must carry a wallet-signed authorization.
+    /// Configurable via `EXECUTOR_PAIRED_AUTHORIZATION`: `required` (default) or `optional`.
+    pub paired_authorization_mode: AuthorizationMode,
+    /// Whether a paired open must come from the client network that fetched its grant.
+    /// Configurable via `EXECUTOR_PAIRED_AUTHORIZATION_NETWORK`: `enforce` (default) or
+    /// `observe`.
+    pub paired_authorization_network: NetworkMode,
+    /// When true, `/validate-features` refuses updates as it refuses baseline writes, and
+    /// every verification goes through a paired session. Configurable via
+    /// `EXECUTOR_SINGLE_CAPTURE_UPDATES`: `allow` (default) or `refuse`.
+    pub single_capture_updates_refused: bool,
+    /// Serves the study routes when true. Off by default, so the routes answer 404 while
+    /// study intake is closed. Configurable via `EXECUTOR_STUDY_ROUTES_ENABLED`.
+    pub study_routes_enabled: bool,
     pub scoring_config: ResolvedScoringConfig,
 }
 
@@ -1171,6 +1329,7 @@ impl Config {
                 .map_err(|e| format!("INTEGRATORS contains invalid JSON: {e}"))?,
             Err(_) => vec![],
         };
+        validate_integrators(&integrators)?;
 
         let api_keys = if api_keys.is_empty() && !integrators.is_empty() {
             integrators.iter().map(|i| i.api_key.clone()).collect()
@@ -1261,8 +1420,40 @@ impl Config {
                 .ok()
                 .as_deref(),
         )?;
-        let paired_wallets =
-            parse_paired_wallets(std::env::var("EXECUTOR_PAIRED_WALLETS").ok().as_deref())?;
+        let paired_authorization_key = parse_paired_authorization_key(
+            std::env::var("EXECUTOR_PAIRED_AUTHORIZATION_KEY_HEX")
+                .ok()
+                .as_deref(),
+        )?;
+        if environment.is_prod() && paired_enabled && paired_authorization_key.is_none() {
+            return Err(
+                "EXECUTOR_PAIRED_AUTHORIZATION_KEY_HEX is required when ENVIRONMENT=prod \
+                 and paired sessions are enabled"
+                    .into(),
+            );
+        }
+        let paired_authorization_ttl_secs = parse_paired_authorization_ttl_secs(
+            std::env::var("EXECUTOR_PAIRED_AUTHORIZATION_TTL_SECS")
+                .ok()
+                .as_deref(),
+        )?;
+        let paired_authorization_mode = AuthorizationMode::parse(
+            std::env::var("EXECUTOR_PAIRED_AUTHORIZATION")
+                .ok()
+                .as_deref(),
+        )?;
+        let paired_authorization_network = NetworkMode::parse(
+            std::env::var("EXECUTOR_PAIRED_AUTHORIZATION_NETWORK")
+                .ok()
+                .as_deref(),
+        )?;
+        let single_capture_updates_refused = parse_single_capture_updates_refused(
+            std::env::var("EXECUTOR_SINGLE_CAPTURE_UPDATES")
+                .ok()
+                .as_deref(),
+            paired_enabled,
+        )?;
+        let study_routes_enabled = parse_bool_env("EXECUTOR_STUDY_ROUTES_ENABLED", false);
 
         Ok(Config {
             environment,
@@ -1296,7 +1487,12 @@ impl Config {
             cross_wallet_cooldown_enforce,
             paired_enabled,
             paired_session_concurrency,
-            paired_wallets,
+            paired_authorization_key,
+            paired_authorization_ttl_secs,
+            paired_authorization_mode,
+            paired_authorization_network,
+            single_capture_updates_refused,
+            study_routes_enabled,
             scoring_config,
         })
     }

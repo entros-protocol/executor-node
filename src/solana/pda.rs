@@ -13,22 +13,13 @@ pub fn verifier_program_id() -> Pubkey {
     VERIFIER_PROGRAM
 }
 
-pub fn find_challenge_pda(challenger: &Pubkey, nonce: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"challenge", challenger.as_ref(), nonce.as_ref()],
-        &VERIFIER_PROGRAM,
-    )
-}
-
-pub fn find_verification_result_pda(verifier: &Pubkey, nonce: &[u8; 32]) -> (Pubkey, u8) {
-    Pubkey::find_program_address(
-        &[b"verification", verifier.as_ref(), nonce.as_ref()],
-        &VERIFIER_PROGRAM,
-    )
-}
-
 pub fn find_identity_state_pda(user: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"identity", user.as_ref()], &ANCHOR_PROGRAM)
+}
+
+/// The record the Anchor program writes when an identity moves to `wallet`.
+pub fn find_migration_record_pda(wallet: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"migration", wallet.as_ref()], &ANCHOR_PROGRAM)
 }
 
 #[allow(dead_code)] // Reserved for integrator onboarding.
@@ -42,21 +33,28 @@ mod tests {
 
     #[test]
     fn pda_derivation_is_deterministic() {
-        let pubkey = Pubkey::new_unique();
-        let nonce = [42u8; 32];
-        let (pda1, bump1) = find_challenge_pda(&pubkey, &nonce);
-        let (pda2, bump2) = find_challenge_pda(&pubkey, &nonce);
-        assert_eq!(pda1, pda2);
-        assert_eq!(bump1, bump2);
+        let wallet = Pubkey::new_unique();
+        assert_eq!(
+            find_identity_state_pda(&wallet),
+            find_identity_state_pda(&wallet)
+        );
+        assert_eq!(
+            find_migration_record_pda(&wallet),
+            find_migration_record_pda(&wallet)
+        );
     }
 
     #[test]
-    fn different_nonces_produce_different_pdas() {
-        let pubkey = Pubkey::new_unique();
-        let nonce1 = [1u8; 32];
-        let nonce2 = [2u8; 32];
-        let (pda1, _) = find_challenge_pda(&pubkey, &nonce1);
-        let (pda2, _) = find_challenge_pda(&pubkey, &nonce2);
-        assert_ne!(pda1, pda2);
+    fn each_wallet_and_each_seed_has_its_own_address() {
+        let wallet = Pubkey::new_unique();
+        let other = Pubkey::new_unique();
+        assert_ne!(
+            find_identity_state_pda(&wallet).0,
+            find_identity_state_pda(&other).0
+        );
+        assert_ne!(
+            find_identity_state_pda(&wallet).0,
+            find_migration_record_pda(&wallet).0
+        );
     }
 }

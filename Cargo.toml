@@ -3,7 +3,7 @@ name = "executor-node"
 version = "0.1.2"
 edition = "2021"
 rust-version = "1.88"
-description = "Entros gateway, challenge service, risk composer, attestation issuer, and Solana relayer"
+description = "Entros gateway, challenge service, risk composer, and attestation issuer"
 
 [dependencies]
 axum = "0.8"
@@ -30,6 +30,9 @@ http-body-util = "0.1"
 thiserror = "2"
 rand = "0.8"
 subtle = "2"
+# Keyed MAC over the paired authorization the executor issues.
+hmac = "0.12"
+sha2 = "0.10"
 zeroize = "1"
 bs58 = "0.5"
 governor = "0.8"

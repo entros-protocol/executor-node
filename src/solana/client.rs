@@ -33,6 +33,13 @@ pub struct RecentActivity {
     pub oldest_block_time: Option<i64>,
 }
 
+/// The owner and data of one account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountSnapshot {
+    pub owner: Pubkey,
+    pub data: Vec<u8>,
+}
+
 pub struct SolanaClient {
     rpc: RpcClient,
     relayer_keypair: Keypair,
@@ -76,6 +83,33 @@ impl SolanaClient {
                 AppError::SolanaRpcUnavailable
             })?;
         Ok(accounts.pop().flatten().map(|account| account.data))
+    }
+
+    /// Reads several accounts in one call and keeps each owner with its data.
+    ///
+    /// Lamports sent to an address create a System-owned account with no data
+    /// there. A caller that acts on what an account holds must check the owner,
+    /// so this read returns it.
+    pub async fn get_account_snapshots(
+        &self,
+        pubkeys: &[Pubkey],
+    ) -> Result<Vec<Option<AccountSnapshot>>, AppError> {
+        let accounts = self.rpc.get_multiple_accounts(pubkeys).await.map_err(|e| {
+            tracing::error!(error = %e, "get_account_snapshots RPC call failed");
+            AppError::SolanaRpcUnavailable
+        })?;
+        if accounts.len() != pubkeys.len() {
+            return Err(AppError::SolanaRpcUnavailable);
+        }
+        Ok(accounts
+            .into_iter()
+            .map(|account| {
+                account.map(|account| AccountSnapshot {
+                    owner: account.owner,
+                    data: account.data,
+                })
+            })
+            .collect())
     }
 
     pub async fn require_devnet(&self) -> Result<(), AppError> {
@@ -148,81 +182,10 @@ impl SolanaClient {
         }
     }
 
-    /// Send a transaction with the given instructions, signed by the relayer keypair.
-    /// Retries up to MAX_RETRIES times with exponential backoff on transient failures.
-    /// Fetches a fresh blockhash on each retry.
-    pub async fn send_verification_tx(
-        &self,
-        instructions: Vec<Instruction>,
-    ) -> Result<Signature, AppError> {
-        let mut backoff = INITIAL_BACKOFF;
-
-        for attempt in 0..MAX_RETRIES {
-            let mut all_instructions =
-                vec![ComputeBudgetInstruction::set_compute_unit_limit(400_000)];
-            all_instructions.extend(instructions.clone());
-
-            let recent_blockhash = match self.rpc.get_latest_blockhash().await {
-                Ok(bh) => bh,
-                Err(e) => {
-                    let last_error = e.to_string();
-                    if attempt < MAX_RETRIES - 1 {
-                        tracing::warn!(
-                            attempt,
-                            error = %last_error,
-                            "Blockhash fetch failed, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                    tracing::error!(
-                        error = %last_error,
-                        attempts = attempt + 1,
-                        "Blockhash fetch failed after retries (send_verification_tx)"
-                    );
-                    return Err(AppError::SolanaRpcUnavailable);
-                }
-            };
-
-            let tx = Transaction::new_signed_with_payer(
-                &all_instructions,
-                Some(&self.relayer_keypair.pubkey()),
-                &[&self.relayer_keypair],
-                recent_blockhash,
-            );
-
-            match self.rpc.send_and_confirm_transaction(&tx).await {
-                Ok(sig) => return Ok(sig),
-                Err(e) => {
-                    let last_error = e.to_string();
-                    if attempt < MAX_RETRIES - 1 {
-                        tracing::warn!(
-                            attempt,
-                            error = %last_error,
-                            "Transaction failed, retrying with fresh blockhash"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
-                        continue;
-                    }
-                    tracing::error!(
-                        error = %last_error,
-                        attempts = attempt + 1,
-                        "Transaction send failed after retries (send_verification_tx)"
-                    );
-                    return Err(AppError::TransactionSubmissionFailed);
-                }
-            }
-        }
-
-        // Unreachable in practice: the loop above returns Ok or Err on every iteration.
-        // Kept as a defensive fallback so the function signature stays total.
-        Err(AppError::TransactionSubmissionFailed)
-    }
-
     /// Send a transaction signed by both the relayer (payer) and a separate authority.
     /// If authority == relayer, uses a single signer to avoid duplicate signer errors.
+    /// Retries up to MAX_RETRIES times with exponential backoff on transient failures,
+    /// and fetches a fresh blockhash on each retry.
     pub async fn send_attestation_tx(
         &self,
         instructions: Vec<Instruction>,

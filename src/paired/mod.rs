@@ -5,11 +5,12 @@
 //! round would add seconds inside the interaction. Finalize carries every segment and goes
 //! through the same timed stack, quota and admission checks as `/validate-features`.
 
+pub mod authorization;
 pub mod finalize;
+pub mod uploads;
 
 use std::net::SocketAddr;
 use std::str::FromStr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
@@ -21,13 +22,13 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use solana_sdk::pubkey::Pubkey;
-use tokio::sync::OwnedSemaphorePermit;
 
+use self::authorization::{AuthorizationError, AuthorizationPayload, Authorized, Step};
 use crate::error::AppError;
 use crate::server::AppState;
 use crate::validation::handler::{check_probing_block, request_origin};
 
-/// Largest open body: a wallet and a tier.
+/// Largest open body: a wallet, a tier and an authorization of fixed-width hex fields.
 pub const OPEN_BODY_BYTES: usize = 4 * 1_024;
 /// Largest commit body: a wallet, a session id, hex digests and small integers.
 pub const COMMIT_BODY_BYTES: usize = 8 * 1_024;
@@ -69,21 +70,6 @@ pub(crate) fn invalid_request() -> AppError {
     }
 }
 
-/// One paired finalize slot. The gate takes it before the body is buffered, and the finalize
-/// handler holds it until it returns, so the timing floor after the handler holds no slot.
-#[derive(Clone)]
-pub struct SessionSlot {
-    _permit: Arc<OwnedSemaphorePermit>,
-}
-
-impl SessionSlot {
-    pub fn new(permit: OwnedSemaphorePermit) -> Self {
-        Self {
-            _permit: Arc::new(permit),
-        }
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenRequest {
@@ -91,6 +77,9 @@ pub struct OpenRequest {
     protocol_version: Option<u16>,
     wallet: String,
     tier: String,
+    /// The wallet-signed authorization from `GET /paired/authorization`.
+    #[serde(default)]
+    authorization: Option<AuthorizationPayload>,
 }
 
 #[derive(Serialize)]
@@ -102,8 +91,11 @@ struct UpstreamOpen<'a> {
 }
 
 /// Opens a paired session. The nonce is fresh randomness bound into the session's attempt
-/// binding. It never passes through the single-capture challenge registry, whose current
-/// nonce `/attest` still consumes.
+/// binding. It never passes through the single-capture challenge registry.
+///
+/// The request must show that the wallet's owner asked for the session. An open displaces
+/// the wallet's live session and leads to a charged attempt, so an unproven one would let any
+/// caller do both to a wallet it does not hold.
 pub async fn open_handler(
     State(state): State<AppState>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
@@ -111,15 +103,6 @@ pub async fn open_handler(
     PairedJson(request): PairedJson<OpenRequest>,
 ) -> Result<Response, AppError> {
     let wallet = Pubkey::from_str(&request.wallet).map_err(|_| invalid_request())?;
-    // An unlisted wallet gets the answer a client reads as paired sessions being off, so it
-    // falls back to the single capture.
-    if state
-        .paired_wallets
-        .as_ref()
-        .is_some_and(|wallets| !wallets.contains(&wallet))
-    {
-        return Ok(StatusCode::NOT_FOUND.into_response());
-    }
     if request.protocol_version != Some(2) {
         return Err(AppError::PairedRejected {
             status: StatusCode::BAD_REQUEST,
@@ -131,10 +114,31 @@ pub async fn open_handler(
     }
     let (ip, _) = request_origin(&headers, peer.map(|Extension(c)| c.0));
     check_probing_block(&state, ip)?;
-    // A wallet out of attempts could not finalize, so it opens nothing. Opening records none.
+    let authorized = state.paired_authorizer.attempt_subject(
+        &wallet,
+        request.authorization.as_ref(),
+        Step::Open,
+        ip,
+    );
+    // Counted in both network modes, so the rollout can see how often honest clients change
+    // network before the rule is enforced.
+    if matches!(
+        authorized,
+        Err(AuthorizationError::NetworkMismatch)
+            | Ok(Authorized {
+                network_mismatch: true,
+                ..
+            })
+    ) {
+        state
+            .metrics
+            .increment_paired_authorization_network_mismatch();
+    }
+    let subject = authorized?.subject;
+    // A subject out of attempts could not finalize, so it opens nothing. Opening records none.
     state
         .wallet_attempts
-        .check(&wallet)
+        .check(&subject)
         .map_err(|retry_after_secs| AppError::WalletRateLimited { retry_after_secs })?;
 
     let mut nonce = [0u8; 32];
@@ -200,14 +204,7 @@ pub async fn cue_handler(
     headers: HeaderMap,
     PairedJson(request): PairedJson<CueRequest>,
 ) -> Result<Response, AppError> {
-    let wallet = Pubkey::from_str(&request.wallet_id).map_err(|_| invalid_request())?;
-    if state
-        .paired_wallets
-        .as_ref()
-        .is_some_and(|wallets| !wallets.contains(&wallet))
-    {
-        return Ok(StatusCode::NOT_FOUND.into_response());
-    }
+    Pubkey::from_str(&request.wallet_id).map_err(|_| invalid_request())?;
     let (ip, _) = request_origin(&headers, peer.map(|Extension(c)| c.0));
     check_probing_block(&state, ip)?;
     relay(&state, "/paired/cue", &request).await
@@ -248,9 +245,18 @@ async fn relay<B: Serialize>(state: &AppState, path: &str, body: &B) -> Result<R
 
 #[cfg(test)]
 mod tests {
+    use super::authorization::{
+        authorization_signed_by, signed_authorization, AuthorizationMode, NetworkMode,
+        PairedAuthorizer,
+    };
     use super::*;
+    use crate::integrator::wallet_attempts::AttemptSubject;
+    use crate::validation::handler::FALLBACK_ORIGIN;
     use crate::validation::mock_validator::{state_with_mock_validator, MockValidator};
     use axum::body::to_bytes;
+    use solana_sdk::signature::Keypair;
+    use solana_sdk::signer::Signer;
+    use std::sync::Arc;
 
     const WALLET: &str = "11111111111111111111111111111111";
 
@@ -269,7 +275,27 @@ mod tests {
             protocol_version: Some(2),
             wallet: wallet.into(),
             tier: tier.into(),
+            authorization: None,
         })
+    }
+
+    /// State that refuses a paired request without an authorization, as production does.
+    fn require_authorization(state: &mut AppState) {
+        require_authorization_with(state, NetworkMode::Enforce);
+    }
+
+    fn require_authorization_with(state: &mut AppState, network: NetworkMode) {
+        state.paired_authorizer = Arc::new(
+            PairedAuthorizer::new(&[0x11; 32], 900, AuthorizationMode::Required, network)
+                .expect("authorizer"),
+        );
+    }
+
+    fn refusal_reason(result: Result<Response, AppError>) -> (StatusCode, String) {
+        match result {
+            Err(AppError::PairedRejected { status, reason }) => (status, reason),
+            other => panic!("expected a paired refusal, got {other:?}"),
+        }
     }
 
     fn commit_request() -> PairedJson<CommitRequest> {
@@ -411,35 +437,246 @@ mod tests {
         assert_eq!(mock.request_count(), 0);
     }
 
+    /// Without the authorization, any caller could open a session for a wallet it does not
+    /// hold. The open displaces the owner's live session and ends in a charged attempt.
     #[tokio::test]
-    async fn an_unlisted_wallet_opens_nothing_and_sees_paired_sessions_off() {
+    async fn an_open_without_the_wallets_authorization_is_refused() {
         let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
         let mut state = state_with_mock_validator(tracker(), &mock);
-        let listed = Pubkey::new_from_array([7; 32]);
-        state.paired_wallets = Some(Arc::new(std::collections::HashSet::from([listed])));
+        require_authorization(&mut state);
+        let victim = Keypair::new();
 
-        let response = open_handler(
+        let result = open_handler(
             State(state.clone()),
             None,
             HeaderMap::new(),
-            open_request(WALLET, "trace"),
+            open_request(&victim.pubkey().to_string(), "trace"),
+        )
+        .await;
+        assert_eq!(
+            refusal_reason(result),
+            (StatusCode::UNAUTHORIZED, "authorization_required".into())
+        );
+
+        // A grant issued in the victim's name and signed by another key is refused. So is the
+        // other key's own valid authorization, presented for the victim's wallet.
+        let attacker = Keypair::new();
+        let signed_by_attacker = authorization_signed_by(
+            &state.paired_authorizer,
+            &victim.pubkey(),
+            &attacker,
+            FALLBACK_ORIGIN,
+        );
+        let attackers_own =
+            signed_authorization(&state.paired_authorizer, &attacker, FALLBACK_ORIGIN);
+        for authorization in [signed_by_attacker, attackers_own] {
+            let mut request = open_request(&victim.pubkey().to_string(), "trace");
+            request.0.authorization = Some(authorization);
+            let result = open_handler(State(state.clone()), None, HeaderMap::new(), request).await;
+            assert_eq!(
+                refusal_reason(result),
+                (StatusCode::UNAUTHORIZED, "authorization_invalid".into())
+            );
+        }
+        assert_eq!(mock.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_authorized_open_reaches_the_validator_and_is_reusable() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let mut state = state_with_mock_validator(tracker(), &mock);
+        require_authorization(&mut state);
+        let owner = Keypair::new();
+        let authorization = signed_authorization(&state.paired_authorizer, &owner, FALLBACK_ORIGIN);
+
+        for _ in 0..2 {
+            let mut request = open_request(&owner.pubkey().to_string(), "trace");
+            request.0.authorization = Some(authorization.clone());
+            open_handler(State(state.clone()), None, HeaderMap::new(), request)
+                .await
+                .expect("forwarded");
+        }
+        assert_eq!(mock.request_count(), 2);
+        // The validator receives no part of the authorization.
+        assert!(mock.received()[0].get("authorization").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_authorization_opens_nothing_from_another_network() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let mut state = state_with_mock_validator(tracker(), &mock);
+        require_authorization(&mut state);
+        let owner = Keypair::new();
+        let elsewhere: std::net::IpAddr = "198.51.100.9".parse().expect("address");
+        let mut request = open_request(&owner.pubkey().to_string(), "trace");
+        request.0.authorization = Some(signed_authorization(
+            &state.paired_authorizer,
+            &owner,
+            elsewhere,
+        ));
+        let result = open_handler(State(state.clone()), None, HeaderMap::new(), request).await;
+        assert_eq!(
+            refusal_reason(result),
+            (StatusCode::UNAUTHORIZED, "authorization_invalid".into())
+        );
+        assert_eq!(mock.request_count(), 0);
+        assert_eq!(state.metrics.paired_authorization_network_mismatch(), 1);
+    }
+
+    /// While the network rule is observed, an open from another network passes, is counted,
+    /// and is charged to the network it came from, never to the wallet's own budget.
+    #[tokio::test]
+    async fn an_observed_open_from_another_network_passes_and_is_counted() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let mut state = state_with_mock_validator(tracker(), &mock);
+        require_authorization_with(&mut state, NetworkMode::Observe);
+        let owner = Keypair::new();
+        let wallet = owner.pubkey();
+        while state
+            .wallet_attempts
+            .check_and_record_attempt(&AttemptSubject::Wallet(wallet))
+            .is_ok()
+        {}
+
+        let elsewhere: std::net::IpAddr = "198.51.100.9".parse().expect("address");
+        let mut request = open_request(&wallet.to_string(), "trace");
+        request.0.authorization = Some(signed_authorization(
+            &state.paired_authorizer,
+            &owner,
+            elsewhere,
+        ));
+        open_handler(State(state.clone()), None, HeaderMap::new(), request)
+            .await
+            .expect("an observed mismatch opens");
+        assert_eq!(mock.request_count(), 1);
+        assert_eq!(state.metrics.paired_authorization_network_mismatch(), 1);
+
+        // From the network that fetched the grant, the wallet's own budget applies.
+        let mut request = open_request(&wallet.to_string(), "trace");
+        request.0.authorization = Some(signed_authorization(
+            &state.paired_authorizer,
+            &owner,
+            FALLBACK_ORIGIN,
+        ));
+        let result = open_handler(State(state.clone()), None, HeaderMap::new(), request).await;
+        assert!(matches!(result, Err(AppError::WalletRateLimited { .. })));
+        assert_eq!(state.metrics.paired_authorization_network_mismatch(), 1);
+    }
+
+    /// Only an authorization that passes every other check counts as one from another network.
+    #[tokio::test]
+    async fn an_invalid_authorization_from_another_network_is_not_counted() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let mut state = state_with_mock_validator(tracker(), &mock);
+        require_authorization_with(&mut state, NetworkMode::Observe);
+        let owner = Keypair::new();
+        let elsewhere: std::net::IpAddr = "198.51.100.9".parse().expect("address");
+        let mut request = open_request(&owner.pubkey().to_string(), "trace");
+        request.0.authorization = Some(authorization_signed_by(
+            &state.paired_authorizer,
+            &owner.pubkey(),
+            &Keypair::new(),
+            elsewhere,
+        ));
+        let result = open_handler(State(state.clone()), None, HeaderMap::new(), request).await;
+        assert_eq!(
+            refusal_reason(result),
+            (StatusCode::UNAUTHORIZED, "authorization_invalid".into())
+        );
+        assert_eq!(state.metrics.paired_authorization_network_mismatch(), 0);
+        assert_eq!(mock.request_count(), 0);
+    }
+
+    /// A third party that fails for a wallet from its own network spends its own budget.
+    /// The owner, who proves the wallet, still opens.
+    #[tokio::test]
+    async fn attempts_spent_without_proof_do_not_block_the_owner() {
+        let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
+        let state = state_with_mock_validator(tracker(), &mock);
+        let owner = Keypair::new();
+        let wallet = owner.pubkey();
+        let unproven = AttemptSubject::WalletAtOrigin(wallet, FALLBACK_ORIGIN);
+        while state
+            .wallet_attempts
+            .check_and_record_attempt(&unproven)
+            .is_ok()
+        {}
+
+        let refused = open_handler(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            open_request(&wallet.to_string(), "trace"),
+        )
+        .await;
+        assert!(matches!(refused, Err(AppError::WalletRateLimited { .. })));
+
+        let mut request = open_request(&wallet.to_string(), "trace");
+        request.0.authorization = Some(signed_authorization(
+            &state.paired_authorizer,
+            &owner,
+            FALLBACK_ORIGIN,
+        ));
+        open_handler(State(state), None, HeaderMap::new(), request)
+            .await
+            .expect("the owner opens");
+        assert_eq!(mock.request_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_authorization_route_issues_a_grant_the_wallet_can_sign() {
+        let state = crate::server::build_test_state(tracker(), None);
+        let owner = Keypair::new();
+        let response = authorization::authorization_handler(
+            State(state.clone()),
+            None,
+            HeaderMap::new(),
+            Ok(axum::extract::Query(
+                serde_json::from_value(serde_json::json!({ "wallet": owner.pubkey().to_string() }))
+                    .expect("query"),
+            )),
         )
         .await
-        .expect("answered");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-        let body = to_bytes(response.into_body(), 64).await.expect("body");
-        assert!(body.is_empty());
-        assert_eq!(mock.request_count(), 0);
+        .expect("issued");
+        assert_eq!(
+            response.headers()[axum::http::header::CACHE_CONTROL],
+            "no-store"
+        );
+        let (status, body) = json_of(response).await;
+        assert_eq!(status, StatusCode::OK);
+        let mut keys: Vec<&str> = body
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["challenge", "expires_at", "expires_in", "mac", "origin"]
+        );
+        assert_eq!(body["expires_in"], 900);
+        assert_eq!(body["challenge"].as_str().expect("challenge").len(), 64);
+        assert_eq!(body["origin"].as_str().expect("origin").len(), 32);
+    }
 
-        open_handler(
+    #[tokio::test]
+    async fn the_authorization_route_refuses_a_malformed_wallet() {
+        let state = crate::server::build_test_state(tracker(), None);
+        let result = authorization::authorization_handler(
             State(state),
             None,
             HeaderMap::new(),
-            open_request(&listed.to_string(), "trace"),
+            Ok(axum::extract::Query(
+                serde_json::from_value(serde_json::json!({ "wallet": "not-a-wallet" }))
+                    .expect("query"),
+            )),
         )
-        .await
-        .expect("forwarded");
-        assert_eq!(mock.request_count(), 1);
+        .await;
+        assert_eq!(
+            refusal_reason(result),
+            (StatusCode::BAD_REQUEST, "invalid_request".into())
+        );
     }
 
     #[tokio::test]
@@ -447,9 +684,10 @@ mod tests {
         let mock = MockValidator::spawn(StatusCode::OK, serde_json::json!({})).await;
         let state = state_with_mock_validator(tracker(), &mock);
         let wallet = Pubkey::from_str(WALLET).expect("wallet");
+        let subject = AttemptSubject::WalletAtOrigin(wallet, FALLBACK_ORIGIN);
         while state
             .wallet_attempts
-            .check_and_record_attempt(&wallet)
+            .check_and_record_attempt(&subject)
             .is_ok()
         {}
         let result = open_handler(

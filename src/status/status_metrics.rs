@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 pub struct StatusMetrics {
-    total_verifications_relayed: AtomicU64,
     total_attestations_issued: AtomicU64,
     total_validations_performed: AtomicU64,
     /// Per-IP rate-limiter rejections. Increments on
@@ -10,6 +9,12 @@ pub struct StatusMetrics {
     /// the unauthenticated `/metrics` endpoint as a Prometheus counter so
     /// ops can monitor sustained-attack signals without log scraping.
     total_per_ip_rate_limit_rejected: AtomicU64,
+    /// Paired opens whose otherwise valid authorization came from another client network than
+    /// the one that fetched it. Counted while the rule is observed and while it is enforced.
+    total_paired_authorization_network_mismatch: AtomicU64,
+    /// Unsigned single-capture requests whose network had no challenge pointer, answered from
+    /// the wallet's latest challenge instead.
+    total_challenge_pointer_fallback: AtomicU64,
     start_time: u64,
     balance_cache: RwLock<(u64, u64)>, // (balance, fetched_at) — updated atomically
 }
@@ -17,22 +22,17 @@ pub struct StatusMetrics {
 impl StatusMetrics {
     pub fn new() -> Self {
         Self {
-            total_verifications_relayed: AtomicU64::new(0),
             total_attestations_issued: AtomicU64::new(0),
             total_validations_performed: AtomicU64::new(0),
             total_per_ip_rate_limit_rejected: AtomicU64::new(0),
+            total_paired_authorization_network_mismatch: AtomicU64::new(0),
+            total_challenge_pointer_fallback: AtomicU64::new(0),
             start_time: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
             balance_cache: RwLock::new((0, 0)),
         }
-    }
-
-    // increase total_verifications_relayed by 1
-    pub fn increment_verifications(&self) {
-        self.total_verifications_relayed
-            .fetch_add(1, Ordering::Relaxed);
     }
 
     // increase total_attestations_issued by 1
@@ -51,11 +51,17 @@ impl StatusMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    // getters for the metrics
-    pub fn verifications_relayed(&self) -> u64 {
-        self.total_verifications_relayed.load(Ordering::Relaxed)
+    pub fn increment_paired_authorization_network_mismatch(&self) {
+        self.total_paired_authorization_network_mismatch
+            .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn increment_challenge_pointer_fallback(&self) {
+        self.total_challenge_pointer_fallback
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // getters for the metrics
     pub fn attestations_issued(&self) -> u64 {
         self.total_attestations_issued.load(Ordering::Relaxed)
     }
@@ -66,6 +72,16 @@ impl StatusMetrics {
 
     pub fn per_ip_rate_limit_rejected(&self) -> u64 {
         self.total_per_ip_rate_limit_rejected
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn paired_authorization_network_mismatch(&self) -> u64 {
+        self.total_paired_authorization_network_mismatch
+            .load(Ordering::Relaxed)
+    }
+
+    pub fn challenge_pointer_fallback(&self) -> u64 {
+        self.total_challenge_pointer_fallback
             .load(Ordering::Relaxed)
     }
 
@@ -93,8 +109,8 @@ mod tests {
     #[test]
     fn counters_start_at_zero() {
         let m = StatusMetrics::new();
-        assert_eq!(m.verifications_relayed(), 0);
         assert_eq!(m.attestations_issued(), 0);
+        assert_eq!(m.validations_performed(), 0);
         assert_eq!(m.per_ip_rate_limit_rejected(), 0);
     }
 
@@ -106,36 +122,32 @@ mod tests {
         m.increment_per_ip_rate_limit_rejected();
         assert_eq!(m.per_ip_rate_limit_rejected(), 3);
         // Other counters untouched.
-        assert_eq!(m.verifications_relayed(), 0);
         assert_eq!(m.attestations_issued(), 0);
         assert_eq!(m.validations_performed(), 0);
     }
 
     #[test]
-    fn increment_verifications_counts_correctly() {
-        let m = StatusMetrics::new();
-        m.increment_verifications();
-        m.increment_verifications();
-        assert_eq!(m.verifications_relayed(), 2);
-        assert_eq!(m.attestations_issued(), 0);
-    }
-
-    #[test]
-    fn increment_attestations_counts_correctly() {
-        let m = StatusMetrics::new();
-        m.increment_attestations();
-        assert_eq!(m.attestations_issued(), 1);
-        assert_eq!(m.verifications_relayed(), 0);
-    }
-
-    #[test]
     fn counters_are_independent() {
         let m = StatusMetrics::new();
-        m.increment_verifications();
-        m.increment_verifications();
+        m.increment_validations();
+        m.increment_validations();
         m.increment_attestations();
-        assert_eq!(m.verifications_relayed(), 2);
+        assert_eq!(m.validations_performed(), 2);
         assert_eq!(m.attestations_issued(), 1);
+        assert_eq!(m.per_ip_rate_limit_rejected(), 0);
+    }
+
+    #[test]
+    fn the_rollout_counters_count_independently() {
+        let m = StatusMetrics::new();
+        assert_eq!(m.paired_authorization_network_mismatch(), 0);
+        assert_eq!(m.challenge_pointer_fallback(), 0);
+        m.increment_paired_authorization_network_mismatch();
+        m.increment_challenge_pointer_fallback();
+        m.increment_challenge_pointer_fallback();
+        assert_eq!(m.paired_authorization_network_mismatch(), 1);
+        assert_eq!(m.challenge_pointer_fallback(), 2);
+        assert_eq!(m.per_ip_rate_limit_rejected(), 0);
     }
 
     #[test]
