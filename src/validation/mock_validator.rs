@@ -246,11 +246,9 @@ pub fn state_with_mock_validator(
     let mut state = crate::server::build_test_state(tracker, Some(mock.url()));
     state.wallet_reputation_observe = false;
     state.curve_trace_observe = false;
-    state.relayer_tx = Arc::new(crate::relayer::transaction::RelayerTransaction::new(
-        Arc::new(crate::solana::client::SolanaClient::new(
-            &mock.url(),
-            Keypair::new(),
-        )),
+    state.solana = Arc::new(crate::solana::client::SolanaClient::new(
+        &mock.url(),
+        Keypair::new(),
     ));
     state
 }

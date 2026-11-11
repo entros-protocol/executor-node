@@ -231,30 +231,18 @@ pub fn verify_wallet_authorization(
     Ok(Some(nonce))
 }
 
+/// The signed request carries its signature in lowercase hex only, so each signature has
+/// one accepted spelling.
 fn decode_lower_signature(value: &str) -> Result<[u8; 64], AppError> {
-    if value.len() != 128
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(AppError::InvalidRequest(
+    let invalid = || {
+        AppError::InvalidRequest(
             "Wallet authorization signature must be 128 lowercase hex characters".into(),
-        ));
+        )
+    };
+    if value.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        return Err(invalid());
     }
-
-    let mut output = [0_u8; 64];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
-        output[index] = (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]);
-    }
-    Ok(output)
-}
-
-fn hex_nibble(value: u8) -> u8 {
-    match value {
-        b'0'..=b'9' => value - b'0',
-        b'a'..=b'f' => value - b'a' + 10,
-        _ => unreachable!("signature alphabet is checked before decoding"),
-    }
+    crate::auth::signature::decode_signature_hex(value).ok_or_else(invalid)
 }
 
 fn lower_hex(value: &[u8]) -> String {
@@ -291,6 +279,7 @@ mod tests {
                 features: vec![-0.0, 2.5],
             }),
             wallet_authorization: None,
+            challenge_nonce: None,
             baseline_reset: true,
             f0_contour: Some(vec![-1.0, 0.5]),
             accel_magnitude: Some(vec![0.25]),
@@ -579,5 +568,27 @@ mod tests {
             .signature_hex
             .replace_range(0..1, "A");
         assert!(verify_wallet_authorization(&request, &keypair.pubkey(), 2).is_err());
+    }
+
+    /// The same signature in uppercase decodes to the same bytes and would verify. It is
+    /// refused as malformed, and so is a 128-byte string that is not 128 characters.
+    #[test]
+    fn only_the_lowercase_spelling_of_a_signature_is_accepted() {
+        let keypair = Keypair::new();
+        let mut request = signed_request(&keypair, [0x55; 32]);
+        let authorization = request.wallet_authorization.as_mut().unwrap();
+        authorization.signature_hex = authorization.signature_hex.to_ascii_uppercase();
+        assert!(matches!(
+            verify_wallet_authorization(&request, &keypair.pubkey(), 2),
+            Err(AppError::InvalidRequest(_))
+        ));
+
+        let crafted = format!("a\u{e9}{}", "0".repeat(125));
+        assert_eq!(crafted.len(), 128);
+        request.wallet_authorization.as_mut().unwrap().signature_hex = crafted;
+        assert!(matches!(
+            verify_wallet_authorization(&request, &keypair.pubkey(), 2),
+            Err(AppError::InvalidRequest(_))
+        ));
     }
 }

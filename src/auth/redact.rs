@@ -19,11 +19,7 @@ pub fn redact_api_key(key: &str) -> String {
     if key.is_empty() {
         return "<empty>".into();
     }
-    let take = REDACT_PREFIX_LEN.min(key.len());
-    let mut s = String::with_capacity(take + 2);
-    s.push_str(&key[..take]);
-    s.push('…');
-    s
+    prefix_with_ellipsis(key)
 }
 
 /// Returns a short, log-safe form of a wallet pubkey.
@@ -46,9 +42,13 @@ pub fn redact_wallet_id(wallet: &str) -> String {
     if wallet.is_empty() {
         return "<empty>".into();
     }
-    let take = REDACT_PREFIX_LEN.min(wallet.len());
-    let mut s = String::with_capacity(take + 2);
-    s.push_str(&wallet[..take]);
+    prefix_with_ellipsis(wallet)
+}
+
+/// The first characters of `value` and an ellipsis. Counts characters, because a
+/// byte offset inside a multi-byte character makes a slice panic.
+fn prefix_with_ellipsis(value: &str) -> String {
+    let mut s: String = value.chars().take(REDACT_PREFIX_LEN).collect();
     s.push('…');
     s
 }
@@ -140,6 +140,13 @@ mod tests {
     #[test]
     fn redact_wallet_handles_short_input() {
         assert_eq!(redact_wallet_id("abc"), "abc…");
+    }
+
+    #[test]
+    fn multi_byte_input_is_cut_on_a_character_boundary() {
+        // Byte offset 6 falls inside the fourth character.
+        assert_eq!(redact_api_key("ééééééé"), "éééééé…");
+        assert_eq!(redact_wallet_id("ab\u{1f600}cdefgh"), "ab\u{1f600}cde…");
     }
 
     #[test]

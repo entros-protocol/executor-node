@@ -8,7 +8,7 @@ use solana_sdk::instruction::{AccountMeta, Instruction};
 use solana_sdk::pubkey;
 use solana_sdk::pubkey::Pubkey;
 
-use crate::solana::instructions::SYSTEM_PROGRAM_ID;
+const SYSTEM_PROGRAM_ID: Pubkey = pubkey!("11111111111111111111111111111111");
 
 pub const ATTESTATION_PROGRAM_ID: Pubkey = pubkey!("22zoJMtdu4tQc2PzL74ZUT7FrwgB1Udec8DdW4yw4BdG");
 

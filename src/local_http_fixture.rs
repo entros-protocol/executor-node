@@ -33,15 +33,11 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .any(|integrator| integrator.api_key == *key)));
     assert!(config.validation_api_key.is_some());
-    // Admission shape is the launcher's choice: an allowlist reproduces the
-    // 2026-09-27 campaign; none matches production, which admits every wallet.
-    match &config.paired_wallets {
-        Some(wallets) if !wallets.is_empty() => {
-            println!("paired admission: allowlist ({} wallets)", wallets.len());
-        }
-        _ => println!("paired admission: open (no EXECUTOR_PAIRED_WALLETS)"),
-    }
     assert!(config.paired_enabled);
+    println!(
+        "paired authorization: {:?}",
+        config.paired_authorization_mode
+    );
     // How long the fixture serves before its graceful shutdown. One hour covered
     // the 2026-09-27 campaigns; longer isolated campaigns set the override.
     let ttl_secs: u64 = std::env::var("EXECUTOR_FIXTURE_TTL_SECS")
@@ -52,12 +48,23 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     let solana_client = Arc::new(SolanaClient::new(&config.rpc_url, config.relayer_keypair));
     let state = AppState {
         validation_identity_program: config.validation_identity_program,
-        relayer_tx: Arc::new(RelayerTransaction::new(solana_client)),
+        solana: solana_client,
         api_keys: Arc::new(config.api_keys),
+        public_api_keys: Arc::new(
+            config
+                .integrators
+                .iter()
+                .filter(|integrator| integrator.public)
+                .map(|integrator| integrator.api_key.clone())
+                .collect(),
+        ),
         rate_limiter: Arc::new(auth::rate_limit::RateLimiter::new(
             config.rate_limit_per_minute,
         )),
         attest_rate_limiter: Arc::new(auth::rate_limit::RateLimiter::new(10)),
+        attest_wallet_rate_limiter: Arc::new(auth::rate_limit::RateLimiter::new(
+            ATTESTATIONS_PER_WALLET_PER_MINUTE,
+        )),
         study_service_rate_limiter: Arc::new(auth::rate_limit::RateLimiter::new(
             config.study_rate_limit_per_minute,
         )),
@@ -70,7 +77,6 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             config.wallet_max_attempts,
             Duration::from_secs(config.wallet_window_secs),
         )),
-        commitment_registry: Arc::new(CommitmentRegistry::new()),
         sas_attestor: None,
         metrics: Arc::new(status::status_metrics::StatusMetrics::new()),
         http_client: Arc::new(reqwest::Client::new()),
@@ -92,7 +98,25 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         session_gate: Arc::new(tokio::sync::Semaphore::new(
             config.paired_session_concurrency,
         )),
-        paired_wallets: config.paired_wallets.map(Arc::new),
+        session_uploads: crate::paired::uploads::UploadGate::new(
+            crate::paired::uploads::SESSION_UPLOADS,
+            crate::paired::uploads::SESSION_UPLOADS_PER_NETWORK,
+        ),
+        paired_authorizer: Arc::new(match config.paired_authorization_key {
+            Some(key) => PairedAuthorizer::new(
+                &key,
+                config.paired_authorization_ttl_secs,
+                config.paired_authorization_mode,
+                config.paired_authorization_network,
+            )?,
+            None => PairedAuthorizer::with_random_key(
+                config.paired_authorization_ttl_secs,
+                config.paired_authorization_mode,
+                config.paired_authorization_network,
+            )?,
+        }),
+        single_capture_updates_refused: config.single_capture_updates_refused,
+        study_routes_enabled: config.study_routes_enabled,
     };
     let app = create_router(state, &config.cors_origins);
     let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;

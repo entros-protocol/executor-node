@@ -1,6 +1,8 @@
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::net::IpAddr;
 use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Mutex, TryLockError};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
@@ -8,167 +10,236 @@ use governor::clock::DefaultClock;
 use governor::state::{InMemoryState, NotKeyed};
 use governor::{Quota, RateLimiter as GovernorLimiter};
 
+use crate::auth::client_ip::{client_network, ipv6_site};
+
 type Limiter = GovernorLimiter<NotKeyed, InMemoryState, DefaultClock>;
 
 const MAX_TRACKED_KEYS: usize = 10_000;
-const ENTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const ENTRY_TTL: Duration = Duration::from_secs(300);
 
-/// Per-IP cap is keyed on a much larger address space than per-API-key
-/// (a single integrator may serve many client IPs), so the bound is
-/// proportionally larger. 50k IPv4 entries × ~100 bytes ≈ 5MB — fine
-/// for an executor process.
+/// The per-IP map holds client networks, a much larger space than API keys. 50,000
+/// entries of about 100 bytes is 5 MB.
 const MAX_TRACKED_IPS: usize = 50_000;
-const IP_ENTRY_TTL: Duration = Duration::from_secs(300); // 5 minutes
+const IP_ENTRY_TTL: Duration = Duration::from_secs(300);
 
-/// Per-API-key rate limiter using the GCRA algorithm.
-/// Entries are evicted after 5 minutes of inactivity.
-/// Bounded to MAX_TRACKED_KEYS to prevent memory exhaustion.
-pub struct RateLimiter {
-    limiters: DashMap<String, (Arc<Limiter>, Instant)>,
+/// An IPv6 /48 may send this many times the rate of one client network. One site can
+/// hold all 65,536 networks in a /48, so the networks alone do not bound it.
+const SITE_RATE_MULTIPLE: u32 = 16;
+
+/// The share of a full map that goes when room is needed: one entry in this many.
+const EVICTION_DIVISOR: usize = 10;
+
+struct Bucket {
+    limiter: Limiter,
+    last_seen: Instant,
+}
+
+/// One GCRA bucket per key, in a map that never grows past `capacity` for long.
+///
+/// A full map makes room by dropping its least recently seen tenth in one pass. A full
+/// map that refused new keys would turn away every new client for as long as a sender
+/// kept its own entries active. A pass on every insert would cost a scan per request,
+/// so one pass pays for the next tenth of the inserts.
+struct Buckets<K> {
+    entries: DashMap<K, Bucket>,
     quota: Quota,
+    capacity: usize,
+    /// Held by the one caller that makes room. The others insert without waiting.
+    making_room: Mutex<()>,
+}
+
+impl<K: Eq + Hash> Buckets<K> {
+    fn new(requests_per_minute: u32, capacity: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            quota: per_minute(requests_per_minute),
+            capacity: capacity.max(1),
+            making_room: Mutex::new(()),
+        }
+    }
+
+    /// Takes a token from a key that already has a bucket. `None` when it has none.
+    fn take_existing<Q>(&self, key: &Q) -> Option<bool>
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        let mut bucket = self.entries.get_mut(key)?;
+        bucket.last_seen = Instant::now();
+        Some(bucket.limiter.check().is_ok())
+    }
+
+    /// Takes a token for `key`, and creates its bucket first if it has none.
+    fn take<Q>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+        Q: Eq + Hash + ToOwned<Owned = K> + ?Sized,
+    {
+        if let Some(allowed) = self.take_existing(key) {
+            return allowed;
+        }
+        self.make_room();
+        let mut bucket = self
+            .entries
+            .entry(key.to_owned())
+            .or_insert_with(|| Bucket {
+                limiter: GovernorLimiter::direct(self.quota),
+                last_seen: Instant::now(),
+            });
+        bucket.last_seen = Instant::now();
+        bucket.limiter.check().is_ok()
+    }
+
+    fn make_room(&self) {
+        if self.entries.len() < self.capacity {
+            return;
+        }
+        let _guard = match self.making_room.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        let mut seen: Vec<Instant> = self.entries.iter().map(|entry| entry.last_seen).collect();
+        if seen.len() < self.capacity {
+            return;
+        }
+        let evict = (seen.len() / EVICTION_DIVISOR).max(1);
+        let (_, cutoff, _) = seen.select_nth_unstable(evict - 1);
+        let cutoff = *cutoff;
+        self.entries.retain(|_, bucket| bucket.last_seen > cutoff);
+    }
+
+    fn evict_idle(&self, ttl: Duration) -> usize {
+        let before = self.entries.len();
+        self.entries
+            .retain(|_, bucket| bucket.last_seen.elapsed() < ttl);
+        before.saturating_sub(self.entries.len())
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+fn per_minute(requests_per_minute: u32) -> Quota {
+    // `.max(1)` makes the value nonzero, so the fallback is never taken.
+    let clamped = requests_per_minute.max(1);
+    Quota::per_minute(NonZeroU32::new(clamped).unwrap_or(NonZeroU32::MIN))
+}
+
+/// `ceil(60 / rate)`, never under one second. An upper bound on the true wait.
+fn retry_after_secs(requests_per_minute: u32) -> u64 {
+    60u64.div_ceil(u64::from(requests_per_minute.max(1))).max(1)
+}
+
+/// Rate limiter keyed on a string, such as an API key or a wallet address.
+/// Entries idle for five minutes are evicted by a background sweep.
+pub struct RateLimiter {
+    buckets: Buckets<String>,
     retry_after_secs: u64,
 }
 
 impl RateLimiter {
     pub fn new(requests_per_minute: u32) -> Self {
-        // `.max(1)` ensures the input is >= 1, so `NonZeroU32::new` cannot
-        // return None on the outer call. The previous `.expect("literal 1")`
-        // fallback was dead defensive code that would never execute.
-        let clamped = requests_per_minute.max(1);
-        let per_minute =
-            NonZeroU32::new(clamped).unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
-        let quota = Quota::per_minute(per_minute);
+        Self::with_capacity(requests_per_minute, MAX_TRACKED_KEYS)
+    }
+
+    fn with_capacity(requests_per_minute: u32, capacity: usize) -> Self {
         Self {
-            limiters: DashMap::new(),
-            quota,
-            retry_after_secs: (60u64.div_ceil(clamped as u64)).max(1),
+            buckets: Buckets::new(requests_per_minute, capacity),
+            retry_after_secs: retry_after_secs(requests_per_minute),
         }
     }
 
-    /// Check if a request from the given API key is allowed.
-    ///
-    /// Eviction of stale entries is performed by `evict_stale()` from a
-    /// background task, NOT inside `check()`. The previous per-request
-    /// `retain()` was a contention hotspot under high concurrency: two
-    /// threads racing through the entry-creation path could both pass the
-    /// `MAX_TRACKED_KEYS` guard and grow the map past the cap.
-    pub fn check(&self, api_key: &str) -> Result<(), ()> {
-        if !self.limiters.contains_key(api_key) && self.limiters.len() >= MAX_TRACKED_KEYS {
-            return Err(());
+    /// Takes one token for `key`. `Err` when the key is over its rate.
+    pub fn check(&self, key: &str) -> Result<(), ()> {
+        if self.buckets.take(key) {
+            Ok(())
+        } else {
+            Err(())
         }
-
-        let mut limiter = self.limiters.entry(api_key.to_string()).or_insert_with(|| {
-            (
-                Arc::new(GovernorLimiter::direct(self.quota)),
-                Instant::now(),
-            )
-        });
-
-        // Update last-seen timestamp
-        limiter.1 = Instant::now();
-        let lim = limiter.0.clone();
-        drop(limiter);
-
-        lim.check().map_err(|_| ())
     }
 
     pub fn check_with_retry(&self, key: &str) -> Result<(), u64> {
         self.check(key).map_err(|()| self.retry_after_secs)
     }
 
-    /// Evict entries that haven't been seen for `ENTRY_TTL`. Called from
-    /// a background tokio task; cheap when most keys are active. Returns
-    /// the approximate number of entries removed (DashMap len() is not
-    /// atomic with retain() under concurrent inserts, so this is a debug
-    /// signal, not a precise count).
+    /// Drops entries idle for `ENTRY_TTL`. Called from a background task. Returns the
+    /// approximate number removed, since the map changes under concurrent inserts.
     pub fn evict_stale(&self) -> usize {
-        let before = self.limiters.len();
-        self.limiters
-            .retain(|_, (_, last_seen)| last_seen.elapsed() < ENTRY_TTL);
-        before.saturating_sub(self.limiters.len())
+        self.buckets.evict_idle(ENTRY_TTL)
     }
 }
 
-/// Per-IP rate limiter. Same governor + DashMap
-/// pattern as `RateLimiter`, but keyed on `IpAddr` and with a larger
-/// `MAX_TRACKED_IPS` cap. Separate type rather than generic so tests
-/// stay simple and the existing per-API-key call sites don't need to
-/// change.
+/// Rate limiter keyed on the client network: an IPv4 address or an IPv6 /64.
 ///
-/// Returns `Err(retry_after_secs)` when over-limit so middleware can
-/// surface a `Retry-After` header. The retry value is conservative:
-/// `ceil(60 / requests_per_minute)` — an upper bound on the true wait.
+/// An IPv6 request also takes a token from the bucket of its /48, at
+/// `SITE_RATE_MULTIPLE` times the network rate. Returns `Err(retry_after_secs)` when
+/// over the limit, so the middleware can send a `Retry-After` header.
 pub struct PerIpRateLimiter {
-    limiters: DashMap<IpAddr, (Arc<Limiter>, Instant)>,
-    quota: Quota,
+    networks: Buckets<IpAddr>,
+    sites: Buckets<[u16; 3]>,
     retry_after_secs: u64,
 }
 
 impl PerIpRateLimiter {
     pub fn new(requests_per_minute: u32) -> Self {
-        let clamped = requests_per_minute.max(1);
-        let per_minute =
-            NonZeroU32::new(clamped).unwrap_or_else(|| unreachable!("clamped >= 1 by .max(1)"));
-        let quota = Quota::per_minute(per_minute);
-        // ceil(60 / clamped); never less than 1 second so the header is
-        // always meaningful even at very high configured rates.
-        let retry_after_secs = (60u64.div_ceil(clamped as u64)).max(1);
+        Self::with_capacity(requests_per_minute, MAX_TRACKED_IPS)
+    }
+
+    fn with_capacity(requests_per_minute: u32, capacity: usize) -> Self {
         Self {
-            limiters: DashMap::new(),
-            quota,
-            retry_after_secs,
+            networks: Buckets::new(requests_per_minute, capacity),
+            sites: Buckets::new(
+                requests_per_minute.saturating_mul(SITE_RATE_MULTIPLE),
+                capacity,
+            ),
+            retry_after_secs: retry_after_secs(requests_per_minute),
         }
     }
 
-    /// Check if a request from `ip` is allowed. Returns `Err(retry_after_secs)`
-    /// when the IP is over-limit OR when the tracked-IP cap is hit and `ip`
-    /// is unknown (over-cap-reject is conservative — better to occasionally
-    /// turn away a legitimate IP than let an attacker grow the map past
-    /// the memory bound).
+    /// Takes one token for the network of `ip`.
+    ///
+    /// The order keeps two properties. A network already over its own rate is refused
+    /// before the site bucket is touched, so one network cannot spend its neighbours'
+    /// site tokens. A network with no bucket asks the site first, so a refused request
+    /// never adds an entry and a /48 cannot fill the map with its 65,536 networks.
     pub fn check(&self, ip: IpAddr) -> Result<(), u64> {
-        if !self.limiters.contains_key(&ip) && self.limiters.len() >= MAX_TRACKED_IPS {
-            return Err(self.retry_after_secs);
+        let network = client_network(ip);
+        let allowed = match self.networks.take_existing(&network) {
+            Some(within_network_rate) => within_network_rate && self.site_allows(network),
+            None => self.site_allows(network) && self.networks.take(&network),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(self.retry_after_secs)
         }
-
-        let mut limiter = self.limiters.entry(ip).or_insert_with(|| {
-            (
-                Arc::new(GovernorLimiter::direct(self.quota)),
-                Instant::now(),
-            )
-        });
-
-        limiter.1 = Instant::now();
-        let lim = limiter.0.clone();
-        drop(limiter);
-
-        lim.check().map_err(|_| self.retry_after_secs)
     }
 
-    /// Drop entries inactive for `IP_ENTRY_TTL`. Called from a background
-    /// task in `main.rs` (60-second sweep) — same pattern as `RateLimiter`.
-    /// Returns the approximate count of removed entries (see `RateLimiter::evict_stale`).
+    fn site_allows(&self, network: IpAddr) -> bool {
+        ipv6_site(network).is_none_or(|site| self.sites.take(&site))
+    }
+
+    /// Drops entries idle for `IP_ENTRY_TTL`. Called from a background task. Returns
+    /// the approximate number removed.
     pub fn evict_stale(&self) -> usize {
         self.evict_with_ttl(IP_ENTRY_TTL)
     }
 
-    /// TTL-parameterized eviction. Production code calls `evict_stale()`
-    /// which delegates here with `IP_ENTRY_TTL`. Tests use a tiny TTL to
-    /// exercise the retain logic without spending 5 minutes of wall time.
+    /// Eviction with an explicit TTL, so tests need not wait five minutes.
     fn evict_with_ttl(&self, ttl: Duration) -> usize {
-        let before = self.limiters.len();
-        self.limiters
-            .retain(|_, (_, last_seen)| last_seen.elapsed() < ttl);
-        before.saturating_sub(self.limiters.len())
+        self.networks.evict_idle(ttl) + self.sites.evict_idle(ttl)
     }
 
-    /// Number of currently-tracked IPs. Exposed for tests.
+    /// Number of client networks tracked. Exposed for tests.
     #[cfg(test)]
     pub fn tracked_count(&self) -> usize {
-        self.limiters.len()
+        self.networks.len()
     }
 
-    /// The conservative `Retry-After` value this limiter emits on rejection.
-    /// Exposed for tests.
+    /// The `Retry-After` value this limiter emits on rejection. Exposed for tests.
     #[cfg(test)]
     pub fn retry_after_secs(&self) -> u64 {
         self.retry_after_secs
@@ -323,5 +394,106 @@ mod tests {
             limiter.check(addr).is_ok(),
             "after eviction the IP should get a fresh budget"
         );
+    }
+
+    #[test]
+    fn addresses_in_one_ipv6_network_share_a_bucket() {
+        let limiter = PerIpRateLimiter::new(1);
+        assert!(limiter.check(ip("2001:db8:1:2::1")).is_ok());
+        assert!(limiter.check(ip("2001:db8:1:2:ffff::9")).is_err());
+        assert_eq!(limiter.tracked_count(), 1);
+    }
+
+    #[test]
+    fn networks_in_one_ipv6_site_have_their_own_buckets() {
+        let limiter = PerIpRateLimiter::new(1);
+        assert!(limiter.check(ip("2001:db8:1:2::1")).is_ok());
+        assert!(limiter.check(ip("2001:db8:1:3::1")).is_ok());
+        assert_eq!(limiter.tracked_count(), 2);
+    }
+
+    fn network_in_site(index: u16) -> IpAddr {
+        IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 7, index, 0, 0, 0, 1))
+    }
+
+    /// A refused request must add no entry. Otherwise one /48 could fill the map with
+    /// networks it holds, and push every other client out.
+    #[test]
+    fn a_site_over_its_rate_adds_no_network_entries() {
+        let limiter = PerIpRateLimiter::new(1);
+        let site_burst = u16::try_from(SITE_RATE_MULTIPLE).unwrap();
+        for index in 0..site_burst {
+            assert!(limiter.check(network_in_site(index)).is_ok(), "{index}");
+        }
+        for index in site_burst..site_burst + 50 {
+            assert!(limiter.check(network_in_site(index)).is_err(), "{index}");
+        }
+        assert_eq!(limiter.tracked_count(), usize::from(site_burst));
+        // Another site is untouched.
+        assert!(limiter.check(ip("2001:db8:8:1::1")).is_ok());
+    }
+
+    #[test]
+    fn a_network_over_its_own_rate_spends_no_site_tokens() {
+        let limiter = PerIpRateLimiter::new(1);
+        let noisy = network_in_site(0);
+        assert!(limiter.check(noisy).is_ok());
+        for _ in 0..200 {
+            assert!(limiter.check(noisy).is_err());
+        }
+        // The site had 16 tokens and the noisy network took one.
+        for index in 1..u16::try_from(SITE_RATE_MULTIPLE).unwrap() {
+            assert!(limiter.check(network_in_site(index)).is_ok(), "{index}");
+        }
+    }
+
+    #[test]
+    fn ipv4_addresses_have_no_site_bucket() {
+        let limiter = PerIpRateLimiter::new(1);
+        for last in 0..=255u8 {
+            let address = IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, last));
+            assert!(limiter.check(address).is_ok(), "{last}");
+        }
+    }
+
+    #[test]
+    fn a_full_per_ip_map_admits_a_new_network_and_drops_the_oldest() {
+        let limiter = PerIpRateLimiter::with_capacity(60, 20);
+        for last in 0..20u8 {
+            limiter
+                .check(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, last)))
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(limiter.tracked_count(), 20);
+        let newcomer = ip("203.0.113.200");
+        assert!(limiter.check(newcomer).is_ok(), "a full map must admit it");
+        // A tenth of the map went, oldest first, and the newcomer took one place.
+        assert_eq!(limiter.tracked_count(), 19);
+        let oldest = ip("198.51.100.0");
+        let newest = ip("198.51.100.19");
+        assert!(!limiter.networks.entries.contains_key(&oldest));
+        assert!(limiter.networks.entries.contains_key(&newest));
+        assert!(limiter.networks.entries.contains_key(&newcomer));
+    }
+
+    #[test]
+    fn a_full_key_map_admits_a_new_key() {
+        let limiter = RateLimiter::with_capacity(60, 10);
+        for index in 0..10 {
+            limiter.check(&format!("key-{index}")).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(limiter.check("newcomer").is_ok());
+        assert!(limiter.buckets.len() <= 10);
+        assert!(!limiter.buckets.entries.contains_key("key-0"));
+    }
+
+    #[test]
+    fn a_key_over_its_rate_is_refused_with_a_wait() {
+        let limiter = RateLimiter::new(2);
+        assert!(limiter.check_with_retry("wallet").is_ok());
+        assert!(limiter.check_with_retry("wallet").is_ok());
+        assert_eq!(limiter.check_with_retry("wallet"), Err(30));
     }
 }

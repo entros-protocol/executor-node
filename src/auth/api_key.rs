@@ -38,7 +38,7 @@ pub async fn api_key_auth(
 ///
 /// The validation service's auth middleware uses the same dummy-comparison
 /// pattern, so both services have identical timing characteristics.
-fn is_valid_api_key(provided: &[u8], api_keys: &[String]) -> bool {
+pub(crate) fn is_valid_api_key(provided: &[u8], api_keys: &[String]) -> bool {
     api_keys.iter().any(|k| {
         let expected = k.as_bytes();
         // Always run ct_eq against a slice of `expected.len()`. If lengths

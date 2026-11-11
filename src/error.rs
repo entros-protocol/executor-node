@@ -281,7 +281,7 @@ impl IntoResponse for AppError {
             ),
             AppError::PairedRequired => (
                 StatusCode::CONFLICT,
-                "Use paired capture to set or replace your baseline.".into(),
+                "This verification requires paired capture.".into(),
             ),
             AppError::PairedRejected { .. } | AppError::PairedBusy => {
                 unreachable!("handled above")
@@ -424,6 +424,20 @@ mod tests {
                 "wire body must not leak '{forbidden}', got: {body_str}"
             );
         }
+    }
+
+    /// The same refusal answers a refused update and a refused baseline write, so its text
+    /// names neither.
+    #[tokio::test]
+    async fn the_paired_required_refusal_fits_every_refused_request() {
+        let resp = AppError::PairedRequired.into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body_bytes = to_bytes(resp.into_body(), 64_000)
+            .await
+            .expect("body bytes");
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).expect("json body");
+        assert_eq!(body["reason"], "paired_required");
+        assert_eq!(body["error"], "This verification requires paired capture.");
     }
 
     #[tokio::test]

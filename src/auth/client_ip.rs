@@ -3,16 +3,22 @@
 //! Railway supplies the original client address in `X-Real-IP`. The service
 //! trusts that header only when the socket peer belongs to a private network.
 //! Direct public peers cannot select their rate-limit key with a header.
+//!
+//! The address returned stands for one client network. An IPv4 address stands
+//! for itself. An IPv6 address is reduced to its /64, because one customer
+//! usually holds the whole /64 and can send from any address in it. Every
+//! per-client control keys on this value, so none of them can be reset by
+//! moving to a neighbouring address.
 
 use axum::http::HeaderMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
 const REAL_IP_HEADER: &str = "x-real-ip";
 
-/// Resolve the client IP from request headers + optional peer address.
+/// Resolve the client network from request headers + optional peer address.
 ///
 /// Use Railway's client header behind a private proxy. Otherwise, use the
-/// socket peer. Normalize IPv4-mapped IPv6 before returning the address.
+/// socket peer. The result is an IPv4 address or an IPv6 /64 network address.
 pub fn extract_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Option<IpAddr> {
     let peer_ip = peer.map(|socket| canonicalize(socket.ip()));
     if peer_ip.is_some_and(is_private_proxy_peer) {
@@ -21,10 +27,34 @@ pub fn extract_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> Optio
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.trim().parse::<IpAddr>().ok())
         {
-            return Some(canonicalize(real_ip));
+            return Some(client_network(real_ip));
         }
     }
-    peer_ip
+    peer_ip.map(client_network)
+}
+
+/// The network that per-client controls treat as one client.
+pub fn client_network(ip: IpAddr) -> IpAddr {
+    match canonicalize(ip) {
+        IpAddr::V6(v6) => {
+            let mut segments = v6.segments();
+            segments[4..].fill(0);
+            IpAddr::V6(Ipv6Addr::from(segments))
+        }
+        v4 => v4,
+    }
+}
+
+/// The /48 that contains an IPv6 client network. One site can hold a whole /48,
+/// which is 65,536 client networks.
+pub fn ipv6_site(ip: IpAddr) -> Option<[u16; 3]> {
+    match canonicalize(ip) {
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            Some([segments[0], segments[1], segments[2]])
+        }
+        IpAddr::V4(_) => None,
+    }
 }
 
 fn is_private_proxy_peer(ip: IpAddr) -> bool {
@@ -122,10 +152,43 @@ mod tests {
 
     #[test]
     fn parses_ipv6_from_real_ip() {
-        let headers = headers_with_real_ip("2001:db8::1");
+        let headers = headers_with_real_ip("2001:db8:1:2:3:4:5:6");
         let peer: SocketAddr = "[fd00::8]:8080".parse().unwrap();
         let ip = extract_client_ip(&headers, Some(peer)).unwrap();
-        assert_eq!(ip.to_string(), "2001:db8::1");
+        assert_eq!(ip.to_string(), "2001:db8:1:2::");
+    }
+
+    #[test]
+    fn every_address_in_one_ipv6_64_is_one_client() {
+        let peer: SocketAddr = "[fd00::8]:8080".parse().unwrap();
+        let first = headers_with_real_ip("2001:db8:1:2::1");
+        let second = headers_with_real_ip("2001:db8:1:2:ffff:ffff:ffff:ffff");
+        let neighbour = headers_with_real_ip("2001:db8:1:3::1");
+        assert_eq!(
+            extract_client_ip(&first, Some(peer)).unwrap(),
+            extract_client_ip(&second, Some(peer)).unwrap()
+        );
+        assert_ne!(
+            extract_client_ip(&first, Some(peer)).unwrap(),
+            extract_client_ip(&neighbour, Some(peer)).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_direct_ipv6_peer_is_reduced_to_its_64() {
+        let peer: SocketAddr = "[2001:db8:9:8:7:6:5:4]:8080".parse().unwrap();
+        let ip = extract_client_ip(&HeaderMap::new(), Some(peer)).unwrap();
+        assert_eq!(ip.to_string(), "2001:db8:9:8::");
+    }
+
+    #[test]
+    fn the_ipv6_site_is_the_48() {
+        assert_eq!(
+            ipv6_site("2001:db8:cafe:1::".parse().unwrap()),
+            Some([0x2001, 0xdb8, 0xcafe])
+        );
+        assert_eq!(ipv6_site("203.0.113.7".parse().unwrap()), None);
+        assert_eq!(ipv6_site("::ffff:203.0.113.7".parse().unwrap()), None);
     }
 
     #[test]
@@ -151,6 +214,7 @@ mod tests {
         let headers = headers_with_real_ip("2001:db8::dead:beef");
         let peer: SocketAddr = "[fd00::8]:8080".parse().unwrap();
         let ip = extract_client_ip(&headers, Some(peer)).unwrap();
-        assert_eq!(ip.to_string(), "2001:db8::dead:beef");
+        assert!(ip.is_ipv6());
+        assert_eq!(ip.to_string(), "2001:db8::");
     }
 }

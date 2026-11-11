@@ -7,7 +7,6 @@ mod integrator;
 mod listener;
 mod padding;
 mod paired;
-mod relayer;
 mod reputation;
 mod server;
 mod solana;
@@ -20,20 +19,22 @@ mod validation;
 use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
-use attestation::sas::{parse_credential_authorized_signers, SasAttestor};
+use attestation::sas::{check_credential_authority, SasAttestor};
 use auth::cross_wallet_cooldown::CrossWalletCooldownTracker;
 use challenge::registry::ChallengeNonceRegistry;
 use config::Config;
 use integrator::tracker::IntegratorTracker;
 use integrator::wallet_attempts::WalletAttemptTracker;
 use listener::event_monitor::EventMonitor;
-use relayer::commitment_registry::CommitmentRegistry;
-use relayer::transaction::RelayerTransaction;
+use paired::authorization::PairedAuthorizer;
 use server::{create_router, AppState};
 use solana::client::SolanaClient;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
 use zeroize::Zeroize;
+
+/// A wallet attests once after each verification. Two a minute covers a retry.
+const ATTESTATIONS_PER_WALLET_PER_MINUTE: u32 = 2;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,13 +70,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Relayer initialized"
     );
 
-    let relayer_tx = Arc::new(RelayerTransaction::new(Arc::clone(&solana_client)));
-
     // Initialize per-API-key rate limiters
     let rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(
         config.rate_limit_per_minute,
     ));
     let attest_rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(10));
+    let attest_wallet_rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(
+        ATTESTATIONS_PER_WALLET_PER_MINUTE,
+    ));
     let study_service_rate_limiter = Arc::new(auth::rate_limit::RateLimiter::new(
         config.study_rate_limit_per_minute,
     ));
@@ -86,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(
         requests_per_minute = config.rate_limit_per_minute,
         attest_per_minute = 10,
+        attest_per_wallet_per_minute = ATTESTATIONS_PER_WALLET_PER_MINUTE,
         study_per_minute = config.study_rate_limit_per_minute,
         study_max_in_flight = config.study_max_in_flight,
         per_ip_per_minute = config.per_ip_rate_limit_per_minute,
@@ -117,6 +120,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
+    let public_api_keys: std::collections::HashSet<String> = config
+        .integrators
+        .iter()
+        .filter(|integrator| integrator.public)
+        .map(|integrator| integrator.api_key.clone())
+        .collect();
+    tracing::info!(
+        public_keys = public_api_keys.len(),
+        "Keys limited per client network"
+    );
     let tracker = Arc::new(IntegratorTracker::new(config.integrators));
     let wallet_attempts = Arc::new(WalletAttemptTracker::new(
         config.wallet_max_attempts,
@@ -131,9 +144,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         integrators = integrator_count,
         "Integrator tracker initialized (in-memory, resets on restart)"
     );
-
-    let commitment_registry = Arc::new(CommitmentRegistry::new());
-    tracing::info!("Commitment registry initialized (in-memory, resets on restart)");
 
     let challenge_registry = Arc::new(ChallengeNonceRegistry::new(config.challenge_ttl_secs));
     tracing::info!(
@@ -239,49 +249,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // and must stop production, while an unreadable account is an RPC
             // problem and must not make the executor's availability depend on
             // devnet responding at start-up.
-            match solana_client.get_account_data(cred).await {
-                Ok(Some(data)) => match parse_credential_authorized_signers(&data) {
-                    Ok(signers) if signers.contains(&authority.pubkey()) => {
-                        tracing::info!(
-                            credential = %cred,
-                            authorized_signers = signers.len(),
-                            "SAS authority confirmed as an authorized signer"
-                        );
-                    }
-                    Ok(signers) => {
-                        let message = format!(
-                            "SAS authority {} is not an authorized signer on credential {} \
-                             ({} signer(s) registered). Every attestation would fail at send \
-                             time. Add it with ChangeAuthorizedSigners before starting.",
-                            authority.pubkey(),
-                            cred,
-                            signers.len()
-                        );
-                        if environment.is_prod() {
-                            return Err(message.into());
+            match solana_client.get_account_snapshots(&[*cred]).await {
+                Ok(accounts) => {
+                    let account = accounts.into_iter().next().flatten();
+                    match check_credential_authority(account.as_ref(), cred, &authority.pubkey()) {
+                        Ok(signers) => {
+                            tracing::info!(
+                                credential = %cred,
+                                authorized_signers = signers,
+                                "SAS authority confirmed as an authorized signer"
+                            );
                         }
-                        tracing::warn!(environment = ?environment, "{message}");
-                    }
-                    Err(e) => {
-                        let message = format!(
-                            "Could not decode SAS credential {cred} to verify the authority: {e}"
-                        );
-                        if environment.is_prod() {
-                            return Err(message.into());
+                        Err(message) => {
+                            if environment.is_prod() {
+                                return Err(message.into());
+                            }
+                            tracing::warn!(environment = ?environment, "{message}");
                         }
-                        tracing::warn!(environment = ?environment, "{message}");
                     }
-                },
-                Ok(None) => {
-                    let message =
-                        format!("SAS credential {cred} does not exist on the configured cluster");
-                    if environment.is_prod() {
-                        return Err(message.into());
-                    }
-                    tracing::warn!(environment = ?environment, "{message}");
                 }
                 Err(e) => {
-                    // RPC failure. Unknown, not wrong — start anyway.
+                    // RPC failure. Unknown, not wrong, so start anyway.
                     tracing::warn!(
                         credential = %cred,
                         error = %e,
@@ -317,16 +305,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // local copy. The Keypair owned by SolanaClient remains intact.
     relayer_keypair_bytes.zeroize();
 
-    // Spawn background eviction task for stale commitment entries
-    let registry_ref = Arc::clone(&commitment_registry);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
-        loop {
-            interval.tick().await;
-            registry_ref.evict_stale();
-        }
-    });
-
     // Spawn background eviction tasks for stale rate-limiter entries.
     // Previously, eviction ran inside RateLimiter::check() on every request,
     // creating contention under load. Moving to a 60-second background sweep
@@ -334,6 +312,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for (name, limiter_ref) in [
         ("rate_limiter", Arc::clone(&rate_limiter)),
         ("attest_rate_limiter", Arc::clone(&attest_rate_limiter)),
+        (
+            "attest_wallet_rate_limiter",
+            Arc::clone(&attest_wallet_rate_limiter),
+        ),
         (
             "study_service_rate_limiter",
             Arc::clone(&study_service_rate_limiter),
@@ -382,10 +364,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Spawn background eviction task for stale wallet-attempt entries.
-    // Bounds memory growth from many distinct wallets over time —
-    // entries with an expired window AND zero in-flight attempts are
-    // dropped (next attempt re-creates them from fresh state, identical
-    // to the window-reset branch in check_and_record_attempt).
+    // Bounds memory growth from many distinct subjects over time: every
+    // entry whose window has ended is dropped (the next attempt re-creates
+    // it from fresh state, identical to the window-reset branch in
+    // check_and_record_attempt).
     let wallet_attempts_ref = Arc::clone(&wallet_attempts);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -411,18 +393,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // A key drawn at start is fine where a restart may end a visit. Production with paired
+    // sessions on never reaches the fallback: the configuration refuses to load without a key.
+    let paired_authorizer = Arc::new(match config.paired_authorization_key {
+        Some(key) => PairedAuthorizer::new(
+            &key,
+            config.paired_authorization_ttl_secs,
+            config.paired_authorization_mode,
+            config.paired_authorization_network,
+        )?,
+        None => PairedAuthorizer::with_random_key(
+            config.paired_authorization_ttl_secs,
+            config.paired_authorization_mode,
+            config.paired_authorization_network,
+        )?,
+    });
+
+    if environment.is_prod()
+        && config.paired_authorization_network == paired::authorization::NetworkMode::Observe
+    {
+        tracing::warn!(
+            "Paired opens from another client network than the one that fetched the grant \
+             are served while EXECUTOR_PAIRED_AUTHORIZATION_NETWORK=observe. Set enforce once \
+             entros_paired_authorization_network_mismatch_total stays near zero."
+        );
+    }
+
     let state = AppState {
         validation_identity_program: config.validation_identity_program,
-        relayer_tx,
+        solana: Arc::clone(&solana_client),
         api_keys: Arc::new(config.api_keys),
+        public_api_keys: Arc::new(public_api_keys),
         rate_limiter,
         attest_rate_limiter,
+        attest_wallet_rate_limiter,
         study_service_rate_limiter,
         study_concurrency,
         per_ip_rate_limiter,
         tracker,
         wallet_attempts,
-        commitment_registry,
         sas_attestor,
         metrics: Arc::new(status::status_metrics::StatusMetrics::new()),
         http_client,
@@ -443,13 +452,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_gate: Arc::new(tokio::sync::Semaphore::new(
             config.paired_session_concurrency,
         )),
-        paired_wallets: config.paired_wallets.clone().map(Arc::new),
+        session_uploads: crate::paired::uploads::UploadGate::new(
+            crate::paired::uploads::SESSION_UPLOADS,
+            crate::paired::uploads::SESSION_UPLOADS_PER_NETWORK,
+        ),
+        paired_authorizer,
+        single_capture_updates_refused: config.single_capture_updates_refused,
+        study_routes_enabled: config.study_routes_enabled,
     };
     tracing::info!(
         paired_enabled = config.paired_enabled,
         paired_session_concurrency = config.paired_session_concurrency,
-        paired_wallet_allowlist = ?config.paired_wallets.as_ref().map(|wallets| wallets.len()),
+        paired_authorization = ?config.paired_authorization_mode,
+        paired_authorization_network = ?config.paired_authorization_network,
+        paired_authorization_ttl_secs = config.paired_authorization_ttl_secs,
+        paired_authorization_key_configured = config.paired_authorization_key.is_some(),
         "Paired session routes"
+    );
+    tracing::info!(
+        single_capture_updates_refused = config.single_capture_updates_refused,
+        study_routes_enabled = config.study_routes_enabled,
+        "Route switches"
     );
 
     let app = create_router(state, &config.cors_origins);
