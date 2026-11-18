@@ -18,8 +18,8 @@ pub struct AcousticEvaluation {
 /// receives.
 ///
 /// Physical microphones picking up human speech in ambient room acoustics exhibit:
-/// - Spectral flatness between 0.015 and 0.85. Flatness < 0.015 indicates pure synthetic
-///   tones / degenerate digital signals. Flatness > 0.85 indicates pure white-noise injection.
+/// - Spectral flatness up to 0.85. Flatness > 0.85 indicates wideband white-noise
+///   injection; negative or non-finite values are invalid.
 /// - Spectral centroid between 100 Hz and 6000 Hz. Centroid < 100 Hz indicates a
 ///   low-frequency DC offset / line hum. Centroid > 6000 Hz indicates an unnaturally
 ///   bright, high-frequency-dominant spectrum atypical of human speech in room acoustics
@@ -46,7 +46,7 @@ pub fn evaluate_acoustic_realism(capture: Option<&CaptureSignals>) -> AcousticEv
     }
 
     if let Some(flatness) = c.flatness {
-        if !(0.015..=0.85).contains(&flatness) {
+        if !(0.0..=0.85).contains(&flatness) {
             flatness_out_of_bounds = true;
             risk_score = (risk_score + 0.8).min(1.0);
         }
@@ -109,16 +109,33 @@ mod tests {
     }
 
     #[test]
-    fn flags_flatness_out_of_bounds_low() {
-        let cap = CaptureSignals {
-            virtual_device: false,
-            voice_isolation_applied: None,
-            flatness: Some(0.005),
-            centroid: Some(1800.0),
-        };
-        let eval = evaluate_acoustic_realism(Some(&cap));
-        assert_eq!(eval.risk_score, 0.8);
-        assert!(eval.flatness_out_of_bounds);
+    fn allows_harmonic_speech_flatness_inside_zero_to_upper_bound() {
+        for flatness in [0.005, 0.0128, 0.015] {
+            let cap = CaptureSignals {
+                virtual_device: false,
+                voice_isolation_applied: None,
+                flatness: Some(flatness),
+                centroid: Some(1800.0),
+            };
+            let eval = evaluate_acoustic_realism(Some(&cap));
+            assert_eq!(eval.risk_score, 0.0);
+            assert!(!eval.flatness_out_of_bounds);
+        }
+    }
+
+    #[test]
+    fn flags_negative_or_non_finite_flatness() {
+        for flatness in [-0.01, f64::NAN] {
+            let cap = CaptureSignals {
+                virtual_device: false,
+                voice_isolation_applied: None,
+                flatness: Some(flatness),
+                centroid: Some(1800.0),
+            };
+            let eval = evaluate_acoustic_realism(Some(&cap));
+            assert_eq!(eval.risk_score, 0.8);
+            assert!(eval.flatness_out_of_bounds);
+        }
     }
 
     #[test]
