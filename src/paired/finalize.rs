@@ -216,6 +216,8 @@ struct ValidatorSessionBody<'a> {
     attestation: Option<&'a AttestationPayload>,
     #[serde(skip_serializing_if = "Option::is_none")]
     compatibility_evidence: Option<&'a ProjectionCompatibilityEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_isolation_applied: Option<bool>,
 }
 
 impl<'a> ValidatorSessionBody<'a> {
@@ -243,6 +245,11 @@ impl<'a> ValidatorSessionBody<'a> {
             origin_ua,
             attestation: request.attestation.as_ref(),
             compatibility_evidence: request.compatibility_evidence.as_ref(),
+            voice_isolation_applied: request
+                .client_signals
+                .as_ref()
+                .and_then(|signals| signals.capture.as_ref())
+                .and_then(|capture| capture.voice_isolation_applied),
         }
     }
 }
@@ -605,6 +612,40 @@ mod tests {
             FEATURE_VECTOR_WIDTH
         );
         assert!(body.get("authorization").is_none());
+    }
+
+    #[test]
+    fn voice_isolation_flag_is_forwarded_only_when_present() {
+        for applied in [true, false] {
+            let mut value = request_value();
+            value["client_signals"] = serde_json::json!({
+                "v": 1,
+                "capture": {
+                    "virtual_device": false,
+                    "voice_isolation_applied": applied
+                },
+                "input": {
+                    "touch_events_observed": false,
+                    "pointer_pressure_observed": false,
+                    "motion_events_observed": false
+                }
+            });
+            let request: ValidateSessionRequest =
+                serde_json::from_value(value).expect("request parses");
+            let body = serde_json::to_value(ValidatorSessionBody::new(
+                &request,
+                Some("mint"),
+                &[],
+                "203.0.113.4",
+                "agent",
+            ))
+            .expect("serializes");
+            assert_eq!(
+                body.get("voice_isolation_applied"),
+                Some(&serde_json::Value::Bool(applied))
+            );
+            assert!(body.get("client_signals").is_none());
+        }
     }
 
     #[test]

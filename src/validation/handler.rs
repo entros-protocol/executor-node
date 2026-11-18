@@ -320,6 +320,20 @@ pub struct ClientSignals {
     /// Capture environment signals (e.g. virtual devices).
     #[serde(default)]
     pub capture: Option<CaptureSignals>,
+    /// Observed input capability flags for the session.
+    #[serde(default)]
+    pub input: Option<InputCapabilitySignals>,
+}
+
+/// Observed input capability booleans emitted by the client SDK without device enumeration.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct InputCapabilitySignals {
+    #[serde(default)]
+    pub touch_events_observed: bool,
+    #[serde(default)]
+    pub pointer_pressure_observed: bool,
+    #[serde(default)]
+    pub motion_events_observed: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -479,6 +493,14 @@ fn validator_request_body(
         body["compatibility_evidence"] =
             serde_json::to_value(evidence).map_err(|_| AppError::ValidationServiceUnavailable)?;
     }
+    if let Some(voice_isolation_applied) = req
+        .client_signals
+        .as_ref()
+        .and_then(|signals| signals.capture.as_ref())
+        .and_then(|capture| capture.voice_isolation_applied)
+    {
+        body["voice_isolation_applied"] = serde_json::Value::Bool(voice_isolation_applied);
+    }
     Ok(body)
 }
 
@@ -629,6 +651,15 @@ pub(crate) fn screen_client_signals(
                     "Capture signals observed"
                 );
             }
+        }
+        if let Some(input) = signals.and_then(|sig| sig.input.as_ref()) {
+            tracing::debug!(
+                wallet_id = %crate::auth::redact::redact_wallet_id(wallet_id),
+                touch_events_observed = input.touch_events_observed,
+                pointer_pressure_observed = input.pointer_pressure_observed,
+                motion_events_observed = input.motion_events_observed,
+                "Input capability signals observed"
+            );
         }
     }
     Ok(())
@@ -1851,13 +1882,51 @@ mod tests {
 
     #[test]
     fn older_payload_without_client_signals_deserializes() {
-        // Backward compatibility: a pre-A1 SDK omits the field entirely.
+        // Backward compatibility: an older SDK omits the field entirely.
         let json = serde_json::json!({
             "features": [0.0, 1.0, 2.0],
             "wallet_id": "abc",
         });
         let req: ValidateFeaturesRequest = serde_json::from_value(json).unwrap();
         assert!(req.client_signals.is_none());
+    }
+
+    #[test]
+    fn validator_request_body_forwards_voice_isolation_only_when_present() {
+        for applied in [true, false] {
+            let mut req = baseline_request("11111111111111111111111111111111".into());
+            req.client_signals = Some(ClientSignals {
+                v: 1,
+                env: Some("browser".into()),
+                automation: None,
+                capture: Some(CaptureSignals {
+                    virtual_device: false,
+                    voice_isolation_applied: Some(applied),
+                    flatness: Some(0.012),
+                    centroid: Some(1500.0),
+                }),
+                input: Some(InputCapabilitySignals {
+                    touch_events_observed: false,
+                    pointer_pressure_observed: false,
+                    motion_events_observed: false,
+                }),
+            });
+            let body = validator_request_body(
+                &req,
+                Some("amber"),
+                1,
+                ProjectionIntent::Mint,
+                &[],
+                "127.0.0.1",
+                "test-agent",
+            )
+            .expect("validator body builds");
+            assert_eq!(
+                body.get("voice_isolation_applied"),
+                Some(&serde_json::Value::Bool(applied))
+            );
+            assert!(body.get("client_signals").is_none());
+        }
     }
 
     #[test]
@@ -2060,6 +2129,7 @@ mod tests {
                 tells: vec!["puppeteer".into(), "selenium".into()],
             }),
             capture: None,
+            input: None,
         });
 
         let result = validate_features_handler(State(state), None, headers, Json(req)).await;
@@ -2095,6 +2165,7 @@ mod tests {
                 tells: vec!["x\nforged".into()],
             }),
             capture: None,
+            input: None,
         });
 
         let result = validate_features_handler(State(state), None, headers, Json(req)).await;
@@ -2348,6 +2419,7 @@ mod validator_reached_tests {
                 tells: vec!["puppeteer".into(), "selenium".into()],
             }),
             capture: None,
+            input: None,
         }
     }
 
