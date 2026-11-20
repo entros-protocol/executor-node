@@ -300,6 +300,7 @@ mod tests {
                     flatness: Some(0.125),
                     centroid: Some(2_400.0),
                 }),
+                input: None,
             }),
             curve_trace: None,
             capture_timing: None,
@@ -333,10 +334,21 @@ mod tests {
         let request = request_fixture(wallet.to_string());
         let nonce = [0x5a; 32];
         let digest = request_digest(&request).expect("fixture digest");
+        let expected_hex = "a629314bf11f266689983f629f55c299789c9fca387e34593a8d323661d5f21a";
 
+        assert_eq!(lower_hex(&digest), expected_hex);
+
+        let mut with_input = request_fixture(wallet.to_string());
+        if let Some(signals) = with_input.client_signals.as_mut() {
+            signals.input = Some(crate::validation::handler::InputCapabilitySignals {
+                touch_events_observed: false,
+                pointer_pressure_observed: false,
+                motion_events_observed: false,
+            });
+        }
         assert_eq!(
-            lower_hex(&digest),
-            "a629314bf11f266689983f629f55c299789c9fca387e34593a8d323661d5f21a"
+            request_digest(&with_input).expect("fixture digest with input"),
+            digest
         );
         assert_eq!(
             authorization_message(&wallet, &nonce, 2, &digest),
