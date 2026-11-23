@@ -1,5 +1,7 @@
 # executor-node
 
+> **Status:** This repository contains the legacy Solana devnet paired-liveness gateway in maintenance mode. Entros develops commercial voice-liveness and `AgentPermit` v2 APIs in separate private infrastructure, outside this gateway. See [entros.io/roadmap](https://entros.io/roadmap) for current product status and deployment scope.
+
 Authenticated gateway, challenge service, risk composer, and SAS issuer for Entros.
 
 The executor does not contain proprietary behavioral models. It forwards validation requests to a separate, private validation HTTP service.
