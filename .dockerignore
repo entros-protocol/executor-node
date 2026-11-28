@@ -1,0 +1,8 @@
+.git/
+target/
+.env
+.env.*
+*keypair*.json
+scripts/node_modules/
+.agents/
+*.log
